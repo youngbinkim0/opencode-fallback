@@ -5,6 +5,7 @@ export interface FallbackPluginConfig {
 	cooldown_seconds?: number
 	timeout_seconds?: number
 	notify_on_fallback?: boolean
+	fallback_models?: string | string[]
 }
 
 export interface FallbackState {

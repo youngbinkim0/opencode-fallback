@@ -3,6 +3,7 @@ import {
 	readFallbackModels,
 	resolveAgentForSession,
 	getFallbackModelsForSession,
+	normalizeFallbackModelsField,
 } from "./config-reader"
 
 describe("config-reader", () => {
@@ -168,8 +169,8 @@ describe("config-reader", () => {
 			})
 		})
 
-		describe("#when no agent resolved but some agent has fallback models", () => {
-			test("#then returns first agent's fallback models as default", () => {
+		describe("#when no agent resolved and no global config", () => {
+			test("#then returns empty array (no iterate-all-agents)", () => {
 				const agents = {
 					opus: {
 						model: "anthropic/claude-opus-4-6",
@@ -186,7 +187,8 @@ describe("config-reader", () => {
 					agents
 				)
 
-				expect(result).toEqual(["google/model-a"])
+				// Should NOT fall back to opus's models — that was the old bug
+				expect(result).toEqual([])
 			})
 		})
 
@@ -217,6 +219,144 @@ describe("config-reader", () => {
 				)
 
 				expect(result).toEqual([])
+			})
+		})
+	})
+
+	describe("#given getFallbackModelsForSession with global config", () => {
+		const globalModels = ["google/antigravity-claude-opus-4-6-thinking", "github-copilot/claude-opus-4.6"]
+
+		describe("#when agent has per-agent fallback_models", () => {
+			test("#then returns per-agent models, ignoring global", () => {
+				const agents = {
+					opus: {
+						model: "anthropic/claude-opus-4-6",
+						fallback_models: ["google/agent-specific-model"],
+					},
+				}
+
+				const result = getFallbackModelsForSession(
+					"ses_123",
+					"opus",
+					agents,
+					globalModels
+				)
+
+				expect(result).toEqual(["google/agent-specific-model"])
+			})
+		})
+
+		describe("#when agent has no per-agent config but global exists", () => {
+			test("#then returns global fallback models", () => {
+				const agents = {
+					opus: {
+						model: "anthropic/claude-opus-4-6",
+					},
+				}
+
+				const result = getFallbackModelsForSession(
+					"ses_123",
+					"opus",
+					agents,
+					globalModels
+				)
+
+				expect(result).toEqual(globalModels)
+			})
+		})
+
+		describe("#when neither per-agent nor global config exists", () => {
+			test("#then returns empty array", () => {
+				const agents = {
+					opus: {
+						model: "anthropic/claude-opus-4-6",
+					},
+				}
+
+				const result = getFallbackModelsForSession(
+					"ses_123",
+					"opus",
+					agents
+				)
+
+				expect(result).toEqual([])
+			})
+		})
+
+		describe("#when per-agent has empty fallback_models and global exists", () => {
+			test("#then returns global (empty per-agent does not override)", () => {
+				const agents = {
+					opus: {
+						model: "anthropic/claude-opus-4-6",
+						fallback_models: [],
+					},
+				}
+
+				const result = getFallbackModelsForSession(
+					"ses_123",
+					"opus",
+					agents,
+					globalModels
+				)
+
+				expect(result).toEqual(globalModels)
+			})
+		})
+
+		describe("#when agent is unresolved and global config exists", () => {
+			test("#then returns global fallback models", () => {
+				const result = getFallbackModelsForSession(
+					"ses_a1b2c3",
+					undefined,
+					undefined,
+					globalModels
+				)
+
+				expect(result).toEqual(globalModels)
+			})
+		})
+
+		describe("#when agent is unresolved and no global config", () => {
+			test("#then returns empty array", () => {
+				const result = getFallbackModelsForSession(
+					"ses_a1b2c3",
+					undefined,
+					undefined
+				)
+
+				expect(result).toEqual([])
+			})
+		})
+
+		describe("#when global fallback is empty array", () => {
+			test("#then returns empty array", () => {
+				const agents = {
+					opus: {
+						model: "anthropic/claude-opus-4-6",
+					},
+				}
+
+				const result = getFallbackModelsForSession(
+					"ses_123",
+					"opus",
+					agents,
+					[]
+				)
+
+				expect(result).toEqual([])
+			})
+		})
+
+		describe("#when agents is undefined but global exists", () => {
+			test("#then returns global fallback models", () => {
+				const result = getFallbackModelsForSession(
+					"ses_123",
+					"opus",
+					undefined,
+					globalModels
+				)
+
+				expect(result).toEqual(globalModels)
 			})
 		})
 	})

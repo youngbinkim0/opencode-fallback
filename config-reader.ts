@@ -13,7 +13,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function normalizeFallbackModelsField(
+export function normalizeFallbackModelsField(
 	value: unknown
 ): string[] {
 	if (!value) return []
@@ -59,21 +59,22 @@ export function resolveAgentForSession(
 export function getFallbackModelsForSession(
 	sessionID: string,
 	eventAgent: string | undefined,
-	agents: AgentRecord | undefined
+	agents: AgentRecord | undefined,
+	globalFallbackModels?: string[]
 ): string[] {
-	if (!agents) return []
-
 	const resolvedAgent = resolveAgentForSession(sessionID, eventAgent)
 
-	if (resolvedAgent) {
+	// Tier 1: Per-agent fallback_models
+	if (resolvedAgent && agents) {
 		const models = readFallbackModels(resolvedAgent, agents)
 		if (models.length > 0) return models
 	}
 
-	for (const agentName of Object.keys(agents)) {
-		const models = readFallbackModels(agentName, agents)
-		if (models.length > 0) return models
+	// Tier 2: Global fallback_models from plugin config
+	if (globalFallbackModels && globalFallbackModels.length > 0) {
+		return globalFallbackModels
 	}
 
+	// Tier 3: No fallback
 	return []
 }

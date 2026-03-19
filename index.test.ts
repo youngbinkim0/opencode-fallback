@@ -104,9 +104,9 @@ describe("OpenCodeFallbackPlugin", () => {
 					event: {
 						type: "session.error",
 						properties: {
-							sessionID: "test-session",
-							error: { statusCode: 429, message: "Rate limited" },
-							model: "anthropic/claude-opus-4-6",
+						sessionID: "ses-opus-001",
+						error: { statusCode: 429, message: "Rate limited" },
+						model: "anthropic/claude-opus-4-6",
 						},
 					},
 				})
