@@ -23,6 +23,18 @@ export interface FallbackResult {
 	maxAttemptsReached?: boolean
 }
 
+export type MessagePart = { type: string } & Record<string, unknown>
+
+export type ReplayTier = 1 | 2 | 3
+
+export interface ReplayResult {
+	success: boolean
+	tier?: ReplayTier
+	sentParts?: MessagePart[]
+	droppedTypes?: string[]
+	error?: string
+}
+
 export interface ChatMessageInput {
 	sessionID: string
 	agent?: string
@@ -74,7 +86,7 @@ export interface PluginContext {
 				body: {
 					agent?: string
 					model: { providerID: string; modelID: string }
-					parts: Array<{ type: string; text: string }>
+					parts: MessagePart[]
 				}
 				query: { directory: string }
 			}) => Promise<void>
