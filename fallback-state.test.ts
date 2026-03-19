@@ -4,6 +4,7 @@ import {
 	isModelInCooldown,
 	findNextAvailableFallback,
 	prepareFallback,
+	recoverToOriginal,
 } from "./fallback-state"
 import { DEFAULT_CONFIG } from "./constants"
 import type { FallbackState } from "./types"
@@ -195,6 +196,142 @@ describe("fallback-state", () => {
 				expect(state.failedModels.has("anthropic/claude-opus-4-6")).toBe(true)
 				const timestamp = state.failedModels.get("anthropic/claude-opus-4-6")!
 				expect(Date.now() - timestamp).toBeLessThan(1000)
+			})
+		})
+	})
+
+	describe("#given recoverToOriginal", () => {
+		describe("#when currentModel equals originalModel", () => {
+			test("#then returns false (no-op, already on primary)", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+
+				const result = recoverToOriginal(state, 60)
+
+				expect(result).toBe(false)
+			})
+		})
+
+		describe("#when originalModel is still in cooldown", () => {
+			test("#then returns false (too early to recover)", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.currentModel = "google/model-a"
+				state.fallbackIndex = 0
+				state.attemptCount = 1
+				state.failedModels.set("anthropic/claude-opus-4-6", Date.now())
+
+				const result = recoverToOriginal(state, 60)
+
+				expect(result).toBe(false)
+			})
+		})
+
+		describe("#when originalModel is NOT in cooldown and currentModel differs", () => {
+			test("#then returns true", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.currentModel = "google/model-a"
+				state.fallbackIndex = 0
+				state.attemptCount = 1
+				state.failedModels.set("anthropic/claude-opus-4-6", Date.now() - 120_000)
+
+				const result = recoverToOriginal(state, 60)
+
+				expect(result).toBe(true)
+			})
+		})
+
+		describe("#when recovery succeeds", () => {
+			test("#then state.currentModel is reset to originalModel", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.currentModel = "google/model-a"
+				state.fallbackIndex = 0
+				state.attemptCount = 1
+				state.failedModels.set("anthropic/claude-opus-4-6", Date.now() - 120_000)
+
+				recoverToOriginal(state, 60)
+
+				expect(state.currentModel).toBe("anthropic/claude-opus-4-6")
+			})
+
+			test("#then state.fallbackIndex is reset to -1", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.currentModel = "google/model-a"
+				state.fallbackIndex = 0
+				state.attemptCount = 1
+				state.failedModels.set("anthropic/claude-opus-4-6", Date.now() - 120_000)
+
+				recoverToOriginal(state, 60)
+
+				expect(state.fallbackIndex).toBe(-1)
+			})
+
+			test("#then state.attemptCount is reset to 0", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.currentModel = "google/model-a"
+				state.fallbackIndex = 0
+				state.attemptCount = 2
+				state.failedModels.set("anthropic/claude-opus-4-6", Date.now() - 120_000)
+
+				recoverToOriginal(state, 60)
+
+				expect(state.attemptCount).toBe(0)
+			})
+
+			test("#then state.pendingFallbackModel is cleared", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.currentModel = "google/model-a"
+				state.fallbackIndex = 0
+				state.attemptCount = 1
+				state.pendingFallbackModel = "google/model-a"
+				state.failedModels.set("anthropic/claude-opus-4-6", Date.now() - 120_000)
+
+				recoverToOriginal(state, 60)
+
+				expect(state.pendingFallbackModel).toBeUndefined()
+			})
+
+			test("#then state.failedModels is preserved unchanged", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.currentModel = "google/model-a"
+				state.fallbackIndex = 0
+				state.attemptCount = 1
+				const failedTimestamp = Date.now() - 120_000
+				state.failedModels.set("anthropic/claude-opus-4-6", failedTimestamp)
+				state.failedModels.set("openai/model-b", Date.now() - 90_000)
+
+				recoverToOriginal(state, 60)
+
+				expect(state.failedModels.size).toBe(2)
+				expect(state.failedModels.get("anthropic/claude-opus-4-6")).toBe(failedTimestamp)
+				expect(state.failedModels.has("openai/model-b")).toBe(true)
+			})
+		})
+
+		describe("#when recovery fails (returns false)", () => {
+			test("#then entire state object is unchanged", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.currentModel = "google/model-a"
+				state.fallbackIndex = 0
+				state.attemptCount = 1
+				state.pendingFallbackModel = "google/model-a"
+				const failedTimestamp = Date.now()
+				state.failedModels.set("anthropic/claude-opus-4-6", failedTimestamp)
+
+				// Snapshot the state before call
+				const snapshotCurrentModel = state.currentModel
+				const snapshotFallbackIndex = state.fallbackIndex
+				const snapshotAttemptCount = state.attemptCount
+				const snapshotPending = state.pendingFallbackModel
+				const snapshotFailedModelsSize = state.failedModels.size
+
+				const result = recoverToOriginal(state, 60)
+
+				expect(result).toBe(false)
+				expect(state.currentModel).toBe(snapshotCurrentModel)
+				expect(state.fallbackIndex).toBe(snapshotFallbackIndex)
+				expect(state.attemptCount).toBe(snapshotAttemptCount)
+				expect(state.pendingFallbackModel).toBe(snapshotPending)
+				expect(state.failedModels.size).toBe(snapshotFailedModelsSize)
+				expect(state.failedModels.get("anthropic/claude-opus-4-6")).toBe(failedTimestamp)
 			})
 		})
 	})

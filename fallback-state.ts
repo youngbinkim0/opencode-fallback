@@ -78,3 +78,18 @@ export function prepareFallback(
 
 	return { success: true, newModel: nextModel }
 }
+
+export function recoverToOriginal(
+	state: FallbackState,
+	cooldownSeconds: number
+): boolean {
+	if (state.currentModel === state.originalModel) return false
+	if (isModelInCooldown(state.originalModel, state, cooldownSeconds)) return false
+
+	state.currentModel = state.originalModel
+	state.fallbackIndex = -1
+	state.attemptCount = 0
+	state.pendingFallbackModel = undefined
+
+	return true
+}

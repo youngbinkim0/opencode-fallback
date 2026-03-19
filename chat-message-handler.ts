@@ -1,11 +1,12 @@
 import type { HookDeps, ChatMessageInput, ChatMessageOutput } from "./types"
 import type { AutoRetryHelpers } from "./auto-retry"
 import { PLUGIN_NAME } from "./constants"
-import { createFallbackState } from "./fallback-state"
+import { createFallbackState, recoverToOriginal } from "./fallback-state"
 import { logInfo, logError } from "./logger"
 
 export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 	const {
+		ctx,
 		config,
 		sessionStates,
 		sessionLastAccess,
@@ -22,6 +23,35 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 		if (!state) return
 
 		sessionLastAccess.set(sessionID, Date.now())
+
+		// Auto-recovery: check if primary model's cooldown has expired
+		if (state.currentModel !== state.originalModel) {
+			if (
+				!sessionRetryInFlight.has(sessionID) &&
+				!sessionAwaitingFallbackResult.has(sessionID)
+			) {
+				const recovered = recoverToOriginal(state, config.cooldown_seconds)
+				if (recovered) {
+					logInfo("Recovered to primary model", {
+						sessionID,
+						model: state.originalModel,
+					})
+					if (config.notify_on_fallback) {
+						const modelName = state.originalModel.split("/").pop() || state.originalModel
+						ctx.client.tui
+							.showToast({
+								body: {
+									title: "Model Recovered",
+									message: `Recovered to ${modelName}`,
+									variant: "info",
+									duration: 3000,
+								},
+							})
+							.catch(() => {})
+					}
+				}
+			}
+		}
 
 		const requestedModel = input.model
 			? `${input.model.providerID}/${input.model.modelID}`
