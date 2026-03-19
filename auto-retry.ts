@@ -1,7 +1,8 @@
-import type { HookDeps } from "./types"
+import type { HookDeps, MessagePart } from "./types"
 import { logInfo, logError } from "./logger"
 import { getFallbackModelsForSession, resolveAgentForSession } from "./config-reader"
 import { prepareFallback } from "./fallback-state"
+import { replayWithDegradation } from "./message-replay"
 
 const SESSION_TTL_MS = 30 * 60 * 1000
 
@@ -139,34 +140,59 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					model: newModel,
 				})
 
-				const retryParts = lastUserPartsRaw
-					.filter(
-						(p) =>
-							p.type === "text" && typeof p.text === "string" && p.text.length > 0
-					)
-					.map((p) => ({ type: "text" as const, text: p.text! }))
+				// Cast raw parts to MessagePart (runtime parts may have any shape)
+				const allParts: MessagePart[] = lastUserPartsRaw.filter(
+					(p): p is MessagePart => typeof p.type === "string"
+				)
 
-				if (retryParts.length > 0) {
-					sessionAwaitingFallbackResult.add(sessionID)
-					scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
+				if (allParts.length > 0) {
+					// Build the send function that calls promptAsync
+					const sendFn = async (parts: MessagePart[]): Promise<void> => {
+						await ctx.client.session.promptAsync({
+							path: { id: sessionID },
+							body: {
+								...(resolvedAgent ? { agent: resolvedAgent } : {}),
+								model: fallbackModelObj,
+								parts,
+							},
+							query: { directory: ctx.directory },
+						})
+					}
 
-					logInfo(`Sending fallback prompt (${source})`, {
-						sessionID,
-						agent: resolvedAgent,
-						model: fallbackModelObj,
-						partsCount: retryParts.length,
-						firstPart: retryParts[0]?.text?.slice(0, 80),
-					})
-					await ctx.client.session.promptAsync({
-						path: { id: sessionID },
-						body: {
-							...(resolvedAgent ? { agent: resolvedAgent } : {}),
-							model: fallbackModelObj,
-							parts: retryParts,
-						},
-						query: { directory: ctx.directory },
-					})
-					retryDispatched = true
+					const replayResult = await replayWithDegradation(allParts, sendFn)
+
+					if (replayResult.success) {
+						sessionAwaitingFallbackResult.add(sessionID)
+						scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
+						retryDispatched = true
+
+						logInfo(`Fallback replay succeeded (${source})`, {
+							sessionID,
+							tier: replayResult.tier,
+							sentPartsCount: replayResult.sentParts?.length,
+							droppedTypes: replayResult.droppedTypes,
+						})
+
+						// Show toast if parts were dropped (tier > 1)
+						if (replayResult.droppedTypes && replayResult.droppedTypes.length > 0) {
+							const droppedStr = replayResult.droppedTypes.join(", ")
+							await ctx.client.tui
+								.showToast({
+									body: {
+										title: "Message Replay",
+										message: `Some message parts were dropped for compatibility: ${droppedStr}`,
+										variant: "warning",
+										duration: 5000,
+									},
+								})
+								.catch(() => {})
+						}
+					} else {
+						logError(`All replay tiers failed (${source})`, {
+							sessionID,
+							error: replayResult.error,
+						})
+					}
 				}
 			} else {
 				logInfo(`No user message found for auto-retry (${source})`, { sessionID })
