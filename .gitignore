@@ -5,3 +5,5 @@ dist/
 *.map
 !build.ts
 .DS_Store
+.planning/
+.opencode/

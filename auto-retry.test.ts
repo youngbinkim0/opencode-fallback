@@ -38,6 +38,7 @@ function createMockDeps(overrides?: Partial<{
 		sessionRetryInFlight: new Set(),
 		sessionAwaitingFallbackResult: new Set(),
 		sessionFallbackTimeouts: new Map(),
+		sessionFirstTokenReceived: new Map(),
 	}
 }
 

@@ -46,11 +46,22 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 	const scheduleSessionFallbackTimeout = (sessionID: string, resolvedAgent?: string) => {
 		clearSessionFallbackTimeout(sessionID)
 
-		const timeoutMs = config.timeout_seconds * 1000
+		const useTTFT = config.ttft_timeout_seconds > 0
+		const timeoutMs = useTTFT
+			? config.ttft_timeout_seconds * 1000
+			: config.timeout_seconds * 1000
 		if (timeoutMs <= 0) return
 
 		const timer = setTimeout(async () => {
 			sessionFallbackTimeouts.delete(sessionID)
+
+			// TTFT mode: if first token has been received, model is streaming — don't abort
+			if (useTTFT && deps.sessionFirstTokenReceived.get(sessionID)) {
+				logInfo("TTFT timeout fired but first token already received, skipping abort", {
+					sessionID,
+				})
+				return
+			}
 
 			const state = sessionStates.get(sessionID)
 			if (!state) return
@@ -76,7 +87,8 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 
 			logInfo("Session fallback timeout reached", {
 				sessionID,
-				timeoutSeconds: config.timeout_seconds,
+				timeoutSeconds: useTTFT ? config.ttft_timeout_seconds : config.timeout_seconds,
+				mode: useTTFT ? "ttft" : "fixed",
 				currentModel: state.currentModel,
 			})
 
@@ -123,6 +135,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		await abortSessionRequest(sessionID, `pre-fallback.${source}`)
 
 		sessionRetryInFlight.add(sessionID)
+		deps.sessionFirstTokenReceived.set(sessionID, false)
 		let retryDispatched = false
 		try {
 			const messagesResp = await ctx.client.session.messages({
@@ -270,6 +283,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				sessionLastAccess.delete(sessionID)
 				sessionRetryInFlight.delete(sessionID)
 				sessionAwaitingFallbackResult.delete(sessionID)
+				deps.sessionFirstTokenReceived.delete(sessionID)
 				clearSessionFallbackTimeout(sessionID)
 				cleanedCount++
 			}

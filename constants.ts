@@ -8,6 +8,7 @@ export const DEFAULT_CONFIG: Required<FallbackPluginConfig> = {
 	max_fallback_attempts: 3,
 	cooldown_seconds: 60,
 	timeout_seconds: 30,
+	ttft_timeout_seconds: 0,
 	notify_on_fallback: true,
 }
 

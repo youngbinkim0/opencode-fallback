@@ -120,7 +120,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 		const sessionID = info?.sessionID as string | undefined
 		const retrySignalResult = extractAutoRetrySignal(info)
 		const retrySignal = retrySignalResult?.signal
-		const timeoutEnabled = config.timeout_seconds > 0
+		const timeoutEnabled = config.timeout_seconds > 0 || config.ttft_timeout_seconds > 0
 		const parts = props?.parts as
 			| Array<{ type?: string; text?: string }>
 			| undefined
@@ -169,6 +169,9 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 			if (!sessionAwaitingFallbackResult.has(sessionID)) {
 				return
 			}
+
+			// TTFT: mark that first token has been received — prevents TTFT timeout from aborting
+			deps.sessionFirstTokenReceived.set(sessionID, true)
 
 			const hasVisible = await checkVisibleResponse(ctx, sessionID, info)
 			if (!hasVisible) {

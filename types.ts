@@ -4,6 +4,7 @@ export interface FallbackPluginConfig {
 	max_fallback_attempts?: number
 	cooldown_seconds?: number
 	timeout_seconds?: number
+	ttft_timeout_seconds?: number
 	notify_on_fallback?: boolean
 	fallback_models?: string | string[]
 }
@@ -118,4 +119,5 @@ export interface HookDeps {
 	sessionRetryInFlight: Set<string>
 	sessionAwaitingFallbackResult: Set<string>
 	sessionFallbackTimeouts: Map<string, ReturnType<typeof setTimeout>>
+	sessionFirstTokenReceived: Map<string, boolean>
 }

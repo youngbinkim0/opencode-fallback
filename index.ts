@@ -73,11 +73,15 @@ export default async function OpenCodeFallbackPlugin(
 					configOverrides?.cooldown_seconds ??
 					fileConfig?.cooldown_seconds ??
 					DEFAULT_CONFIG.cooldown_seconds,
-					timeout_seconds:
-					configOverrides?.timeout_seconds ??
-					fileConfig?.timeout_seconds ??
-					DEFAULT_CONFIG.timeout_seconds,
-				notify_on_fallback:
+			 	timeout_seconds:
+				configOverrides?.timeout_seconds ??
+				fileConfig?.timeout_seconds ??
+				DEFAULT_CONFIG.timeout_seconds,
+			ttft_timeout_seconds:
+				configOverrides?.ttft_timeout_seconds ??
+				fileConfig?.ttft_timeout_seconds ??
+				DEFAULT_CONFIG.ttft_timeout_seconds,
+			notify_on_fallback:
 					configOverrides?.notify_on_fallback ??
 					fileConfig?.notify_on_fallback ??
 					DEFAULT_CONFIG.notify_on_fallback,
@@ -100,6 +104,7 @@ export default async function OpenCodeFallbackPlugin(
 		sessionRetryInFlight: new Set(),
 		sessionAwaitingFallbackResult: new Set(),
 		sessionFallbackTimeouts: new Map(),
+		sessionFirstTokenReceived: new Map(),
 	}
 
 	const helpers = createAutoRetryHelpers(deps)

@@ -124,7 +124,11 @@ Per-agent config **completely overrides** the global chain (no merging).
 
 5. **Cooldown** -- Failed models enter a cooldown period (default 60 seconds) before being retried again.
 
-6. **Max attempts** -- The plugin stops trying after 3 fallback attempts per session (configurable) to avoid infinite loops.
+6. **Auto-recovery** -- When the primary model's cooldown expires, the plugin automatically switches back on the next prompt.
+
+7. **Max attempts** -- The plugin stops trying after 3 fallback attempts per session (configurable) to avoid infinite loops.
+
+8. **TTFT timeout** -- Optional time-to-first-token timeout that only aborts models that produce no tokens at all. Models actively streaming are never interrupted.
 
 ### Fallback Flow
 
@@ -177,7 +181,8 @@ Create a config file at `.opencode/opencode-fallback.json` (or `.jsonc` for comm
 | `retry_on_errors` | `[429, 500, 502, 503, 504]` | HTTP status codes that trigger fallback |
 | `max_fallback_attempts` | `3` | Maximum fallback attempts per session |
 | `cooldown_seconds` | `60` | Time before retrying a failed model |
-| `timeout_seconds` | `30` | Timeout for fallback model retry requests |
+| `timeout_seconds` | `30` | Fixed timeout for fallback model retry requests |
+| `ttft_timeout_seconds` | `0` | Time-to-first-token timeout (0 = disabled, uses fixed timeout). When set, only aborts models that produce no tokens — streaming models are never interrupted |
 | `notify_on_fallback` | `true` | Show toast notifications on model switch |
 
 ### Config File Locations
