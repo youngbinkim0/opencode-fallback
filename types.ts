@@ -112,6 +112,7 @@ export interface HookDeps {
 	ctx: PluginContext
 	config: Required<FallbackPluginConfig>
 	agentConfigs: Record<string, unknown> | undefined
+	globalFallbackModels: string[]
 	sessionStates: Map<string, FallbackState>
 	sessionLastAccess: Map<string, number>
 	sessionRetryInFlight: Set<string>

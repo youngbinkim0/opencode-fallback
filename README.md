@@ -56,6 +56,62 @@ A single string is also accepted and will be normalized to a one-element array:
 }
 ```
 
+## Global Fallback Chain
+
+Instead of configuring `fallback_models` on every agent, set a default in your plugin config file (`.opencode/opencode-fallback.json`):
+
+```json
+{
+  "fallback_models": [
+    "google/antigravity-claude-opus-4-6-thinking",
+    "github-copilot/claude-opus-4.6"
+  ]
+}
+```
+
+This applies to any agent that doesn't have its own `fallback_models`.
+
+### Precedence
+
+| Priority | Source | Example |
+|----------|--------|---------|
+| 1 (highest) | Per-agent `fallback_models` in `opencode.json` | Agent-specific chain |
+| 2 | Global `fallback_models` in `opencode-fallback.json` | Default chain |
+| 3 | None | No fallback -- error passes through |
+
+Per-agent config **completely overrides** the global chain (no merging).
+
+### Example: Global + Per-Agent
+
+**Plugin config** (`.opencode/opencode-fallback.json`):
+```json
+{
+  "fallback_models": [
+    "google/antigravity-claude-opus-4-6-thinking",
+    "github-copilot/claude-opus-4.6"
+  ],
+  "cooldown_seconds": 60
+}
+```
+
+**Agent config** (`opencode.json`):
+```json
+{
+  "agent": {
+    "opus": {
+      "model": "anthropic/claude-opus-4-6"
+    },
+    "gemini": {
+      "model": "google/antigravity-gemini-3.1-pro",
+      "fallback_models": ["github-copilot/gemini-3.1-pro-preview"]
+    }
+  }
+}
+```
+
+- **opus** -- uses global chain (`google/antigravity-claude-opus-4-6-thinking`, `github-copilot/claude-opus-4.6`)
+- **gemini** -- uses its own chain (`github-copilot/gemini-3.1-pro-preview`), global is ignored
+
 ## How It Works
 
 1. **Error detection** -- When a model API call fails with a retryable error, the plugin intercepts it.
@@ -117,6 +173,7 @@ Create a config file at `.opencode/opencode-fallback.json` (or `.jsonc` for comm
 | Option | Default | Description |
 |--------|---------|-------------|
 | `enabled` | `true` | Enable/disable the fallback mechanism |
+| `fallback_models` | `[]` | Global default fallback model chain (string or array) |
 | `retry_on_errors` | `[429, 500, 502, 503, 504]` | HTTP status codes that trigger fallback |
 | `max_fallback_attempts` | `3` | Maximum fallback attempts per session |
 | `cooldown_seconds` | `60` | Time before retrying a failed model |
@@ -141,7 +198,7 @@ The plugin looks for config in these locations (first match wins):
 ## Requirements
 
 - [OpenCode](https://github.com/sst/opencode) with plugin support (`@opencode-ai/plugin >= 1.1.0`)
-- At least one agent with `fallback_models` configured
+- Fallback models configured (global in plugin config and/or per-agent in `opencode.json`)
 
 ## Using Local Version (Before Publishing)
 

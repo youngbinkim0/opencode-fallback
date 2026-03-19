@@ -32,6 +32,7 @@ function createMockDeps(overrides?: Partial<{
 		},
 		config: { ...DEFAULT_CONFIG } as Required<FallbackPluginConfig>,
 		agentConfigs: undefined,
+		globalFallbackModels: [],
 		sessionStates: new Map(),
 		sessionLastAccess: new Map(),
 		sessionRetryInFlight: new Set(),

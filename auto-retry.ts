@@ -69,7 +69,8 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			const fallbackModels = getFallbackModelsForSession(
 				sessionID,
 				resolvedAgent,
-				deps.agentConfigs
+				deps.agentConfigs,
+				deps.globalFallbackModels
 			)
 			if (fallbackModels.length === 0) return
 

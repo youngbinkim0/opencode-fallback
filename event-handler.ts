@@ -105,7 +105,8 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		const fallbackModels = getFallbackModelsForSession(
 			sessionID,
 			resolvedAgent,
-			deps.agentConfigs
+			deps.agentConfigs,
+			deps.globalFallbackModels
 		)
 
 		logInfo("Provider retry detected", {
@@ -287,7 +288,8 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		const fallbackModels = getFallbackModelsForSession(
 			sessionID,
 			resolvedAgent,
-			deps.agentConfigs
+			deps.agentConfigs,
+			deps.globalFallbackModels
 		)
 
 		if (fallbackModels.length === 0) {

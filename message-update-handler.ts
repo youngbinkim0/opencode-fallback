@@ -252,7 +252,8 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 			const fallbackModels = getFallbackModelsForSession(
 				sessionID,
 				resolvedAgent,
-				deps.agentConfigs
+				deps.agentConfigs,
+				deps.globalFallbackModels
 			)
 
 			if (fallbackModels.length === 0) {

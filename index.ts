@@ -10,6 +10,7 @@ import { createAutoRetryHelpers } from "./auto-retry"
 import { createEventHandler } from "./event-handler"
 import { createMessageUpdateHandler } from "./message-update-handler"
 import { createChatMessageHandler } from "./chat-message-handler"
+import { normalizeFallbackModelsField } from "./config-reader"
 import { readFileSync, existsSync } from "fs"
 import { join } from "path"
 import { logInfo } from "./logger"
@@ -50,6 +51,7 @@ export default async function OpenCodeFallbackPlugin(
 	let agentConfigs: Record<string, unknown> | undefined
 	let fileConfig: Partial<FallbackPluginConfig> = loadPluginConfig(ctx.directory)
 	let mergedConfig: Required<FallbackPluginConfig> | undefined
+	const globalFallbackModels = normalizeFallbackModelsField(fileConfig.fallback_models)
 
 	// Config getter that builds config on first access
 	const getConfig = (): Required<FallbackPluginConfig> => {
@@ -92,6 +94,7 @@ export default async function OpenCodeFallbackPlugin(
 		get agentConfigs() {
 			return agentConfigs
 		},
+		globalFallbackModels,
 		sessionStates: new Map(),
 		sessionLastAccess: new Map(),
 		sessionRetryInFlight: new Set(),
@@ -110,7 +113,7 @@ export default async function OpenCodeFallbackPlugin(
 	)
 	cleanupInterval.unref()
 
-	logInfo("Plugin initialized")
+	logInfo(`Plugin initialized (${globalFallbackModels.length} global fallback model(s) configured)`)
 
 	return {
 		name: PLUGIN_NAME,
