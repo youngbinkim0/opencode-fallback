@@ -1,4 +1,4 @@
-# opencode-fallback
+# opencode-runtime-fallback
 
 Automatic model fallback plugin for [OpenCode](https://github.com/sst/opencode). When a model API call fails, the plugin transparently switches to the next model in a configured fallback chain and replays the request — no manual intervention required.
 
@@ -17,14 +17,14 @@ Automatic model fallback plugin for [OpenCode](https://github.com/sst/opencode).
 ## Installation
 
 ```bash
-npm install opencode-fallback
+npm install opencode-runtime-fallback
 ```
 
 Then add the plugin to your `opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-fallback"]
+  "plugin": ["opencode-runtime-fallback"]
 }
 ```
 
