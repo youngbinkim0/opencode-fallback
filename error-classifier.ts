@@ -97,6 +97,10 @@ export function classifyErrorType(error: unknown): string | undefined {
 		return "model_not_found"
 	}
 
+	if (/model\s+(?:is\s+)?not\s+(?:found|supported|available)/i.test(message)) {
+		return "model_not_found"
+	}
+
 	return undefined
 }
 

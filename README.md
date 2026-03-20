@@ -211,23 +211,22 @@ To test the plugin locally before publishing to npm:
 
 **Option 1: Local plugin directory**
 
-Place the plugin files in your OpenCode plugins directory:
+Copy the plugin source files into your project's OpenCode plugins directory:
 
 ```bash
-# Project-level
+# Project-level (from the plugin repo root)
 mkdir -p .opencode/plugins/opencode-fallback
-cp src/standalone-plugin/*.ts .opencode/plugins/opencode-fallback/
+cp *.ts .opencode/plugins/opencode-fallback/
 
 # Or global
 mkdir -p ~/.config/opencode/plugins/opencode-fallback
-cp src/standalone-plugin/*.ts ~/.config/opencode/plugins/opencode-fallback/
+cp *.ts ~/.config/opencode/plugins/opencode-fallback/
 ```
 
 **Option 2: bun link**
 
 ```bash
-# In the plugin directory
-cd src/standalone-plugin
+# In the plugin repo root
 bun link
 
 # In your project directory
