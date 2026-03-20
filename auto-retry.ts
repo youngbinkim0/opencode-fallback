@@ -94,6 +94,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 
 			const result = prepareFallback(sessionID, state, fallbackModels, config)
 			if (result.success && result.newModel) {
+				sessionRetryInFlight.add(sessionID)
 				await autoRetryWithFallback(
 					sessionID,
 					result.newModel,
@@ -112,10 +113,8 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		resolvedAgent: string | undefined,
 		source: string
 	): Promise<void> => {
-		if (sessionRetryInFlight.has(sessionID)) {
-			logInfo(`Retry already in flight, skipping (${source})`, { sessionID })
-			return
-		}
+		// Note: sessionRetryInFlight should be set by the caller to prevent race conditions
+		// between different events (e.g. message.updated and session.error).
 
 		const modelParts = newModel.split("/")
 		if (modelParts.length < 2) {
@@ -143,10 +142,29 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				query: { directory: ctx.directory },
 			})
 			const msgs = messagesResp.data
-			const lastUserMsg = msgs?.filter((m) => m.info?.role === "user").pop()
-			const lastUserPartsRaw =
-				lastUserMsg?.parts ??
-				(lastUserMsg?.info?.parts as Array<{ type?: string; text?: string }> | undefined)
+			if (!msgs || msgs.length === 0) {
+				logError(`No messages found in session for auto-retry (${source})`, { sessionID })
+			}
+
+			// Look for the last user message that actually has content/parts
+			const userMessages = msgs?.filter((m) => {
+				const role = (m.info?.role ?? m.role ?? "") as string
+				return role.toLowerCase() === "user"
+			}) || []
+
+			let lastUserMsg = undefined
+			let lastUserPartsRaw = undefined
+
+			// Search backwards for a user message with parts
+			for (let i = userMessages.length - 1; i >= 0; i--) {
+				const m = userMessages[i]
+				const parts = m.parts ?? (m.info?.parts as any[] | undefined)
+				if (parts && parts.length > 0) {
+					lastUserMsg = m
+					lastUserPartsRaw = parts
+					break
+				}
+			}
 
 			if (lastUserPartsRaw && lastUserPartsRaw.length > 0) {
 				logInfo(`Auto-retrying with fallback model (${source})`, {

@@ -263,6 +263,19 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				return
 			}
 
+			// Prevent duplicate triggers for the same failure
+			// We only skip if the error is from a model that is NOT the one we're currently 
+			// waiting for a fallback result from. If it IS the pending model, it means
+			// the fallback itself failed, and we should proceed to the next one.
+			if (state && state.pendingFallbackModel && model !== state.pendingFallbackModel) {
+				logInfo("Skipping duplicate fallback trigger (already in progress for different model)", {
+					sessionID,
+					pendingFallbackModel: state.pendingFallbackModel,
+					errorModel: model
+				})
+				return
+			}
+
 			const isRetryable = isRetryableError(error, config.retry_on_errors)
 			const inFallbackChain = state && state.currentModel !== state.originalModel
 			
@@ -359,26 +372,62 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				config
 			)
 
-			if (result.success && config.notify_on_fallback) {
-				await deps.ctx.client.tui
-					.showToast({
-						body: {
-							title: "Model Fallback",
-							message: `Switching to ${result.newModel?.split("/").pop() || result.newModel} for next request`,
-							variant: "warning",
-							duration: 5000,
-						},
-					})
-					.catch(() => {})
+			if (result.success && result.newModel) {
+				// Mark retry in flight IMMEDIATELY to prevent race conditions from other events
+				deps.sessionRetryInFlight.add(sessionID)
+
+				if (config.notify_on_fallback) {
+					deps.ctx.client.tui
+						.showToast({
+							body: {
+								title: "Model Fallback",
+								message: `Switching to ${result.newModel?.split("/").pop() || result.newModel} for next request`,
+								variant: "warning",
+								duration: 5000,
+							},
+						})
+						.catch(() => {})
+				}
+
+				try {
+					await helpers.autoRetryWithFallback(
+						sessionID,
+						result.newModel,
+						resolvedAgent,
+						"message.updated"
+					)
+				} finally {
+					deps.sessionRetryInFlight.delete(sessionID)
+				}
 			}
 
+
 			if (result.success && result.newModel) {
-				await helpers.autoRetryWithFallback(
+				logInfo(`Calling autoRetryWithFallback from message.updated`, {
 					sessionID,
-					result.newModel,
-					resolvedAgent,
-					"message.updated"
-				)
+					newModel: result.newModel,
+				})
+				try {
+					await helpers.autoRetryWithFallback(
+						sessionID,
+						result.newModel,
+						resolvedAgent,
+						"message.updated"
+					)
+					logInfo(`autoRetryWithFallback returned successfully in message.updated`, { sessionID })
+				} catch (e) {
+					logError(`autoRetryWithFallback THREW ERROR in message.updated`, {
+						sessionID,
+						error: String(e),
+						stack: e instanceof Error ? e.stack : undefined
+					})
+				}
+			} else {
+				logInfo(`Fallback not prepared in message.updated`, {
+					sessionID,
+					success: result.success,
+					newModel: result.newModel
+				})
 			}
 		}
 	}

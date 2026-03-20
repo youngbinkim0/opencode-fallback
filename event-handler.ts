@@ -182,21 +182,24 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 
 		const result = prepareFallback(sessionID, state, fallbackModels, config)
 
-		if (result.success && config.notify_on_fallback) {
-			const modelName = result.newModel?.split("/").pop() || result.newModel
-			await deps.ctx.client.tui
-				.showToast({
-					body: {
-						title: "Retry Detected -- Switching Model",
-						variant: "warning",
-						duration: 5000,
-						message: `${status.message || "Provider retrying"} -> ${modelName} (attempt ${state.attemptCount} of ${fallbackModels.length})`,
-					},
-				})
-				.catch(() => {})
-		}
-
 		if (result.success && result.newModel) {
+			// Mark retry in flight IMMEDIATELY
+			deps.sessionRetryInFlight.add(sessionID)
+
+			if (config.notify_on_fallback) {
+				const modelName = result.newModel?.split("/").pop() || result.newModel
+				deps.ctx.client.tui
+					.showToast({
+						body: {
+							title: "Retry Detected -- Switching Model",
+							variant: "warning",
+							duration: 5000,
+							message: `${status.message || "Provider retrying"} -> ${modelName} (attempt ${state.attemptCount} of ${fallbackModels.length})`,
+						},
+					})
+					.catch(() => {})
+			}
+
 			await helpers.autoRetryWithFallback(
 				sessionID,
 				result.newModel,
@@ -366,22 +369,25 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 
 		const result = prepareFallback(sessionID, state, fallbackModels, config)
 
-		if (result.success && config.notify_on_fallback) {
-			const modelName = result.newModel?.split("/").pop() || result.newModel
-			const attemptInfo = `attempt ${state.attemptCount} of ${fallbackModels.length}`
-			await deps.ctx.client.tui
-				.showToast({
-					body: {
-						title: "Model Fallback",
-						message: `Switching to ${modelName} (${attemptInfo})`,
-						variant: "warning",
-						duration: 5000,
-					},
-				})
-				.catch(() => {})
-		}
-
 		if (result.success && result.newModel) {
+			// Mark retry in flight IMMEDIATELY
+			deps.sessionRetryInFlight.add(sessionID)
+
+			if (config.notify_on_fallback) {
+				const modelName = result.newModel?.split("/").pop() || result.newModel
+				const attemptInfo = `attempt ${state.attemptCount} of ${fallbackModels.length}`
+				deps.ctx.client.tui
+					.showToast({
+						body: {
+							title: "Model Fallback",
+							message: `Switching to ${modelName} (${attemptInfo})`,
+							variant: "warning",
+							duration: 5000,
+						},
+					})
+					.catch(() => {})
+			}
+
 			await helpers.autoRetryWithFallback(
 				sessionID,
 				result.newModel,
