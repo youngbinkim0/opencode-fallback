@@ -57,6 +57,30 @@ describe("error-classifier", () => {
 			})
 		})
 
+		describe("#when error has quota protection messages", () => {
+			test("#then returns true for 'Quota protection: All accounts are over usage'", () => {
+				const error = {
+					message: "Quota protection: All 5 account(s) are over 90% usage for claude. Quota resets in 11h 1m. Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable."
+				}
+				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors)).toBe(true)
+			})
+
+			test("#then returns true for simple 'quota protection' message", () => {
+				const error = { message: "Quota protection triggered" }
+				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors)).toBe(true)
+			})
+		})
+
+		describe("#when error has model not supported message", () => {
+			test("#then returns true for 'The requested model is not supported'", () => {
+				const error = {
+					name: "AI_APICallError",
+					message: "The requested model is not supported"
+				}
+				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors)).toBe(true)
+			})
+		})
+
 		describe("#when error has retryable error types", () => {
 			test("#then returns true for missing_api_key", () => {
 				const error = {
