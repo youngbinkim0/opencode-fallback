@@ -120,7 +120,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 		const sessionID = info?.sessionID as string | undefined
 		const retrySignalResult = extractAutoRetrySignal(info)
 		const retrySignal = retrySignalResult?.signal
-		const timeoutEnabled = config.timeout_seconds > 0 || config.ttft_timeout_seconds > 0
+		const timeoutEnabled = config.timeout_seconds > 0
 		const parts = props?.parts as
 			| Array<{ type?: string; text?: string }>
 			| undefined
@@ -207,8 +207,35 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				})
 				return
 			}
+
+			// Safety net: if this is a MessageAbortedError on the current model
+			// and we recently called session.abort() ourselves (within 2s window),
+			// this is likely a self-inflicted abort from the previous fallback
+			// transition.  Ignore it — the model hasn't actually failed.
+			const SELF_ABORT_WINDOW_MS = 2000
+			const errorName = extractErrorName(error)
+			const selfAbortTs = deps.sessionSelfAbortTimestamp.get(sessionID)
+			if (
+				errorName === "MessageAbortedError" &&
+				selfAbortTs &&
+				Date.now() - selfAbortTs < SELF_ABORT_WINDOW_MS &&
+				sessionAwaitingFallbackResult.has(sessionID)
+			) {
+				logInfo("Ignoring self-inflicted MessageAbortedError on current fallback model", {
+					sessionID,
+					model,
+					msSinceAbort: Date.now() - selfAbortTs,
+				})
+				return
+			}
 			
 			sessionAwaitingFallbackResult.delete(sessionID)
+
+			// ── EARLY LOCK ACQUISITION ──
+			// Acquire the retry lock BEFORE any async work to prevent
+			// session.error from interleaving via microtask scheduling.
+			// Both message.updated and session.error fire for the same
+			// original error; only one should advance the fallback state.
 			if (sessionRetryInFlight.has(sessionID) && !retrySignal) {
 				logInfo("message.updated fallback skipped (retry in flight)", {
 					sessionID,
@@ -232,171 +259,160 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				sessionRetryInFlight.delete(sessionID)
 			}
 
-			if (retrySignal && timeoutEnabled) {
-				logInfo("Detected provider auto-retry signal", { sessionID, model })
-			}
+			// Acquire the lock now — before any async calls that could yield
+			// and allow session.error to interleave.
+			deps.sessionRetryInFlight.add(sessionID)
 
-			if (!retrySignal) {
-				helpers.clearSessionFallbackTimeout(sessionID)
-			}
-
-			logInfo("message.updated with assistant error", {
-				sessionID,
-				model,
-				statusCode: extractStatusCode(error, config.retry_on_errors),
-				errorName: extractErrorName(error),
-				errorType: classifyErrorType(error),
-			})
-
-			let state = sessionStates.get(sessionID)
-			const agent = info?.agent as string | undefined
-			const resolvedAgent =
-				await helpers.resolveAgentForSessionFromContext(sessionID, agent)
-			const fallbackModels = getFallbackModelsForSession(
-				sessionID,
-				resolvedAgent,
-				deps.agentConfigs,
-				deps.globalFallbackModels
-			)
-
-			if (fallbackModels.length === 0) {
-				return
-			}
-
-			// Prevent duplicate triggers for the same failure
-			// We only skip if the error is from a model that is NOT the one we're currently 
-			// waiting for a fallback result from. If it IS the pending model, it means
-			// the fallback itself failed, and we should proceed to the next one.
-			if (state && state.pendingFallbackModel && model !== state.pendingFallbackModel) {
-				logInfo("Skipping duplicate fallback trigger (already in progress for different model)", {
-					sessionID,
-					pendingFallbackModel: state.pendingFallbackModel,
-					errorModel: model
-				})
-				return
-			}
-
-			const isRetryable = isRetryableError(error, config.retry_on_errors)
-			const inFallbackChain = state && state.currentModel !== state.originalModel
-			
-			if (!isRetryable && !inFallbackChain) {
-				logError(
-					"message.updated error not retryable and not in fallback chain, skipping",
-					{
-						sessionID,
-						statusCode: extractStatusCode(error, config.retry_on_errors),
-						errorName: extractErrorName(error),
-						errorType: classifyErrorType(error),
-					}
-				)
-				return
-			}
-			
-			if (!isRetryable && inFallbackChain) {
-				logInfo("message.updated non-retryable error but in fallback chain, continuing", {
-					sessionID,
-					currentModel: state?.currentModel,
-					originalModel: state?.originalModel,
-					errorName: extractErrorName(error),
-				})
-			}
-
-			if (!state) {
-				let initialModel = model
-				if (!initialModel) {
-					const agentConfig =
-						resolvedAgent && deps.agentConfigs
-							? (deps.agentConfigs[resolvedAgent] as
-									| Record<string, unknown>
-									| undefined)
-							: undefined
-					const agentModel = agentConfig?.model as string | undefined
-					if (agentModel) {
-						logError(
-							"Derived model from agent config for message.updated",
-							{
-								sessionID,
-								agent: resolvedAgent,
-								model: agentModel,
-							}
-						)
-						initialModel = agentModel
-					}
+			try {
+				if (retrySignal && timeoutEnabled) {
+					logInfo("Detected provider auto-retry signal", { sessionID, model })
 				}
 
-				if (!initialModel) {
+				if (!retrySignal) {
+					helpers.clearSessionFallbackTimeout(sessionID)
+				}
+
+				logInfo("message.updated with assistant error", {
+					sessionID,
+					model,
+					statusCode: extractStatusCode(error, config.retry_on_errors),
+					errorName: extractErrorName(error),
+					errorType: classifyErrorType(error),
+				})
+
+				let state = sessionStates.get(sessionID)
+				const agent = info?.agent as string | undefined
+				const resolvedAgent =
+					await helpers.resolveAgentForSessionFromContext(sessionID, agent)
+				const fallbackModels = getFallbackModelsForSession(
+					sessionID,
+					resolvedAgent,
+					deps.agentConfigs,
+					deps.globalFallbackModels
+				)
+
+				if (fallbackModels.length === 0) {
+					return
+				}
+
+				// Prevent duplicate triggers for the same failure
+				if (state && state.pendingFallbackModel && model !== state.pendingFallbackModel) {
+					logInfo("Skipping duplicate fallback trigger (already in progress for different model)", {
+						sessionID,
+						pendingFallbackModel: state.pendingFallbackModel,
+						errorModel: model
+					})
+					return
+				}
+
+				const isRetryable = isRetryableError(error, config.retry_on_errors, config.retryable_error_patterns)
+				const inFallbackChain = state && state.currentModel !== state.originalModel
+				
+				if (!isRetryable && !inFallbackChain) {
 					logError(
-						"message.updated missing model info, cannot fallback",
+						"message.updated error not retryable and not in fallback chain, skipping",
 						{
 							sessionID,
+							statusCode: extractStatusCode(error, config.retry_on_errors),
 							errorName: extractErrorName(error),
 							errorType: classifyErrorType(error),
 						}
 					)
 					return
 				}
-
-				state = createFallbackState(initialModel)
-				sessionStates.set(sessionID, state)
-				sessionLastAccess.set(sessionID, Date.now())
-			} else {
-				sessionLastAccess.set(sessionID, Date.now())
 				
-				// Handle auto-retry signals from providers
-				if (state.pendingFallbackModel && retrySignal && timeoutEnabled) {
-					logError(
-						"Clearing pending fallback due to provider auto-retry signal",
-						{
-							sessionID,
-							pendingFallbackModel: state.pendingFallbackModel,
+				if (!isRetryable && inFallbackChain) {
+					logInfo("message.updated non-retryable error but in fallback chain, continuing", {
+						sessionID,
+						currentModel: state?.currentModel,
+						originalModel: state?.originalModel,
+						errorName: extractErrorName(error),
+					})
+				}
+
+				if (!state) {
+					let initialModel = model
+					if (!initialModel) {
+						const agentConfig =
+							resolvedAgent && deps.agentConfigs
+								? (deps.agentConfigs[resolvedAgent] as
+										| Record<string, unknown>
+										| undefined)
+								: undefined
+						const agentModel = agentConfig?.model as string | undefined
+						if (agentModel) {
+							logError(
+								"Derived model from agent config for message.updated",
+								{
+									sessionID,
+									agent: resolvedAgent,
+									model: agentModel,
+								}
+							)
+							initialModel = agentModel
 						}
-					)
-					state.pendingFallbackModel = undefined
-				}
-			}
+					}
 
-			// Acquire the retry lock BEFORE mutating state via prepareFallback.
-			// This prevents session.error from also calling prepareFallback on the
-			// same shared state object concurrently.
-			if (deps.sessionRetryInFlight.has(sessionID)) {
-				logInfo("message.updated skipped -- retry already in flight", { sessionID })
-				return
-			}
-			deps.sessionRetryInFlight.add(sessionID)
+					if (!initialModel) {
+						logError(
+							"message.updated missing model info, cannot fallback",
+							{
+								sessionID,
+								errorName: extractErrorName(error),
+								errorType: classifyErrorType(error),
+							}
+						)
+						return
+					}
 
-			const result = prepareFallback(
-				sessionID,
-				state,
-				fallbackModels,
-				config
-			)
-
-			if (result.success && result.newModel) {
-				if (config.notify_on_fallback) {
-					deps.ctx.client.tui
-						.showToast({
-							body: {
-								title: "Model Fallback",
-								message: `Switching to ${result.newModel?.split("/").pop() || result.newModel} for next request`,
-								variant: "warning",
-								duration: 5000,
-							},
-						})
-						.catch(() => {})
+					state = createFallbackState(initialModel)
+					sessionStates.set(sessionID, state)
+					sessionLastAccess.set(sessionID, Date.now())
+				} else {
+					sessionLastAccess.set(sessionID, Date.now())
+					
+					// Handle auto-retry signals from providers
+					if (state.pendingFallbackModel && retrySignal && timeoutEnabled) {
+						logError(
+							"Clearing pending fallback due to provider auto-retry signal",
+							{
+								sessionID,
+								pendingFallbackModel: state.pendingFallbackModel,
+							}
+						)
+						state.pendingFallbackModel = undefined
+					}
 				}
 
-				try {
+				const result = prepareFallback(
+					sessionID,
+					state,
+					fallbackModels,
+					config
+				)
+
+				if (result.success && result.newModel) {
+					if (config.notify_on_fallback) {
+						deps.ctx.client.tui
+							.showToast({
+								body: {
+									title: "Model Fallback",
+									message: `Switching to ${result.newModel?.split("/").pop() || result.newModel} for next request`,
+									variant: "warning",
+									duration: 5000,
+								},
+							})
+							.catch(() => {})
+					}
+
 					await helpers.autoRetryWithFallback(
 						sessionID,
 						result.newModel,
 						resolvedAgent,
 						"message.updated"
 					)
-				} finally {
-					deps.sessionRetryInFlight.delete(sessionID)
 				}
-			} else {
-				// prepareFallback didn't succeed, release the lock
+			} finally {
 				deps.sessionRetryInFlight.delete(sessionID)
 			}
 		}

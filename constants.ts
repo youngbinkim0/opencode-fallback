@@ -5,10 +5,10 @@ export const PLUGIN_NAME = "opencode-fallback"
 export const DEFAULT_CONFIG: Required<FallbackPluginConfig> = {
 	enabled: true,
 	retry_on_errors: [429, 500, 502, 503, 504],
+	retryable_error_patterns: [],
 	max_fallback_attempts: 3,
 	cooldown_seconds: 60,
 	timeout_seconds: 30,
-	ttft_timeout_seconds: 0,
 	notify_on_fallback: true,
 }
 

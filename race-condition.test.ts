@@ -50,6 +50,7 @@ function createMockDeps(overrides?: Partial<{
 		sessionAwaitingFallbackResult: new Set(),
 		sessionFallbackTimeouts: new Map(),
 		sessionFirstTokenReceived: new Map(),
+		sessionSelfAbortTimestamp: new Map(),
 	}
 }
 
@@ -404,6 +405,173 @@ describe("race condition protection", () => {
 
 				retryInFlight.delete("session-1")
 				retryInFlight.delete("session-2")
+			})
+		})
+	})
+
+	describe("#given self-abort protection (sessionSelfAbortTimestamp)", () => {
+		describe("#when abortSessionRequest is called", () => {
+			test("#then sessionSelfAbortTimestamp is set for the session", async () => {
+				const deps = createMockDeps()
+				const { createAutoRetryHelpers } = await import("./auto-retry")
+				const helpers = createAutoRetryHelpers(deps)
+
+				expect(deps.sessionSelfAbortTimestamp.has("test-session")).toBe(false)
+				await helpers.abortSessionRequest("test-session", "test")
+				expect(deps.sessionSelfAbortTimestamp.has("test-session")).toBe(true)
+				expect(typeof deps.sessionSelfAbortTimestamp.get("test-session")).toBe("number")
+			})
+		})
+
+		describe("#when MessageAbortedError arrives within self-abort window", () => {
+			test("#then it is ignored if sessionAwaitingFallbackResult is set", async () => {
+				const deps = createMockDeps({
+					agentConfigs: {
+						test: {
+							model: "primary/model",
+							fallback_models: ["fallback/model-a", "fallback/model-b"],
+						},
+					},
+				})
+
+				// Set up state as if we just sent a fallback request to model-a (index 0)
+				const state = createFallbackState("primary/model")
+				state.currentModel = "fallback/model-a"
+				state.originalModel = "primary/model"
+				state.attemptCount = 1
+				state.fallbackIndex = 0  // model-a is at index 0
+				deps.sessionStates.set("test-session", state)
+				deps.sessionAwaitingFallbackResult.add("test-session")
+				// Mark self-abort as very recent (now)
+				deps.sessionSelfAbortTimestamp.set("test-session", Date.now())
+
+				const { createMessageUpdateHandler } = await import("./message-update-handler")
+				const { createAutoRetryHelpers } = await import("./auto-retry")
+				const helpers = createAutoRetryHelpers(deps)
+				const handler = createMessageUpdateHandler(deps, helpers)
+
+				// Simulate MessageAbortedError on the current fallback model
+				await handler({
+					info: {
+						role: "assistant",
+						sessionID: "test-session",
+						model: "fallback/model-a",
+						error: { name: "MessageAbortedError", message: "aborted" },
+					},
+				})
+
+				// The state should NOT have advanced — the error was ignored
+				expect(state.attemptCount).toBe(1)
+				expect(state.fallbackIndex).toBe(0)
+				expect(state.currentModel).toBe("fallback/model-a")
+				// Should still be awaiting the fallback result
+				expect(deps.sessionAwaitingFallbackResult.has("test-session")).toBe(true)
+			})
+		})
+
+		describe("#when MessageAbortedError arrives outside self-abort window", () => {
+			test("#then it is treated as a real error and advances the chain", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{
+							info: { role: "user" },
+							parts: [{ type: "text", text: "test" }],
+						},
+					],
+					agentConfigs: {
+						test: {
+							model: "primary/model",
+							fallback_models: ["fallback/model-a", "fallback/model-b"],
+						},
+					},
+				})
+
+				// Set up state as if we just sent a fallback request to model-a (index 0)
+				const state = createFallbackState("primary/model")
+				state.currentModel = "fallback/model-a"
+				state.originalModel = "primary/model"
+				state.attemptCount = 1
+				state.fallbackIndex = 0  // model-a is at index 0, so next search starts at 1
+				deps.sessionStates.set("test-session", state)
+				deps.sessionAwaitingFallbackResult.add("test-session")
+				// Mark self-abort as OLD (3 seconds ago, beyond 2s window)
+				deps.sessionSelfAbortTimestamp.set("test-session", Date.now() - 3000)
+
+				const { createMessageUpdateHandler } = await import("./message-update-handler")
+				const { createAutoRetryHelpers } = await import("./auto-retry")
+				const helpers = createAutoRetryHelpers(deps)
+				const handler = createMessageUpdateHandler(deps, helpers)
+
+				// Simulate MessageAbortedError on the current fallback model
+				await handler({
+					info: {
+						role: "assistant",
+						sessionID: "test-session",
+						model: "fallback/model-a",
+						error: { name: "MessageAbortedError", message: "aborted" },
+					},
+				})
+
+				// The chain should have advanced (non-retryable but in fallback chain)
+				expect(state.attemptCount).toBe(2)
+				expect(state.currentModel).toBe("fallback/model-b")
+			})
+		})
+
+		describe("#when MessageAbortedError arrives with no self-abort timestamp", () => {
+			test("#then it is treated as user cancellation in fallback chain", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{
+							info: { role: "user" },
+							parts: [{ type: "text", text: "test" }],
+						},
+					],
+					agentConfigs: {
+						test: {
+							model: "primary/model",
+							fallback_models: ["fallback/model-a", "fallback/model-b"],
+						},
+					},
+				})
+
+				const state = createFallbackState("primary/model")
+				state.currentModel = "fallback/model-a"
+				state.originalModel = "primary/model"
+				state.attemptCount = 1
+				state.fallbackIndex = 0  // model-a is at index 0
+				deps.sessionStates.set("test-session", state)
+				deps.sessionAwaitingFallbackResult.add("test-session")
+				// No self-abort timestamp at all
+
+				const { createMessageUpdateHandler } = await import("./message-update-handler")
+				const { createAutoRetryHelpers } = await import("./auto-retry")
+				const helpers = createAutoRetryHelpers(deps)
+				const handler = createMessageUpdateHandler(deps, helpers)
+
+				await handler({
+					info: {
+						role: "assistant",
+						sessionID: "test-session",
+						model: "fallback/model-a",
+						error: { name: "MessageAbortedError", message: "aborted" },
+					},
+				})
+
+				// Without self-abort, this is treated as a real error — chain advances
+				expect(state.attemptCount).toBe(2)
+			})
+		})
+
+		describe("#when self-abort timestamp is cleaned up", () => {
+			test("#then sessionSelfAbortTimestamp is removed on session deletion", () => {
+				const deps = createMockDeps()
+				deps.sessionSelfAbortTimestamp.set("test-session", Date.now())
+				expect(deps.sessionSelfAbortTimestamp.has("test-session")).toBe(true)
+
+				// Simulate what handleSessionDeleted does
+				deps.sessionSelfAbortTimestamp.delete("test-session")
+				expect(deps.sessionSelfAbortTimestamp.has("test-session")).toBe(false)
 			})
 		})
 	})

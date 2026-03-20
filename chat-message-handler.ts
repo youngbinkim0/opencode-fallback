@@ -2,6 +2,7 @@ import type { HookDeps, ChatMessageInput, ChatMessageOutput } from "./types"
 import type { AutoRetryHelpers } from "./auto-retry"
 import { PLUGIN_NAME } from "./constants"
 import { createFallbackState, recoverToOriginal } from "./fallback-state"
+import { getFallbackModelsForSession, resolveAgentForSession } from "./config-reader"
 import { logInfo, logError } from "./logger"
 
 export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
@@ -64,6 +65,31 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 			) {
 				state.pendingFallbackModel = undefined
 				return
+			}
+
+			// Check if this "mismatch" is just a stale retry from the race
+			// between message.updated / session.error / session.status.
+			// If the requestedModel is in the fallback chain and we're actively
+			// retrying, this is NOT a manual change — it's a stale handler
+			// sending its model while another handler already advanced the state.
+			if (sessionRetryInFlight.has(sessionID) || sessionAwaitingFallbackResult.has(sessionID)) {
+				const resolvedAgent = resolveAgentForSession(sessionID, input.agent)
+				const fallbackModels = getFallbackModelsForSession(
+					sessionID,
+					resolvedAgent,
+					deps.agentConfigs,
+					deps.globalFallbackModels
+				)
+				if (fallbackModels.includes(requestedModel)) {
+					logInfo("Ignoring stale fallback model mismatch during active retry", {
+						sessionID,
+						requestedModel,
+						currentModel: state.currentModel,
+					})
+					// Update state to match what's actually being sent
+					state.currentModel = requestedModel
+					return
+				}
 			}
 
 			logError("Detected manual model change, resetting fallback state", {

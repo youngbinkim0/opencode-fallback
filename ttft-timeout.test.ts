@@ -38,6 +38,7 @@ function createMockDeps(configOverrides?: Partial<FallbackPluginConfig>): HookDe
 		sessionAwaitingFallbackResult: new Set(),
 		sessionFallbackTimeouts: new Map(),
 		sessionFirstTokenReceived: new Map(),
+		sessionSelfAbortTimestamp: new Map(),
 	}
 }
 
@@ -53,10 +54,10 @@ function createMockHelpers(): AutoRetryHelpers {
 }
 
 describe("TTFT-based timeout", () => {
-	describe("#given TTFT mode enabled (ttft_timeout_seconds > 0)", () => {
+	describe("#given timeout enabled (timeout_seconds > 0)", () => {
 		describe("#when timeout fires and first token has been received", () => {
 			test("#then timeout is a no-op and session is not aborted", async () => {
-				const deps = createMockDeps({ ttft_timeout_seconds: 0.01 })
+				const deps = createMockDeps({ timeout_seconds: 0.01 })
 				const state = createFallbackState("anthropic/claude-opus-4-6")
 				state.currentModel = "google/gemini-pro"
 				deps.sessionStates.set("test-session", state)
@@ -73,7 +74,7 @@ describe("TTFT-based timeout", () => {
 
 		describe("#when timeout fires and no first token received", () => {
 			test("#then session is aborted", async () => {
-				const deps = createMockDeps({ ttft_timeout_seconds: 0.01 })
+				const deps = createMockDeps({ timeout_seconds: 0.01 })
 				const state = createFallbackState("anthropic/claude-opus-4-6")
 				state.currentModel = "google/gemini-pro"
 				deps.sessionStates.set("test-session", state)
@@ -89,25 +90,20 @@ describe("TTFT-based timeout", () => {
 		})
 	})
 
-	describe("#given fixed timeout mode (ttft_timeout_seconds = 0)", () => {
-		describe("#when timeout fires with firstTokenReceived true", () => {
-			test("#then session is aborted regardless (backward compatible)", async () => {
-				const deps = createMockDeps({
-					ttft_timeout_seconds: 0,
-					timeout_seconds: 0.01,
-				})
+	describe("#given timeout disabled (timeout_seconds = 0)", () => {
+		describe("#when timeout_seconds is 0", () => {
+			test("#then no timeout is scheduled", async () => {
+				const deps = createMockDeps({ timeout_seconds: 0 })
 				const state = createFallbackState("anthropic/claude-opus-4-6")
 				state.currentModel = "google/gemini-pro"
 				deps.sessionStates.set("test-session", state)
-				deps.sessionFirstTokenReceived.set("test-session", true)
 
 				const helpers = createAutoRetryHelpers(deps)
 				helpers.scheduleSessionFallbackTimeout("test-session")
 
 				await new Promise((r) => globalThis.setTimeout(r, 50))
 
-				// Fixed mode ignores firstTokenReceived — always aborts on timeout
-				expect(deps.ctx.client.session.abort).toHaveBeenCalled()
+				expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
 			})
 		})
 	})
@@ -204,9 +200,9 @@ describe("TTFT-based timeout", () => {
 		})
 	})
 
-	describe("#given ttft_timeout_seconds default config", () => {
-		test("#then defaults to 0 (disabled, backward compatible)", () => {
-			expect(DEFAULT_CONFIG.ttft_timeout_seconds).toBe(0)
+	describe("#given timeout_seconds default config", () => {
+		test("#then defaults to 30", () => {
+			expect(DEFAULT_CONFIG.timeout_seconds).toBe(30)
 		})
 	})
 })

@@ -61,11 +61,15 @@ export default async function OpenCodeFallbackPlugin(
 					configOverrides?.enabled ??
 					fileConfig?.enabled ??
 					DEFAULT_CONFIG.enabled,
-				retry_on_errors:
-					configOverrides?.retry_on_errors ??
-					fileConfig?.retry_on_errors ??
-					DEFAULT_CONFIG.retry_on_errors,
-				max_fallback_attempts:
+			retry_on_errors:
+				configOverrides?.retry_on_errors ??
+				fileConfig?.retry_on_errors ??
+				DEFAULT_CONFIG.retry_on_errors,
+			retryable_error_patterns:
+				configOverrides?.retryable_error_patterns ??
+				fileConfig?.retryable_error_patterns ??
+				DEFAULT_CONFIG.retryable_error_patterns,
+			max_fallback_attempts:
 					configOverrides?.max_fallback_attempts ??
 					fileConfig?.max_fallback_attempts ??
 					DEFAULT_CONFIG.max_fallback_attempts,
@@ -73,14 +77,10 @@ export default async function OpenCodeFallbackPlugin(
 					configOverrides?.cooldown_seconds ??
 					fileConfig?.cooldown_seconds ??
 					DEFAULT_CONFIG.cooldown_seconds,
-			 	timeout_seconds:
-				configOverrides?.timeout_seconds ??
-				fileConfig?.timeout_seconds ??
-				DEFAULT_CONFIG.timeout_seconds,
-			ttft_timeout_seconds:
-				configOverrides?.ttft_timeout_seconds ??
-				fileConfig?.ttft_timeout_seconds ??
-				DEFAULT_CONFIG.ttft_timeout_seconds,
+		 	timeout_seconds:
+			configOverrides?.timeout_seconds ??
+			fileConfig?.timeout_seconds ??
+			DEFAULT_CONFIG.timeout_seconds,
 			notify_on_fallback:
 					configOverrides?.notify_on_fallback ??
 					fileConfig?.notify_on_fallback ??
@@ -105,6 +105,7 @@ export default async function OpenCodeFallbackPlugin(
 		sessionAwaitingFallbackResult: new Set(),
 		sessionFallbackTimeouts: new Map(),
 		sessionFirstTokenReceived: new Map(),
+		sessionSelfAbortTimestamp: new Map(),
 	}
 
 	const helpers = createAutoRetryHelpers(deps)

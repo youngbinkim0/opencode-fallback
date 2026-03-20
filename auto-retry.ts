@@ -12,6 +12,11 @@ declare function setTimeout(
 ): ReturnType<typeof globalThis.setTimeout>
 declare function clearTimeout(timeout: ReturnType<typeof globalThis.setTimeout>): void
 
+// Delay after abort to let OpenCode's session-level abort propagation settle.
+// Without this, a promptAsync sent immediately after abort can itself be aborted
+// because OpenCode's abort is session-wide and takes time to fully propagate.
+const POST_ABORT_DELAY_MS = 150
+
 export function createAutoRetryHelpers(deps: HookDeps) {
 	const {
 		ctx,
@@ -26,6 +31,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 	const abortSessionRequest = async (sessionID: string, source: string): Promise<void> => {
 		try {
 			await ctx.client.session.abort({ path: { id: sessionID } })
+			deps.sessionSelfAbortTimestamp.set(sessionID, Date.now())
 			logInfo(`Aborted in-flight session request (${source})`, { sessionID })
 		} catch (error) {
 			logError(`Failed to abort in-flight session request (${source})`, {
@@ -46,18 +52,15 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 	const scheduleSessionFallbackTimeout = (sessionID: string, resolvedAgent?: string) => {
 		clearSessionFallbackTimeout(sessionID)
 
-		const useTTFT = config.ttft_timeout_seconds > 0
-		const timeoutMs = useTTFT
-			? config.ttft_timeout_seconds * 1000
-			: config.timeout_seconds * 1000
+		const timeoutMs = config.timeout_seconds * 1000
 		if (timeoutMs <= 0) return
 
 		const timer = setTimeout(async () => {
 			sessionFallbackTimeouts.delete(sessionID)
 
-			// TTFT mode: if first token has been received, model is streaming — don't abort
-			if (useTTFT && deps.sessionFirstTokenReceived.get(sessionID)) {
-				logInfo("TTFT timeout fired but first token already received, skipping abort", {
+			// TTFT: if first token has been received, model is streaming — don't abort
+			if (deps.sessionFirstTokenReceived.get(sessionID)) {
+				logInfo("Timeout fired but first token already received, skipping abort", {
 					sessionID,
 				})
 				return
@@ -71,7 +74,6 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			}
 
 			await abortSessionRequest(sessionID, "session.timeout")
-			sessionRetryInFlight.delete(sessionID)
 
 			if (state.pendingFallbackModel) {
 				state.pendingFallbackModel = undefined
@@ -87,20 +89,24 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 
 			logInfo("Session fallback timeout reached", {
 				sessionID,
-				timeoutSeconds: useTTFT ? config.ttft_timeout_seconds : config.timeout_seconds,
-				mode: useTTFT ? "ttft" : "fixed",
+				timeoutSeconds: config.timeout_seconds,
 				currentModel: state.currentModel,
 			})
 
-			const result = prepareFallback(sessionID, state, fallbackModels, config)
-			if (result.success && result.newModel) {
-				sessionRetryInFlight.add(sessionID)
-				await autoRetryWithFallback(
-					sessionID,
-					result.newModel,
-					resolvedAgent,
-					"session.timeout"
-				)
+			// Timeout callback manages its own lock lifecycle
+			sessionRetryInFlight.add(sessionID)
+			try {
+				const result = prepareFallback(sessionID, state, fallbackModels, config)
+				if (result.success && result.newModel) {
+					await autoRetryWithFallback(
+						sessionID,
+						result.newModel,
+						resolvedAgent,
+						"session.timeout"
+					)
+				}
+			} finally {
+				sessionRetryInFlight.delete(sessionID)
 			}
 		}, timeoutMs)
 
@@ -113,8 +119,18 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		resolvedAgent: string | undefined,
 		source: string
 	): Promise<void> => {
-		// Note: sessionRetryInFlight should be set by the caller to prevent race conditions
-		// between different events (e.g. message.updated and session.error).
+		// Guard: if the state has already been advanced past this model by
+		// a concurrent handler (race between message.updated / session.error /
+		// session.status), skip this retry — the other handler owns it now.
+		const preCheckState = sessionStates.get(sessionID)
+		if (preCheckState && preCheckState.currentModel !== newModel) {
+			logInfo(`Skipping stale autoRetryWithFallback (${source}): state already at ${preCheckState.currentModel}, wanted ${newModel}`, {
+				sessionID,
+				staleModel: newModel,
+				currentModel: preCheckState.currentModel,
+			})
+			return
+		}
 
 		const modelParts = newModel.split("/")
 		if (modelParts.length < 2) {
@@ -133,7 +149,12 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 
 		await abortSessionRequest(sessionID, `pre-fallback.${source}`)
 
-		sessionRetryInFlight.add(sessionID)
+		// Wait for OpenCode's session-level abort to fully propagate.
+		// Without this delay, the promptAsync below can be caught by the
+		// still-propagating abort and receive a spurious MessageAbortedError.
+		await new Promise((resolve) => setTimeout(resolve, POST_ABORT_DELAY_MS))
+
+		// Note: The caller holds sessionRetryInFlight. We do NOT manage it here.
 		deps.sessionFirstTokenReceived.set(sessionID, false)
 		let retryDispatched = false
 		try {
@@ -167,6 +188,19 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			}
 
 			if (lastUserPartsRaw && lastUserPartsRaw.length > 0) {
+				// Second stale check: re-verify after all async work (abort + delay +
+				// message fetch).  Another handler may have advanced the state during
+				// any of the awaits above.
+				const postCheckState = sessionStates.get(sessionID)
+				if (postCheckState && postCheckState.currentModel !== newModel) {
+					logInfo(`Skipping stale autoRetryWithFallback after async work (${source})`, {
+						sessionID,
+						staleModel: newModel,
+						currentModel: postCheckState.currentModel,
+					})
+					return
+				}
+
 				logInfo(`Auto-retrying with fallback model (${source})`, {
 					sessionID,
 					model: newModel,
@@ -237,7 +271,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			sessionAwaitingFallbackResult.delete(sessionID)
 			clearSessionFallbackTimeout(sessionID)
 		} finally {
-			sessionRetryInFlight.delete(sessionID)
+			// Note: sessionRetryInFlight is managed by the caller, not here.
 			if (!retryDispatched) {
 				sessionAwaitingFallbackResult.delete(sessionID)
 				clearSessionFallbackTimeout(sessionID)
@@ -302,6 +336,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				sessionRetryInFlight.delete(sessionID)
 				sessionAwaitingFallbackResult.delete(sessionID)
 				deps.sessionFirstTokenReceived.delete(sessionID)
+				deps.sessionSelfAbortTimestamp.delete(sessionID)
 				clearSessionFallbackTimeout(sessionID)
 				cleanedCount++
 			}

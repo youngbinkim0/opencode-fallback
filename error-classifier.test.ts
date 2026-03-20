@@ -322,4 +322,52 @@ describe("error-classifier", () => {
 			})
 		})
 	})
+
+	describe("#given user-provided retryable_error_patterns", () => {
+		describe("#when error matches a user pattern", () => {
+			test("#then isRetryableError returns true", () => {
+				const error = { message: "Custom vendor error: billing suspended" }
+				const userPatterns = ["billing\\s+suspended"]
+				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors, userPatterns)).toBe(true)
+			})
+		})
+
+		describe("#when error does not match any user pattern", () => {
+			test("#then falls through to default behavior", () => {
+				const error = { statusCode: 404, message: "Not found" }
+				const userPatterns = ["billing\\s+suspended"]
+				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors, userPatterns)).toBe(false)
+			})
+		})
+
+		describe("#when user patterns are empty", () => {
+			test("#then behaves like no patterns", () => {
+				const error = { statusCode: 404, message: "Not found" }
+				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors, [])).toBe(false)
+			})
+		})
+
+		describe("#when user patterns are undefined", () => {
+			test("#then behaves like no patterns", () => {
+				const error = { statusCode: 404, message: "Not found" }
+				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors, undefined)).toBe(false)
+			})
+		})
+
+		describe("#when user pattern is an invalid regex", () => {
+			test("#then skips the invalid pattern gracefully", () => {
+				const error = { message: "some error message" }
+				const userPatterns = ["[invalid", "some\\s+error"]
+				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors, userPatterns)).toBe(true)
+			})
+		})
+
+		describe("#when user pattern matches case-insensitively", () => {
+			test("#then returns true", () => {
+				const error = { message: "CUSTOM_PROVIDER_LIMIT_REACHED" }
+				const userPatterns = ["custom_provider_limit"]
+				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors, userPatterns)).toBe(true)
+			})
+		})
+	})
 })

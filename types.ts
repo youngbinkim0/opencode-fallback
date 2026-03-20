@@ -1,10 +1,17 @@
 export interface FallbackPluginConfig {
 	enabled?: boolean
 	retry_on_errors?: number[]
+	/** Additional regex patterns (strings) that mark an error as retryable.
+	 *  These supplement the built-in patterns. Each string is compiled as
+	 *  a case-insensitive regex and matched against the error message. */
+	retryable_error_patterns?: string[]
 	max_fallback_attempts?: number
 	cooldown_seconds?: number
+	/** Time-to-first-token timeout in seconds.  If the fallback model does not
+	 *  produce its first token within this window, it is aborted and the next
+	 *  fallback is tried.  Once streaming begins the timeout is cancelled.
+	 *  Set to 0 to disable. */
 	timeout_seconds?: number
-	ttft_timeout_seconds?: number
 	notify_on_fallback?: boolean
 	fallback_models?: string | string[]
 }
@@ -120,4 +127,7 @@ export interface HookDeps {
 	sessionAwaitingFallbackResult: Set<string>
 	sessionFallbackTimeouts: Map<string, ReturnType<typeof setTimeout>>
 	sessionFirstTokenReceived: Map<string, boolean>
+	/** Timestamp of the last plugin-initiated abort per session.
+	 *  Used to distinguish self-inflicted MessageAbortedError from user cancellation. */
+	sessionSelfAbortTimestamp: Map<string, number>
 }

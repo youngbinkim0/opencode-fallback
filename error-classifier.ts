@@ -200,7 +200,11 @@ export function extractErrorContentFromParts(
 	return { hasError: false }
 }
 
-export function isRetryableError(error: unknown, retryOnErrors: number[]): boolean {
+export function isRetryableError(
+	error: unknown,
+	retryOnErrors: number[],
+	userPatterns?: string[]
+): boolean {
 	const statusCode = extractStatusCode(error, retryOnErrors)
 	const message = getErrorMessage(error)
 	const errorType = classifyErrorType(error)
@@ -217,5 +221,21 @@ export function isRetryableError(error: unknown, retryOnErrors: number[]): boole
 		return true
 	}
 
-	return RETRYABLE_ERROR_PATTERNS.some((pattern) => pattern.test(message))
+	if (RETRYABLE_ERROR_PATTERNS.some((pattern) => pattern.test(message))) {
+		return true
+	}
+
+	// Check user-provided retryable_error_patterns from config
+	if (userPatterns && userPatterns.length > 0) {
+		for (const patternStr of userPatterns) {
+			try {
+				const re = new RegExp(patternStr, "i")
+				if (re.test(message)) return true
+			} catch {
+				// Invalid regex — skip silently
+			}
+		}
+	}
+
+	return false
 }
