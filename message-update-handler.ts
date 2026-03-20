@@ -341,27 +341,17 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				sessionLastAccess.set(sessionID, Date.now())
 			} else {
 				sessionLastAccess.set(sessionID, Date.now())
-
-				if (state.pendingFallbackModel) {
-					if (retrySignal && timeoutEnabled) {
-						logError(
-							"Clearing pending fallback due to provider auto-retry signal",
-							{
-								sessionID,
-								pendingFallbackModel: state.pendingFallbackModel,
-							}
-						)
-						state.pendingFallbackModel = undefined
-					} else {
-						logError(
-							"message.updated fallback skipped (pending fallback in progress)",
-							{
-								sessionID,
-								pendingFallbackModel: state.pendingFallbackModel,
-							}
-						)
-						return
-					}
+				
+				// Handle auto-retry signals from providers
+				if (state.pendingFallbackModel && retrySignal && timeoutEnabled) {
+					logError(
+						"Clearing pending fallback due to provider auto-retry signal",
+						{
+							sessionID,
+							pendingFallbackModel: state.pendingFallbackModel,
+						}
+					)
+					state.pendingFallbackModel = undefined
 				}
 			}
 
