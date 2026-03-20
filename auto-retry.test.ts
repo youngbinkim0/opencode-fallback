@@ -215,7 +215,7 @@ describe("auto-retry integration", () => {
 		})
 
 		describe("#when retry is already in flight", () => {
-			test("#then skips the retry", async () => {
+			test("#then callers are responsible for checking the lock before calling autoRetryWithFallback", async () => {
 				const deps = createMockDeps({
 					messagesData: [
 						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
@@ -223,6 +223,10 @@ describe("auto-retry integration", () => {
 				})
 				deps.sessionRetryInFlight.add("test-session")
 
+				// autoRetryWithFallback no longer checks the lock itself;
+				// callers (message-update-handler, event-handler) must check
+				// sessionRetryInFlight BEFORE calling prepareFallback + autoRetryWithFallback.
+				// So calling it directly with the lock set will still proceed.
 				const helpers = createAutoRetryHelpers(deps)
 				await helpers.autoRetryWithFallback(
 					"test-session",
@@ -231,9 +235,9 @@ describe("auto-retry integration", () => {
 					"test"
 				)
 
-				// Should not have called abort or promptAsync
-				expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
-				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+				// It proceeds because the lock contract is at the caller level
+				expect(deps.ctx.client.session.abort).toHaveBeenCalled()
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
 			})
 		})
 	})

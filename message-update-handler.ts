@@ -355,6 +355,15 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				}
 			}
 
+			// Acquire the retry lock BEFORE mutating state via prepareFallback.
+			// This prevents session.error from also calling prepareFallback on the
+			// same shared state object concurrently.
+			if (deps.sessionRetryInFlight.has(sessionID)) {
+				logInfo("message.updated skipped -- retry already in flight", { sessionID })
+				return
+			}
+			deps.sessionRetryInFlight.add(sessionID)
+
 			const result = prepareFallback(
 				sessionID,
 				state,
@@ -363,9 +372,6 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 			)
 
 			if (result.success && result.newModel) {
-				// Mark retry in flight IMMEDIATELY to prevent race conditions from other events
-				deps.sessionRetryInFlight.add(sessionID)
-
 				if (config.notify_on_fallback) {
 					deps.ctx.client.tui
 						.showToast({
@@ -389,35 +395,9 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				} finally {
 					deps.sessionRetryInFlight.delete(sessionID)
 				}
-			}
-
-
-			if (result.success && result.newModel) {
-				logInfo(`Calling autoRetryWithFallback from message.updated`, {
-					sessionID,
-					newModel: result.newModel,
-				})
-				try {
-					await helpers.autoRetryWithFallback(
-						sessionID,
-						result.newModel,
-						resolvedAgent,
-						"message.updated"
-					)
-					logInfo(`autoRetryWithFallback returned successfully in message.updated`, { sessionID })
-				} catch (e) {
-					logError(`autoRetryWithFallback THREW ERROR in message.updated`, {
-						sessionID,
-						error: String(e),
-						stack: e instanceof Error ? e.stack : undefined
-					})
-				}
 			} else {
-				logInfo(`Fallback not prepared in message.updated`, {
-					sessionID,
-					success: result.success,
-					newModel: result.newModel
-				})
+				// prepareFallback didn't succeed, release the lock
+				deps.sessionRetryInFlight.delete(sessionID)
 			}
 		}
 	}

@@ -180,12 +180,15 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		sessionAwaitingFallbackResult.delete(sessionID)
 		helpers.clearSessionFallbackTimeout(sessionID)
 
+		if (sessionRetryInFlight.has(sessionID)) {
+			logInfo("session.status skipped -- retry lock already held", { sessionID })
+			return
+		}
+		sessionRetryInFlight.add(sessionID)
+
 		const result = prepareFallback(sessionID, state, fallbackModels, config)
 
 		if (result.success && result.newModel) {
-			// Mark retry in flight IMMEDIATELY
-			deps.sessionRetryInFlight.add(sessionID)
-
 			if (config.notify_on_fallback) {
 				const modelName = result.newModel?.split("/").pop() || result.newModel
 				deps.ctx.client.tui
@@ -200,13 +203,18 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 					.catch(() => {})
 			}
 
-			await helpers.autoRetryWithFallback(
-				sessionID,
-				result.newModel,
-				resolvedAgent,
-				"session.status"
-			)
+			try {
+				await helpers.autoRetryWithFallback(
+					sessionID,
+					result.newModel,
+					resolvedAgent,
+					"session.status"
+				)
+			} finally {
+				sessionRetryInFlight.delete(sessionID)
+			}
 		} else if (!result.success) {
+			sessionRetryInFlight.delete(sessionID)
 			logError("session.status fallback failed", {
 				sessionID,
 				error: result.error,
@@ -367,12 +375,18 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			sessionLastAccess.set(sessionID, Date.now())
 		}
 
+		// Acquire the retry lock BEFORE mutating state via prepareFallback.
+		// This prevents message.updated from also calling prepareFallback on the
+		// same shared state object concurrently.
+		if (sessionRetryInFlight.has(sessionID)) {
+			logInfo("session.error skipped -- retry lock already held (pre-prepareFallback)", { sessionID })
+			return
+		}
+		sessionRetryInFlight.add(sessionID)
+
 		const result = prepareFallback(sessionID, state, fallbackModels, config)
 
 		if (result.success && result.newModel) {
-			// Mark retry in flight IMMEDIATELY
-			deps.sessionRetryInFlight.add(sessionID)
-
 			if (config.notify_on_fallback) {
 				const modelName = result.newModel?.split("/").pop() || result.newModel
 				const attemptInfo = `attempt ${state.attemptCount} of ${fallbackModels.length}`
@@ -388,15 +402,19 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 					.catch(() => {})
 			}
 
-			await helpers.autoRetryWithFallback(
-				sessionID,
-				result.newModel,
-				resolvedAgent,
-				"session.error"
-			)
-		}
-
-		if (!result.success) {
+			try {
+				await helpers.autoRetryWithFallback(
+					sessionID,
+					result.newModel,
+					resolvedAgent,
+					"session.error"
+				)
+			} finally {
+				sessionRetryInFlight.delete(sessionID)
+			}
+		} else {
+			// prepareFallback didn't succeed, release the lock
+			sessionRetryInFlight.delete(sessionID)
 			logError("Fallback preparation failed", {
 				sessionID,
 				error: result.error,
@@ -444,30 +462,41 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		sessionAwaitingFallbackResult.delete(sessionID)
 		helpers.clearSessionFallbackTimeout(sessionID)
 
+		if (sessionRetryInFlight.has(sessionID)) {
+			logInfo("session.status.immediate skipped -- retry lock already held", { sessionID })
+			return
+		}
+		sessionRetryInFlight.add(sessionID)
+
 		const result = prepareFallback(sessionID, state, fallbackModels, config)
 
-		if (result.success && config.notify_on_fallback) {
-			const modelName = result.newModel?.split("/").pop() || result.newModel
-			await deps.ctx.client.tui
-				.showToast({
-					body: {
-						title: "Provider Retry Too Slow - Switching Model",
-						variant: "warning",
-						duration: 5000,
-						message: `${status.message || "Provider retrying"} -> ${modelName} (immediate fallback)`,
-					},
-				})
-				.catch(() => {})
-		}
-
 		if (result.success && result.newModel) {
-			await helpers.autoRetryWithFallback(
-				sessionID,
-				result.newModel,
-				resolvedAgent,
-				"session.status.immediate"
-			)
+			if (config.notify_on_fallback) {
+				const modelName = result.newModel?.split("/").pop() || result.newModel
+				deps.ctx.client.tui
+					.showToast({
+						body: {
+							title: "Provider Retry Too Slow - Switching Model",
+							variant: "warning",
+							duration: 5000,
+							message: `${status.message || "Provider retrying"} -> ${modelName} (immediate fallback)`,
+						},
+					})
+					.catch(() => {})
+			}
+
+			try {
+				await helpers.autoRetryWithFallback(
+					sessionID,
+					result.newModel,
+					resolvedAgent,
+					"session.status.immediate"
+				)
+			} finally {
+				sessionRetryInFlight.delete(sessionID)
+			}
 		} else if (!result.success) {
+			sessionRetryInFlight.delete(sessionID)
 			logError("Immediate fallback preparation failed", {
 				sessionID,
 				error: result.error,
