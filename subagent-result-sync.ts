@@ -62,18 +62,22 @@ export async function waitForChildFallbackResult(
 		const firstTokenReceived = deps.sessionFirstTokenReceived.get(childSessionID)
 		if (firstTokenReceived) {
 			// Child has started generating tokens — keep waiting regardless
-			// of timeout. It will eventually go idle.
+			// of timeout.
 			if (!inFlight && !awaiting) {
-				// Flags cleared — check if session is now idle with a response
+				// Both flags cleared — message-update-handler has seen the
+				// final response. Try to extract it now. The session may still
+				// be "active" (tool calls after text generation) but the
+				// assistant text is already available in messages.
 				try {
+					const result = await extractAssistantResponse(deps, childSessionID)
+					if (result) {
+						logInfo(`[subagent-sync] Got fallback result for ${childSessionID} (${Date.now() - startTime}ms)`)
+						return result
+					}
+					// No text yet — check if session is idle (exhausted chain)
 					const sessionInfo = await deps.ctx.client.session.get({ path: { id: childSessionID } })
 					const status = sessionInfo?.data?.status as string | undefined
 					if (status === "idle") {
-						const result = await extractAssistantResponse(deps, childSessionID)
-						if (result) {
-							logInfo(`[subagent-sync] Got fallback result for ${childSessionID} (${Date.now() - startTime}ms)`)
-							return result
-						}
 						logInfo(`[subagent-sync] Child ${childSessionID} idle but no assistant response found`)
 						return null
 					}

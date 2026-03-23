@@ -175,19 +175,24 @@ describe("subagent-result-sync", () => {
 			expect(result).toBeNull()
 		})
 
-		it("keeps waiting when child is actively streaming (does not enforce timeout)", async () => {
+		it("keeps waiting when child is actively streaming with awaiting flag set (does not enforce timeout)", async () => {
 			const deps = createMockDeps()
 			const childID = "ses_streaming"
 
-			// Child has first token — actively streaming
+			// Child has first token AND is still awaiting (real-world case:
+			// streaming but message-update-handler hasn't seen final response yet)
 			deps.sessionFirstTokenReceived.set(childID, true)
+			deps.sessionAwaitingFallbackResult.add(childID)
 
-			// Simulate: active for several polls, then goes idle
+			// After several polls, clear the awaiting flag (simulates final response detected)
 			let pollCount = 0
+			setTimeout(() => {
+				deps.sessionAwaitingFallbackResult.delete(childID)
+			}, 250)
 			;(deps.ctx.client.session.get as any).mockImplementation(() => {
 				pollCount++
 				return Promise.resolve({
-					data: { status: pollCount >= 6 ? "idle" : "active" },
+					data: { status: "active" },
 				})
 			})
 			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
@@ -202,8 +207,29 @@ describe("subagent-result-sync", () => {
 			// maxWaitMs is very short, but child is streaming so timeout should NOT apply
 			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 100, pollIntervalMs: 50 })
 			expect(result).toBe("Streamed response after long generation.")
-			// Verify it actually polled past the maxWaitMs boundary
-			expect(pollCount).toBeGreaterThanOrEqual(6)
+		})
+
+		it("extracts response immediately when flags clear and first token received", async () => {
+			const deps = createMockDeps()
+			const childID = "ses_flags_clear"
+
+			// Flags already clear, first token received — should extract immediately
+			deps.sessionFirstTokenReceived.set(childID, true)
+
+			;(deps.ctx.client.session.get as any).mockImplementation(() =>
+				Promise.resolve({ data: { status: "active" } })
+			)
+			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
+				Promise.resolve({
+					data: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+						{ info: { role: "assistant" }, parts: [{ type: "text", text: "Immediate extraction." }] },
+					],
+				})
+			)
+
+			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 100, pollIntervalMs: 50 })
+			expect(result).toBe("Immediate extraction.")
 		})
 
 		it("keeps waiting when child is streaming AND in sessionAwaitingFallbackResult", async () => {
