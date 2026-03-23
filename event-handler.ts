@@ -39,6 +39,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			sessionRetryInFlight.delete(sessionID)
 			sessionAwaitingFallbackResult.delete(sessionID)
 			deps.sessionSelfAbortTimestamp.delete(sessionID)
+			deps.sessionParentID.delete(sessionID)
 			helpers.clearSessionFallbackTimeout(sessionID)
 		}
 	}
@@ -458,9 +459,9 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		sessionAwaitingFallbackResult.delete(sessionID)
 		helpers.clearSessionFallbackTimeout(sessionID)
 
-		const result = prepareFallback(sessionID, state, fallbackModels, config)
+			const result = prepareFallback(sessionID, state, fallbackModels, config)
 
-		if (result.success && result.newModel) {
+			if (result.success && result.newModel) {
 			if (config.notify_on_fallback) {
 				const modelName = result.newModel?.split("/").pop() || result.newModel
 				deps.ctx.client.tui

@@ -388,7 +388,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 					sessionID,
 					state,
 					fallbackModels,
-					config
+					config,
 				)
 
 				if (result.success && result.newModel) {

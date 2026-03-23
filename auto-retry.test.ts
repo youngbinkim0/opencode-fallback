@@ -40,6 +40,7 @@ function createMockDeps(overrides?: Partial<{
 		sessionFallbackTimeouts: new Map(),
 		sessionFirstTokenReceived: new Map(),
 		sessionSelfAbortTimestamp: new Map(),
+		sessionParentID: new Map(),
 	}
 }
 
@@ -237,6 +238,118 @@ describe("auto-retry integration", () => {
 				)
 
 				// It proceeds because the lock contract is at the caller level
+				expect(deps.ctx.client.session.abort).toHaveBeenCalled()
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
+			})
+		})
+	})
+
+	describe("#given model has already stopped (error-triggered source)", () => {
+		describe("#when source is session.error", () => {
+			test("#then abort is skipped and replay proceeds directly", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+				})
+
+				const helpers = createAutoRetryHelpers(deps)
+				await helpers.autoRetryWithFallback(
+					"test-session",
+					"openai/gpt-4o",
+					undefined,
+					"session.error"
+				)
+
+				expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
+			})
+		})
+
+		describe("#when source is message.updated", () => {
+			test("#then abort is skipped and replay proceeds directly", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+				})
+
+				const helpers = createAutoRetryHelpers(deps)
+				await helpers.autoRetryWithFallback(
+					"test-session",
+					"openai/gpt-4o",
+					undefined,
+					"message.updated"
+				)
+
+				expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
+			})
+		})
+	})
+
+	describe("#given caller already aborted (timeout-triggered source)", () => {
+		describe("#when source is session.timeout", () => {
+			test("#then autoRetryWithFallback does not double-abort but still replays", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+				})
+
+				const helpers = createAutoRetryHelpers(deps)
+				await helpers.autoRetryWithFallback(
+					"test-session",
+					"openai/gpt-4o",
+					undefined,
+					"session.timeout"
+				)
+
+				// No abort inside autoRetryWithFallback (caller already did it)
+				expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
+			})
+		})
+	})
+
+	describe("#given model still in-flight (status-triggered source)", () => {
+		describe("#when source is session.status", () => {
+			test("#then abort IS called to stop the in-flight request", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+				})
+
+				const helpers = createAutoRetryHelpers(deps)
+				await helpers.autoRetryWithFallback(
+					"test-session",
+					"openai/gpt-4o",
+					undefined,
+					"session.status"
+				)
+
+				expect(deps.ctx.client.session.abort).toHaveBeenCalled()
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
+			})
+		})
+
+		describe("#when source is session.status.immediate", () => {
+			test("#then abort IS called to stop the in-flight request", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+				})
+
+				const helpers = createAutoRetryHelpers(deps)
+				await helpers.autoRetryWithFallback(
+					"test-session",
+					"openai/gpt-4o",
+					undefined,
+					"session.status.immediate"
+				)
+
 				expect(deps.ctx.client.session.abort).toHaveBeenCalled()
 				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
 			})

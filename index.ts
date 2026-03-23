@@ -108,7 +108,6 @@ export default async function OpenCodeFallbackPlugin(
 		sessionFirstTokenReceived: new Map(),
 		sessionSelfAbortTimestamp: new Map(),
 		sessionParentID: new Map(),
-		globalModelCooldown: new Map(),
 	}
 
 	const helpers = createAutoRetryHelpers(deps)

@@ -52,7 +52,6 @@ function createMockDeps(overrides?: Partial<HookDeps>): HookDeps {
 		sessionFirstTokenReceived: new Map(),
 		sessionSelfAbortTimestamp: new Map(),
 		sessionParentID: new Map(),
-		globalModelCooldown: new Map(),
 		...overrides,
 	}
 }

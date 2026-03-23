@@ -31,6 +31,7 @@ function createMockDeps(configOverrides?: Partial<FallbackPluginConfig>): HookDe
 		sessionFallbackTimeouts: new Map(),
 		sessionFirstTokenReceived: new Map(),
 		sessionSelfAbortTimestamp: new Map(),
+		sessionParentID: new Map(),
 	}
 }
 

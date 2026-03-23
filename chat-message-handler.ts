@@ -1,6 +1,5 @@
 import type { HookDeps, ChatMessageInput, ChatMessageOutput } from "./types"
 import type { AutoRetryHelpers } from "./auto-retry"
-import { PLUGIN_NAME } from "./constants"
 import { createFallbackState, recoverToOriginal } from "./fallback-state"
 import { getFallbackModelsForSession, resolveAgentForSession } from "./config-reader"
 import { logInfo, logError } from "./logger"
@@ -21,7 +20,9 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 		const { sessionID } = input
 		let state = sessionStates.get(sessionID)
 
-		if (!state) return
+		if (!state) {
+			return
+		}
 
 		sessionLastAccess.set(sessionID, Date.now())
 

@@ -130,4 +130,8 @@ export interface HookDeps {
 	/** Timestamp of the last plugin-initiated abort per session.
 	 *  Used to distinguish self-inflicted MessageAbortedError from user cancellation. */
 	sessionSelfAbortTimestamp: Map<string, number>
+	/** Cached parentID for child sessions.  `undefined` value means "looked up,
+	 *  no parent" so we distinguish from "never looked up" (key absent). */
+	sessionParentID: Map<string, string | null>
+
 }

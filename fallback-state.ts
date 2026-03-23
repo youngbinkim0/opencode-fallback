@@ -42,7 +42,7 @@ export function prepareFallback(
 	sessionID: string,
 	state: FallbackState,
 	fallbackModels: string[],
-	config: Required<FallbackPluginConfig>
+	config: Required<FallbackPluginConfig>,
 ): FallbackResult {
 	if (state.attemptCount >= config.max_fallback_attempts) {
 		logInfo(`Max fallback attempts reached for session ${sessionID} (${state.attemptCount})`)
