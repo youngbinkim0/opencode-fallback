@@ -206,6 +206,40 @@ describe("subagent-result-sync", () => {
 			expect(pollCount).toBeGreaterThanOrEqual(6)
 		})
 
+		it("keeps waiting when child is streaming AND in sessionAwaitingFallbackResult", async () => {
+			const deps = createMockDeps()
+			const childID = "ses_await_streaming"
+
+			// Real-world scenario: child is both awaiting AND has first token
+			deps.sessionAwaitingFallbackResult.add(childID)
+			deps.sessionFirstTokenReceived.set(childID, true)
+
+			// After several polls, clear awaiting and go idle
+			let pollCount = 0
+			setTimeout(() => {
+				deps.sessionAwaitingFallbackResult.delete(childID)
+			}, 200)
+			;(deps.ctx.client.session.get as any).mockImplementation(() => {
+				pollCount++
+				// Only called after awaiting flag clears
+				return Promise.resolve({
+					data: { status: pollCount >= 2 ? "idle" : "active" },
+				})
+			})
+			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
+				Promise.resolve({
+					data: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+						{ info: { role: "assistant" }, parts: [{ type: "text", text: "Response after streaming while awaiting." }] },
+					],
+				})
+			)
+
+			// maxWaitMs is very short but child is streaming — should NOT timeout
+			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 100, pollIntervalMs: 50 })
+			expect(result).toBe("Response after streaming while awaiting.")
+		})
+
 		it("times out when child is active but NOT streaming (no first token)", async () => {
 			const deps = createMockDeps()
 			const childID = "ses_stuck"

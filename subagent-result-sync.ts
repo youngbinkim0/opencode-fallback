@@ -55,8 +55,39 @@ export async function waitForChildFallbackResult(
 		const inFlight = deps.sessionRetryInFlight.has(childSessionID)
 		const awaiting = deps.sessionAwaitingFallbackResult.has(childSessionID)
 
+		// Check if child is actively streaming tokens — this takes priority
+		// over all other checks. A child can be in sessionAwaitingFallbackResult
+		// AND streaming simultaneously (the "awaiting" flag stays set until a
+		// visible final response is detected by message-update-handler).
+		const firstTokenReceived = deps.sessionFirstTokenReceived.get(childSessionID)
+		if (firstTokenReceived) {
+			// Child has started generating tokens — keep waiting regardless
+			// of timeout. It will eventually go idle.
+			if (!inFlight && !awaiting) {
+				// Flags cleared — check if session is now idle with a response
+				try {
+					const sessionInfo = await deps.ctx.client.session.get({ path: { id: childSessionID } })
+					const status = sessionInfo?.data?.status as string | undefined
+					if (status === "idle") {
+						const result = await extractAssistantResponse(deps, childSessionID)
+						if (result) {
+							logInfo(`[subagent-sync] Got fallback result for ${childSessionID} (${Date.now() - startTime}ms)`)
+							return result
+						}
+						logInfo(`[subagent-sync] Child ${childSessionID} idle but no assistant response found`)
+						return null
+					}
+				} catch (err) {
+					logInfo(`[subagent-sync] Error checking child session: ${err}`)
+				}
+			}
+			// Still streaming or still in retry — keep waiting with no timeout
+			await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
+			continue
+		}
+
 		if (!inFlight && !awaiting) {
-			// Check child session status
+			// No first token yet, but flags are clear — check session status
 			try {
 				const sessionInfo = await deps.ctx.client.session.get({ path: { id: childSessionID } })
 				const status = sessionInfo?.data?.status as string | undefined
@@ -72,24 +103,12 @@ export async function waitForChildFallbackResult(
 					logInfo(`[subagent-sync] Child ${childSessionID} idle but no assistant response found`)
 					return null
 				}
-
-				if (status === "active") {
-					// Child is actively generating — check if it's making progress
-					// (first token received means it's streaming, not stuck waiting)
-					const firstTokenReceived = deps.sessionFirstTokenReceived.get(childSessionID)
-					if (firstTokenReceived) {
-						// Child is streaming tokens — don't enforce timeout, keep waiting
-						logInfo(`[subagent-sync] Child ${childSessionID} actively streaming, continuing wait (${Date.now() - startTime}ms elapsed)`)
-						await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
-						continue
-					}
-				}
 			} catch (err) {
 				logInfo(`[subagent-sync] Error checking child session: ${err}`)
 			}
 		}
 
-		// Enforce timeout only when child is NOT actively streaming
+		// Enforce timeout only when child has NOT started streaming
 		if (Date.now() - startTime >= maxWaitMs) {
 			logInfo(`[subagent-sync] Timed out waiting for child ${childSessionID} after ${maxWaitMs}ms`)
 			return null
