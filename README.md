@@ -48,7 +48,7 @@ Add `fallback_models` to any agent in `opencode.json`:
 }
 ```
 
-When `anthropic/claude-sonnet-4-6` hits a rate limit or quota error, the plugin automatically retries with `openai/gpt-4o`, then `google/gemini-pro` if that also fails.
+When `anthropic/claude-opus-4-6` hits a rate limit or quota error, the plugin automatically retries with `openai/gpt-5.4`, then `kimi-for-coding/k2p5` if that also fails.
 
 A single string is accepted too:
 
