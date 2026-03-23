@@ -93,7 +93,7 @@ Plans:
 
 Plans:
 - [x] 04.1-01-PLAN.md — TDD: subagent empty task-result synchronization helpers (detection, session ID extraction, bounded polling)
-- [ ] 04.1-02-PLAN.md — Wire tool.execute.after replacement flow + remove deferred proactive redirection + regression coverage
+- [x] 04.1-02-PLAN.md — Wire tool.execute.after replacement flow + remove deferred proactive redirection + regression coverage
 
 ## Progress
 
@@ -106,4 +106,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | 2. Global Fallback Config | 2/2 | Complete    | 2026-03-19 |
 | 3. Auto-Recovery | 2/2 | Complete | 2026-03-19 |
 | 4. TTFT-Based Timeout | 2/2 | Complete | 2026-03-19 |
-| 4.1. Subagent Fallback Fix | 1/2 | In Progress | 2026-03-23 |
+| 4.1. Subagent Fallback Fix | 2/2 | Complete | 2026-03-23 |
