@@ -175,6 +175,54 @@ describe("subagent-result-sync", () => {
 			expect(result).toBeNull()
 		})
 
+		it("keeps waiting when child is actively streaming (does not enforce timeout)", async () => {
+			const deps = createMockDeps()
+			const childID = "ses_streaming"
+
+			// Child has first token — actively streaming
+			deps.sessionFirstTokenReceived.set(childID, true)
+
+			// Simulate: active for several polls, then goes idle
+			let pollCount = 0
+			;(deps.ctx.client.session.get as any).mockImplementation(() => {
+				pollCount++
+				return Promise.resolve({
+					data: { status: pollCount >= 6 ? "idle" : "active" },
+				})
+			})
+			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
+				Promise.resolve({
+					data: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+						{ info: { role: "assistant" }, parts: [{ type: "text", text: "Streamed response after long generation." }] },
+					],
+				})
+			)
+
+			// maxWaitMs is very short, but child is streaming so timeout should NOT apply
+			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 100, pollIntervalMs: 50 })
+			expect(result).toBe("Streamed response after long generation.")
+			// Verify it actually polled past the maxWaitMs boundary
+			expect(pollCount).toBeGreaterThanOrEqual(6)
+		})
+
+		it("times out when child is active but NOT streaming (no first token)", async () => {
+			const deps = createMockDeps()
+			const childID = "ses_stuck"
+
+			// No first token — child is active but stuck (no progress)
+			// sessionFirstTokenReceived NOT set for this child
+
+			;(deps.ctx.client.session.get as any).mockImplementation(() =>
+				Promise.resolve({
+					data: { status: "active" },
+				})
+			)
+
+			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 200, pollIntervalMs: 50 })
+			expect(result).toBeNull()
+		})
+
 		it("concatenates multiple text parts from assistant message", async () => {
 			const deps = createMockDeps()
 			const childID = "ses_multipart"
