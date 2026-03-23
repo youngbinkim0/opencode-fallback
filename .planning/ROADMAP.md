@@ -14,7 +14,7 @@ Four targeted enhancements to an existing, working OpenCode fallback plugin. Eac
 - [x] **Phase 2: Global Fallback Config** - Default fallback chain for agents without per-agent config (completed 2026-03-19)
 - [x] **Phase 3: Auto-Recovery** - Automatic switch back to primary model when cooldown expires (completed 2026-03-19)
 - [x] **Phase 4: TTFT-Based Timeout** - Time-to-first-token timeout replaces fixed timer for smarter fallback (completed 2026-03-19)
-- [ ] **Phase 4.1: Subagent Fallback Fix** - INSERTED — Fix empty task results when child session fallback triggers (parent receives actual fallback response)
+- [~] **Phase 4.1: Subagent Fallback Fix** - INSERTED — Fix empty task results when child session fallback triggers (parent receives actual fallback response)
 
 ## Phase Details
 
@@ -92,7 +92,7 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 04.1-01-PLAN.md — TDD: subagent empty task-result synchronization helpers (detection, session ID extraction, bounded polling)
+- [x] 04.1-01-PLAN.md — TDD: subagent empty task-result synchronization helpers (detection, session ID extraction, bounded polling)
 - [ ] 04.1-02-PLAN.md — Wire tool.execute.after replacement flow + remove deferred proactive redirection + regression coverage
 
 ## Progress
@@ -106,4 +106,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | 2. Global Fallback Config | 2/2 | Complete    | 2026-03-19 |
 | 3. Auto-Recovery | 2/2 | Complete | 2026-03-19 |
 | 4. TTFT-Based Timeout | 2/2 | Complete | 2026-03-19 |
-| 4.1. Subagent Fallback Fix | 0/2 | Planned | — |
+| 4.1. Subagent Fallback Fix | 1/2 | In Progress | 2026-03-23 |
