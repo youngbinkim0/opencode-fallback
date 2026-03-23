@@ -11,6 +11,7 @@ import { createEventHandler } from "./event-handler"
 import { createMessageUpdateHandler } from "./message-update-handler"
 import { createChatMessageHandler } from "./chat-message-handler"
 import { normalizeFallbackModelsField } from "./config-reader"
+import { isEmptyTaskResult, extractChildSessionID, waitForChildFallbackResult } from "./subagent-result-sync"
 import { readFileSync, existsSync } from "fs"
 import { join } from "path"
 import { logInfo } from "./logger"
@@ -106,6 +107,8 @@ export default async function OpenCodeFallbackPlugin(
 		sessionFallbackTimeouts: new Map(),
 		sessionFirstTokenReceived: new Map(),
 		sessionSelfAbortTimestamp: new Map(),
+		sessionParentID: new Map(),
+		globalModelCooldown: new Map(),
 	}
 
 	const helpers = createAutoRetryHelpers(deps)
@@ -154,6 +157,54 @@ export default async function OpenCodeFallbackPlugin(
 				return
 			}
 			await baseEventHandler({ event })
+		},
+
+		"tool.execute.after": async (
+			input: { tool: string; sessionID: string; callID: string; args: any },
+			output: { title: string; output: string; metadata: any }
+		) => {
+			// Only intercept task tool calls with empty results
+			if (input.tool !== "task" || !isEmptyTaskResult(output.output)) {
+				return
+			}
+
+			const childSessionID = extractChildSessionID(output.output)
+			if (!childSessionID) {
+				logInfo("Empty task result but no child session ID found", {
+					sessionID: input.sessionID,
+					outputPreview: output.output?.substring(0, 200),
+				})
+				return
+			}
+
+			logInfo("Detected empty task result, waiting for child fallback", {
+				parentSession: input.sessionID,
+				childSession: childSessionID,
+			})
+
+			// Wait for child session fallback to complete (bounded)
+			const maxWaitMs = Math.min(
+				(deps.config.timeout_seconds || 120) * 1000,
+				120_000,
+			)
+			const replacementText = await waitForChildFallbackResult(deps, childSessionID, {
+				maxWaitMs,
+				pollIntervalMs: 500,
+			})
+
+			if (replacementText) {
+				output.output = replacementText
+				logInfo("Replaced empty task result with fallback response", {
+					parentSession: input.sessionID,
+					childSession: childSessionID,
+					responseLength: replacementText.length,
+				})
+			} else {
+				logInfo("No fallback response available, preserving original output", {
+					parentSession: input.sessionID,
+					childSession: childSessionID,
+				})
+			}
 		},
 
 		"chat.message": async (
