@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-last_updated: "2026-03-23T22:09:55.456Z"
-last_activity: 2026-03-23 — Plan 04.1-01 sync helpers implemented (13 tests)
+last_updated: "2026-03-23T22:15:00.000Z"
+last_activity: 2026-03-23 — Phase 4.1 both plans complete (178 tests)
 progress:
   total_phases: 5
-  completed_phases: 1
-  total_plans: 8
-  completed_plans: 4
-  percent: 90
+  completed_phases: 4
+  total_plans: 10
+  completed_plans: 10
+  percent: 100
 ---
 
 # Project State
@@ -24,19 +24,19 @@ See: .planning/PROJECT.md (updated 2026-03-18)
 
 ## Current Position
 
-Phase: 4.1 of 4.1 (executing)
-Plan: 04.1-01 complete, 04.1-02 pending
-Status: Executing
-Last activity: 2026-03-23 — Plan 04.1-01 sync helpers implemented (13 tests)
+Phase: 4.1 of 4.1 (all plans complete, pending verification)
+Plan: 04.1-02 complete (2/2)
+Status: Verifying
+Last activity: 2026-03-23 — Both plans complete, 178 tests passing
 
-Progress: [█████████░] 90%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 8
-- Total execution time: ~2 hours
-- Tests: 126 pass, 0 fail, 8 test files
+- Total plans completed: 10
+- Total execution time: ~2.5 hours
+- Tests: 178 pass, 0 fail, 10 test files
 
 **By Phase:**
 
@@ -46,7 +46,7 @@ Progress: [█████████░] 90%
 | 2: Global Fallback Config | 2 | ✅ Complete | 9 |
 | 3: Auto-Recovery | 2 | ✅ Complete | 16 |
 | 4: TTFT-Based Timeout | 2 | ✅ Complete | 8 |
-| Phase 04.1-subagent-fallback-fix P01 | 5min | 2 tasks | 2 files |
+| 4.1: Subagent Fallback Fix | 2 | ✅ Complete | 18 |
 
 ## Accumulated Context
 
@@ -74,7 +74,10 @@ All 16 v1 requirements addressed:
 - [Plan 01]: Flexible regex for empty tag detection (`/<task_result>\s*<\/task_result>/`)
 - [Plan 01]: Fixed 500ms polling interval, no exponential backoff
 - [Plan 01]: Helper module pure — no hook registration, clean separation
+- [Plan 02]: Replaced diagnostic hook with real interception in tool.execute.after
+- [Plan 02]: Removed globalModelCooldown — proactive redirect unnecessary with post-tool fix
+- [Plan 02]: Max wait bounded by config timeout_seconds (capped at 120s)
 
 ## Session Continuity
 
-Phase 4.1 plan 01 complete. Plan 02 (hook integration + proactive redirect removal) next.
+Phase 4.1 all plans complete. Pending verification.
