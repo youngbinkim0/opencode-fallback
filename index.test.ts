@@ -88,7 +88,7 @@ describe("OpenCodeFallbackPlugin", () => {
 		})
 
 		describe("#when session.error event is received", () => {
-			it("#then event handler processes the error", async () => {
+			it("#then event handler processes the error without aborting (model already stopped)", async () => {
 				const plugin = await OpenCodeFallbackPlugin(ctx)
 
 				plugin.config({
@@ -99,6 +99,15 @@ describe("OpenCodeFallbackPlugin", () => {
 						},
 					},
 				})
+
+				// Provide a user message so replay can proceed
+				;(ctx.client.session.messages as any).mockImplementation(() =>
+					Promise.resolve({
+						data: [
+							{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+						],
+					})
+				)
 
 				await plugin.event({
 					event: {
@@ -111,7 +120,10 @@ describe("OpenCodeFallbackPlugin", () => {
 					},
 				})
 
-				expect(ctx.client.session.abort).toHaveBeenCalled()
+				// Model already stopped on error — abort is skipped
+				expect(ctx.client.session.abort).not.toHaveBeenCalled()
+				// Replay proceeds directly with fallback model
+				expect(ctx.client.session.promptAsync).toHaveBeenCalled()
 			})
 		})
 
@@ -182,6 +194,154 @@ describe("OpenCodeFallbackPlugin", () => {
 				})
 
 				expect(true).toBe(true)
+			})
+		})
+
+		describe("tool.execute.after", () => {
+			it("#then replaces empty task result with fallback response when child completes", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+				const childSessionID = "ses_child123abc"
+
+				// Mock: child session goes idle and has an assistant response
+				;(ctx.client.session.get as any).mockImplementation(() =>
+					Promise.resolve({
+						data: { status: "idle" },
+					})
+				)
+				;(ctx.client.session.messages as any).mockImplementation(() =>
+					Promise.resolve({
+						data: [
+							{ info: { role: "user" }, parts: [{ type: "text", text: "Do the task" }] },
+							{ info: { role: "assistant" }, parts: [{ type: "text", text: "Here is the completed task result from fallback model." }] },
+						],
+					})
+				)
+
+				const input = {
+					tool: "task",
+					sessionID: "ses_parent456",
+					callID: "call_001",
+					args: {},
+				}
+				const output = {
+					title: "Task",
+					output: `task_id: ${childSessionID} (for resuming to continue this task if needed)\n\n<task_result>\n\n</task_result>`,
+					metadata: {},
+				}
+
+				await plugin["tool.execute.after"](input, output)
+
+				expect(output.output).toBe("Here is the completed task result from fallback model.")
+			})
+
+			it("#then waits while child has active fallback then replaces result", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+				const childSessionID = "ses_waitchild"
+
+				// Simulate: child starts in-flight, then completes after a delay
+				let callCount = 0
+				;(ctx.client.session.get as any).mockImplementation(() => {
+					callCount++
+					return Promise.resolve({
+						data: { status: callCount >= 3 ? "idle" : "active" },
+					})
+				})
+				;(ctx.client.session.messages as any).mockImplementation(() =>
+					Promise.resolve({
+						data: [
+							{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+							{ info: { role: "assistant" }, parts: [{ type: "text", text: "Fallback result after wait." }] },
+						],
+					})
+				)
+
+				const input = {
+					tool: "task",
+					sessionID: "ses_parent789",
+					callID: "call_002",
+					args: {},
+				}
+				const output = {
+					title: "Task",
+					output: `task_id: ${childSessionID} (for resuming...)\n\n<task_result>\n\n</task_result>`,
+					metadata: {},
+				}
+
+				await plugin["tool.execute.after"](input, output)
+
+				expect(output.output).toBe("Fallback result after wait.")
+			})
+
+			it("#then preserves original empty result on max-wait timeout", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx, { timeout_seconds: 1 })
+				const childSessionID = "ses_timeoutchild"
+
+				// Child never goes idle
+				;(ctx.client.session.get as any).mockImplementation(() =>
+					Promise.resolve({
+						data: { status: "active" },
+					})
+				)
+
+				const input = {
+					tool: "task",
+					sessionID: "ses_parent_timeout",
+					callID: "call_003",
+					args: {},
+				}
+				const originalOutput = `task_id: ${childSessionID} (for resuming...)\n\n<task_result>\n\n</task_result>`
+				const output = {
+					title: "Task",
+					output: originalOutput,
+					metadata: {},
+				}
+
+				await plugin["tool.execute.after"](input, output)
+
+				// Should preserve original since timeout
+				expect(output.output).toBe(originalOutput)
+			})
+
+			it("#then does not modify non-task tool output", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+
+				const input = {
+					tool: "bash",
+					sessionID: "ses_parent_bash",
+					callID: "call_004",
+					args: {},
+				}
+				const originalOutput = "some bash output"
+				const output = {
+					title: "Bash",
+					output: originalOutput,
+					metadata: {},
+				}
+
+				await plugin["tool.execute.after"](input, output)
+
+				expect(output.output).toBe(originalOutput)
+			})
+
+			it("#then does not modify non-empty task result", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+
+				const input = {
+					tool: "task",
+					sessionID: "ses_parent_nonempty",
+					callID: "call_005",
+					args: {},
+				}
+				const originalOutput = `task_id: ses_child999 (for resuming...)\n\n<task_result>\nActual content here\n</task_result>`
+				const output = {
+					title: "Task",
+					output: originalOutput,
+					metadata: {},
+				}
+
+				await plugin["tool.execute.after"](input, output)
+
+				expect(output.output).toBe(originalOutput)
 			})
 		})
 	})
