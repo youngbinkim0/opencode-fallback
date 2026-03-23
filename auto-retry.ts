@@ -28,6 +28,29 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		sessionFallbackTimeouts,
 	} = deps
 
+	/** Look up the parentID for a session, with caching.
+	 *  Returns the parentID string if this is a child session, or null. */
+	const getParentSessionID = async (sessionID: string): Promise<string | null> => {
+		const cached = deps.sessionParentID.get(sessionID)
+		if (cached !== undefined) return cached
+
+		try {
+			const sessionInfo = await ctx.client.session.get({ path: { id: sessionID } })
+			const sessionData = (sessionInfo?.data ?? sessionInfo) as Record<string, unknown>
+			const parentID = typeof sessionData?.parentID === "string" && sessionData.parentID.length > 0
+				? sessionData.parentID
+				: null
+			deps.sessionParentID.set(sessionID, parentID)
+			if (parentID) {
+				logInfo("Detected child session", { sessionID, parentID })
+			}
+			return parentID
+		} catch {
+			logError("Failed to look up parentID", { sessionID })
+			return null
+		}
+	}
+
 	const abortSessionRequest = async (sessionID: string, source: string): Promise<void> => {
 		try {
 			await ctx.client.session.abort({ path: { id: sessionID } })
@@ -73,6 +96,11 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				logInfo("Overriding in-flight retry due to session timeout", { sessionID })
 			}
 
+			// For TTFT timeouts we MUST abort even for child sessions — the
+			// hung model is still consuming the session and we cannot send a
+			// replay until it is stopped.  The downstream autoRetryWithFallback
+			// will handle the child-session concern (skipping its own abort
+			// since we already did it here).
 			await abortSessionRequest(sessionID, "session.timeout")
 
 			if (state.pendingFallbackModel) {
@@ -147,12 +175,36 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			modelID: modelParts.slice(1).join("/"),
 		}
 
-		await abortSessionRequest(sessionID, `pre-fallback.${source}`)
+		// ── TOP-LEVEL SESSION HANDLING ──
+		// Decide whether to abort based on model state, not session type.
+		//
+		// Error-triggered sources (session.error, message.updated): the model
+		// has already stopped — abort is unnecessary and harmful (for child
+		// sessions it signals the parent that the child is done, causing an
+		// empty response).
+		//
+		// Timeout (session.timeout): the caller already aborted because the
+		// model was hung — just wait for propagation.
+		//
+		// Status sources (session.status, session.status.immediate): the model
+		// is still in a provider retry loop — abort is needed to stop it.
+		const modelAlreadyStopped = source === "session.error" || source === "message.updated"
+		const callerAlreadyAborted = source === "session.timeout"
 
-		// Wait for OpenCode's session-level abort to fully propagate.
-		// Without this delay, the promptAsync below can be caught by the
-		// still-propagating abort and receive a spurious MessageAbortedError.
-		await new Promise((resolve) => setTimeout(resolve, POST_ABORT_DELAY_MS))
+		if (modelAlreadyStopped) {
+			logInfo(`Skipping abort — model already stopped (${source})`, {
+				sessionID,
+				newModel,
+			})
+		} else if (callerAlreadyAborted) {
+			logInfo(`Caller already aborted (${source}), waiting for propagation`, {
+				sessionID,
+			})
+			await new Promise((resolve) => setTimeout(resolve, POST_ABORT_DELAY_MS))
+		} else {
+			await abortSessionRequest(sessionID, `pre-fallback.${source}`)
+			await new Promise((resolve) => setTimeout(resolve, POST_ABORT_DELAY_MS))
+		}
 
 		// Note: The caller holds sessionRetryInFlight. We do NOT manage it here.
 		deps.sessionFirstTokenReceived.set(sessionID, false)
@@ -337,6 +389,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				sessionAwaitingFallbackResult.delete(sessionID)
 				deps.sessionFirstTokenReceived.delete(sessionID)
 				deps.sessionSelfAbortTimestamp.delete(sessionID)
+				deps.sessionParentID.delete(sessionID)
 				clearSessionFallbackTimeout(sessionID)
 				cleanedCount++
 			}
