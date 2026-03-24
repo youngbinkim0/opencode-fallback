@@ -1,7 +1,7 @@
-import type { HookDeps, MessagePart } from "./types"
+import type { HookDeps, MessagePart, FallbackPlan } from "./types"
 import { logInfo, logError } from "./logger"
 import { getFallbackModelsForSession, resolveAgentForSession } from "./config-reader"
-import { prepareFallback } from "./fallback-state"
+import { prepareFallback, planFallback, commitFallback } from "./fallback-state"
 import { replayWithDegradation } from "./message-replay"
 
 const SESSION_TTL_MS = 30 * 60 * 1000
@@ -124,13 +124,14 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			// Timeout callback manages its own lock lifecycle
 			sessionRetryInFlight.add(sessionID)
 			try {
-				const result = prepareFallback(sessionID, state, fallbackModels, config)
-				if (result.success && result.newModel) {
+				const plan = planFallback(sessionID, state, fallbackModels, config)
+				if (plan.success) {
 					await autoRetryWithFallback(
 						sessionID,
-						result.newModel,
+						plan.newModel,
 						resolvedAgent,
-						"session.timeout"
+						"session.timeout",
+						plan
 					)
 				}
 			} finally {
@@ -145,19 +146,37 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		sessionID: string,
 		newModel: string,
 		resolvedAgent: string | undefined,
-		source: string
-	): Promise<void> => {
+		source: string,
+		plan?: FallbackPlan
+	): Promise<boolean> => {
+		// Track whether we skipped because another handler owns the dispatch.
+		// In that case, the finally block must NOT clear sessionAwaitingFallbackResult.
+		let deferredToOtherHandler = false
+
 		// Guard: if the state has already been advanced past this model by
 		// a concurrent handler (race between message.updated / session.error /
 		// session.status), skip this retry — the other handler owns it now.
+		// When using plan-based flow, state hasn't been committed yet, so
+		// check against the failed model (which should still be current).
 		const preCheckState = sessionStates.get(sessionID)
-		if (preCheckState && preCheckState.currentModel !== newModel) {
+		if (plan) {
+			if (preCheckState && preCheckState.currentModel !== plan.failedModel) {
+				logInfo(`Skipping stale autoRetryWithFallback (${source}): state already at ${preCheckState.currentModel}, expected failed model ${plan.failedModel}`, {
+					sessionID,
+					staleModel: newModel,
+					currentModel: preCheckState.currentModel,
+				})
+				deferredToOtherHandler = true
+				return false
+			}
+		} else if (preCheckState && preCheckState.currentModel !== newModel) {
 			logInfo(`Skipping stale autoRetryWithFallback (${source}): state already at ${preCheckState.currentModel}, wanted ${newModel}`, {
 				sessionID,
 				staleModel: newModel,
 				currentModel: preCheckState.currentModel,
 			})
-			return
+			deferredToOtherHandler = true
+			return false
 		}
 
 		const modelParts = newModel.split("/")
@@ -167,7 +186,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			if (state?.pendingFallbackModel) {
 				state.pendingFallbackModel = undefined
 			}
-			return
+			return false
 		}
 
 		const fallbackModelObj = {
@@ -188,7 +207,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		//
 		// Status sources (session.status, session.status.immediate): the model
 		// is still in a provider retry loop — abort is needed to stop it.
-		const modelAlreadyStopped = source === "session.error" || source === "message.updated"
+		const modelAlreadyStopped = source === "session.error" || source === "message.updated" || source === "session.idle.silent-failure"
 		const callerAlreadyAborted = source === "session.timeout"
 
 		if (modelAlreadyStopped) {
@@ -200,10 +219,14 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			logInfo(`Caller already aborted (${source}), waiting for propagation`, {
 				sessionID,
 			})
-			await new Promise((resolve) => setTimeout(resolve, POST_ABORT_DELAY_MS))
+			await new Promise<void>((resolve) =>
+				setTimeout(() => resolve(), POST_ABORT_DELAY_MS)
+			)
 		} else {
 			await abortSessionRequest(sessionID, `pre-fallback.${source}`)
-			await new Promise((resolve) => setTimeout(resolve, POST_ABORT_DELAY_MS))
+			await new Promise<void>((resolve) =>
+				setTimeout(() => resolve(), POST_ABORT_DELAY_MS)
+			)
 		}
 
 		// Note: The caller holds sessionRetryInFlight. We do NOT manage it here.
@@ -219,39 +242,62 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				logError(`No messages found in session for auto-retry (${source})`, { sessionID })
 			}
 
-			// Look for the last user message that actually has content/parts
-			const userMessages = msgs?.filter((m) => {
-				const role = (m.info?.role ?? m.role ?? "") as string
-				return role.toLowerCase() === "user"
-			}) || []
+			// Prefer replaying the last user message.  In child subagent sessions,
+			// the latest replayable prompt can be non-user (e.g. system/tool), so
+			// fall back to the last non-assistant message with parts.
+			let lastUserPartsRaw: any[] | undefined
+			let lastNonAssistantPartsRaw: any[] | undefined
 
-			let lastUserMsg = undefined
-			let lastUserPartsRaw = undefined
+			for (let i = (msgs?.length ?? 0) - 1; i >= 0; i--) {
+				const m = msgs?.[i]
+				const role = ((m?.info?.role ?? (m as any)?.role ?? "") as string).toLowerCase()
+				const parts = m?.parts ?? (m?.info?.parts as any[] | undefined)
+				if (!parts || parts.length === 0) continue
 
-			// Search backwards for a user message with parts
-			for (let i = userMessages.length - 1; i >= 0; i--) {
-				const m = userMessages[i]
-				const parts = m.parts ?? (m.info?.parts as any[] | undefined)
-				if (parts && parts.length > 0) {
-					lastUserMsg = m
+				if (!lastNonAssistantPartsRaw && role !== "assistant") {
+					lastNonAssistantPartsRaw = parts
+				}
+
+				if (role === "user") {
 					lastUserPartsRaw = parts
 					break
 				}
 			}
 
-			if (lastUserPartsRaw && lastUserPartsRaw.length > 0) {
+			const replayPartsRaw = lastUserPartsRaw ?? lastNonAssistantPartsRaw
+
+			if (replayPartsRaw && replayPartsRaw.length > 0) {
 				// Second stale check: re-verify after all async work (abort + delay +
 				// message fetch).  Another handler may have advanced the state during
 				// any of the awaits above.
 				const postCheckState = sessionStates.get(sessionID)
-				if (postCheckState && postCheckState.currentModel !== newModel) {
+				const expectedCurrentModel = plan ? plan.failedModel : newModel
+				if (postCheckState && postCheckState.currentModel !== expectedCurrentModel) {
 					logInfo(`Skipping stale autoRetryWithFallback after async work (${source})`, {
 						sessionID,
 						staleModel: newModel,
+						expectedCurrentModel,
 						currentModel: postCheckState.currentModel,
 					})
-					return
+					deferredToOtherHandler = true
+					return false
 				}
+
+				// If another handler already dispatched and is awaiting a result
+				// for this session, skip the duplicate dispatch.
+				if (sessionAwaitingFallbackResult.has(sessionID)) {
+					logInfo(`Skipping duplicate fallback dispatch — another handler already dispatched (${source})`, {
+						sessionID,
+						model: newModel,
+					})
+					deferredToOtherHandler = true
+					return false
+				}
+
+				// Claim the dispatch slot BEFORE any async work (promptAsync).
+				// This prevents a second concurrent handler from also dispatching.
+				// Cleared in the finally block if dispatch fails.
+				sessionAwaitingFallbackResult.add(sessionID)
 
 				logInfo(`Auto-retrying with fallback model (${source})`, {
 					sessionID,
@@ -259,7 +305,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				})
 
 				// Cast raw parts to MessagePart (runtime parts may have any shape)
-				const allParts: MessagePart[] = lastUserPartsRaw.filter(
+				const allParts: MessagePart[] = replayPartsRaw.filter(
 					(p): p is MessagePart => typeof p.type === "string"
 				)
 
@@ -280,7 +326,31 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					const replayResult = await replayWithDegradation(allParts, sendFn)
 
 					if (replayResult.success) {
-						sessionAwaitingFallbackResult.add(sessionID)
+						// Commit the fallback plan to state NOW — after the API call
+						// actually succeeded. This prevents race conditions where
+						// session.error sees an advanced state before any API call
+						// was made.
+						if (plan) {
+							const stateToCommit = sessionStates.get(sessionID)
+							if (stateToCommit) {
+								const committed = commitFallback(stateToCommit, plan)
+								if (committed) {
+									logInfo(`Committed fallback state after successful dispatch (${source})`, {
+										sessionID,
+										newModel: plan.newModel,
+										failedModel: plan.failedModel,
+										attemptCount: stateToCommit.attemptCount,
+									})
+								} else {
+									logInfo(`Fallback state already committed by another handler, skipping duplicate (${source})`, {
+										sessionID,
+										newModel: plan.newModel,
+									})
+								}
+							}
+						}
+
+						// sessionAwaitingFallbackResult already set before dispatch
 						scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
 						retryDispatched = true
 
@@ -313,7 +383,9 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					}
 				}
 			} else {
-				logInfo(`No user message found for auto-retry (${source})`, { sessionID })
+				logInfo(`No replayable non-assistant message found for auto-retry (${source})`, {
+					sessionID,
+				})
 			}
 		} catch (retryError) {
 			logError(`Auto-retry failed (${source})`, {
@@ -324,7 +396,9 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			clearSessionFallbackTimeout(sessionID)
 		} finally {
 			// Note: sessionRetryInFlight is managed by the caller, not here.
-			if (!retryDispatched) {
+			// Don't clear awaiting flag if we deferred to another handler that
+			// IS dispatching — they own the flag now.
+			if (!retryDispatched && !deferredToOtherHandler) {
 				sessionAwaitingFallbackResult.delete(sessionID)
 				clearSessionFallbackTimeout(sessionID)
 				const state = sessionStates.get(sessionID)
@@ -333,6 +407,8 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				}
 			}
 		}
+
+		return retryDispatched
 	}
 
 	const resolveAgentForSessionFromContext = async (

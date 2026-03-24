@@ -195,6 +195,82 @@ describe("OpenCodeFallbackPlugin", () => {
 
 				expect(true).toBe(true)
 			})
+
+			it("#then replays from non-assistant context and ignores model-less stale session.error", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+
+				plugin.config({
+					agents: {
+						planner: {
+							model: "google/antigravity-claude-opus-4-6-thinking",
+							fallback_models: [
+								"anthropic/claude-opus-4-6",
+								"github-copilot/gpt-5.3-codex",
+							],
+						},
+					},
+				})
+
+				// Simulate a child session where no user message exists, but a non-assistant
+				// replayable message does exist (tool/system-like context).
+				;(ctx.client.session.messages as any).mockImplementation(() =>
+					Promise.resolve({
+						data: [
+							{
+								info: {
+									role: "tool",
+									sessionID: "ses_child_race",
+								},
+								parts: [{ type: "text", text: "tool context" }],
+							},
+							{
+								info: {
+									role: "assistant",
+									sessionID: "ses_child_race",
+									agent: "planner",
+									model: "google/antigravity-claude-opus-4-6-thinking",
+								},
+								parts: [{ type: "text", text: "upstream failure" }],
+							},
+						],
+					})
+				)
+
+				// First failure path via message.updated: should prepare fallback to anthropic.
+				await plugin.event({
+					event: {
+						type: "message.updated",
+						properties: {
+							info: {
+								sessionID: "ses_child_race",
+								role: "assistant",
+								agent: "planner",
+								model: "google/antigravity-claude-opus-4-6-thinking",
+								error: { statusCode: 429, message: "primary failed" },
+							},
+						},
+					},
+				})
+
+				// Stale/late error path with no model field (mirrors observed logs).
+				await plugin.event({
+					event: {
+						type: "session.error",
+						properties: {
+							sessionID: "ses_child_race",
+							agent: "planner",
+							error: { name: "UnknownError", message: "late stale error" },
+						},
+					},
+				})
+
+				// Must dispatch exactly one replay (to anthropic), and stale session.error
+				// must NOT consume a second fallback attempt.
+				expect(ctx.client.session.promptAsync).toHaveBeenCalledTimes(1)
+				const promptArgs = (ctx.client.session.promptAsync as any).mock.calls[0][0]
+				expect(promptArgs.body.model.providerID).toBe("anthropic")
+				expect(promptArgs.body.model.modelID).toBe("claude-opus-4-6")
+			})
 		})
 
 		describe("tool.execute.after", () => {
@@ -238,14 +314,13 @@ describe("OpenCodeFallbackPlugin", () => {
 				const plugin = await OpenCodeFallbackPlugin(ctx)
 				const childSessionID = "ses_waitchild"
 
-				// Simulate: child starts in-flight, then completes after a delay
-				let callCount = 0
-				;(ctx.client.session.get as any).mockImplementation(() => {
-					callCount++
-					return Promise.resolve({
-						data: { status: callCount >= 3 ? "idle" : "active" },
+				// Simulate: session.get returns idle immediately (event-driven
+				// approach uses immediate status check as race protection)
+				;(ctx.client.session.get as any).mockImplementation(() =>
+					Promise.resolve({
+						data: { status: "idle" },
 					})
-				})
+				)
 				;(ctx.client.session.messages as any).mockImplementation(() =>
 					Promise.resolve({
 						data: [
@@ -279,7 +354,7 @@ describe("OpenCodeFallbackPlugin", () => {
 				// Child never goes idle
 				;(ctx.client.session.get as any).mockImplementation(() =>
 					Promise.resolve({
-						data: { status: "active" },
+						data: { status: "busy" },
 					})
 				)
 

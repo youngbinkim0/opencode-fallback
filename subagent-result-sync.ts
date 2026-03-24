@@ -25,20 +25,101 @@ export function extractChildSessionID(output: string): string | null {
 export interface WaitOptions {
 	/** Maximum time to wait in milliseconds */
 	maxWaitMs?: number
-	/** Polling interval in milliseconds */
+	/** Polling interval in milliseconds (only used as fallback for streaming check) */
 	pollIntervalMs?: number
 }
 
 /**
- * Poll the child session until its fallback completes and return the
- * assistant's response text. Returns null if the wait times out or
- * no valid assistant response is found.
+ * Helper to extract the session status type string from session.get() response.
+ * OpenCode's SessionStatus is a discriminated union ({ type: "idle" } | ...) but
+ * may also appear as a plain string.
+ */
+function getSessionStatusType(
+	sessionData: Record<string, unknown> | undefined,
+): string | undefined {
+	const status = sessionData?.status
+	if (!status) return undefined
+	if (typeof status === "string") return status
+	if (typeof status === "object" && status !== null && "type" in status) {
+		return (status as { type?: string }).type
+	}
+	return undefined
+}
+
+/**
+ * Wait for a child session to go idle using an event-driven approach.
+ * Registers a resolver that handleSessionIdle triggers, with an immediate
+ * status check to avoid missing events that fired before registration.
+ */
+function waitForSessionIdle(
+	deps: HookDeps,
+	sessionID: string,
+	maxWaitMs: number,
+): Promise<boolean> {
+	return new Promise<boolean>((resolve) => {
+		let settled = false
+		const settle = (result: boolean) => {
+			if (settled) return
+			settled = true
+			// Clean up resolver
+			const resolvers = deps.sessionIdleResolvers.get(sessionID)
+			if (resolvers) {
+				const idx = resolvers.indexOf(onIdle)
+				if (idx >= 0) resolvers.splice(idx, 1)
+				if (resolvers.length === 0) deps.sessionIdleResolvers.delete(sessionID)
+			}
+			resolve(result)
+		}
+
+		const onIdle = () => settle(true)
+
+		// Register resolver for session.idle event
+		let resolvers = deps.sessionIdleResolvers.get(sessionID)
+		if (!resolvers) {
+			resolvers = []
+			deps.sessionIdleResolvers.set(sessionID, resolvers)
+		}
+		resolvers.push(onIdle)
+
+		// Timeout — only fires if session.idle never comes
+		const timer = setTimeout(() => settle(false), maxWaitMs)
+		// Override settle to also clear timer
+		const originalSettle = settle
+		const settleWithCleanup = (result: boolean) => {
+			clearTimeout(timer)
+			originalSettle(result)
+		}
+		// Patch: use settleWithCleanup for the onIdle path too
+		const idxSelf = resolvers.indexOf(onIdle)
+		if (idxSelf >= 0) {
+			resolvers[idxSelf] = () => settleWithCleanup(true)
+		}
+
+		// Immediate check: session may already be idle (race protection)
+		deps.ctx.client.session.get({ path: { id: sessionID } })
+			.then((sessionInfo) => {
+				const statusType = getSessionStatusType(
+					(sessionInfo?.data ?? sessionInfo) as Record<string, unknown> | undefined
+				)
+				if (statusType === "idle") {
+					settleWithCleanup(true)
+				}
+			})
+			.catch(() => {
+				// Ignore — we'll rely on the event
+			})
+	})
+}
+
+/**
+ * Wait for child session fallback to complete and return the assistant's
+ * response text. Uses event-driven session.idle detection rather than polling.
  *
- * Timeout behavior: the maxWaitMs timeout only applies when the child
- * session is NOT actively generating tokens. If the child is streaming
- * (status "active", not in retry/awaiting sets, first token received),
- * we keep waiting indefinitely — the child is making progress and will
- * eventually go idle.
+ * Returns null if the wait times out or no valid assistant response is found.
+ *
+ * Timeout behavior: maxWaitMs is the overall timeout. If the child has started
+ * streaming (firstTokenReceived), we extend the timeout generously since the
+ * model is making progress.
  */
 export async function waitForChildFallbackResult(
 	deps: HookDeps,
@@ -51,75 +132,42 @@ export async function waitForChildFallbackResult(
 
 	logInfo(`[subagent-sync] Waiting for child ${childSessionID} fallback result (max ${maxWaitMs}ms idle timeout)`)
 
-	while (true) {
-		const inFlight = deps.sessionRetryInFlight.has(childSessionID)
-		const awaiting = deps.sessionAwaitingFallbackResult.has(childSessionID)
-
-		// Check if child is actively streaming tokens — this takes priority
-		// over all other checks. A child can be in sessionAwaitingFallbackResult
-		// AND streaming simultaneously (the "awaiting" flag stays set until a
-		// visible final response is detected by message-update-handler).
-		const firstTokenReceived = deps.sessionFirstTokenReceived.get(childSessionID)
-		if (firstTokenReceived) {
-			// Child has started generating tokens — keep waiting regardless
-			// of timeout.
-			if (!inFlight && !awaiting) {
-				// Both flags cleared — message-update-handler has seen the
-				// final response. Try to extract it now. The session may still
-				// be "active" (tool calls after text generation) but the
-				// assistant text is already available in messages.
-				try {
-					const result = await extractAssistantResponse(deps, childSessionID)
-					if (result) {
-						logInfo(`[subagent-sync] Got fallback result for ${childSessionID} (${Date.now() - startTime}ms)`)
-						return result
-					}
-					// No text yet — check if session is idle (exhausted chain)
-					const sessionInfo = await deps.ctx.client.session.get({ path: { id: childSessionID } })
-					const status = sessionInfo?.data?.status as string | undefined
-					if (status === "idle") {
-						logInfo(`[subagent-sync] Child ${childSessionID} idle but no assistant response found`)
-						return null
-					}
-				} catch (err) {
-					logInfo(`[subagent-sync] Error checking child session: ${err}`)
-				}
-			}
-			// Still streaming or still in retry — keep waiting with no timeout
-			await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
-			continue
-		}
-
-		if (!inFlight && !awaiting) {
-			// No first token yet, but flags are clear — check session status
-			try {
-				const sessionInfo = await deps.ctx.client.session.get({ path: { id: childSessionID } })
-				const status = sessionInfo?.data?.status as string | undefined
-
-				if (status === "idle") {
-					// Session finished — extract the response
-					const result = await extractAssistantResponse(deps, childSessionID)
-					if (result) {
-						logInfo(`[subagent-sync] Got fallback result for ${childSessionID} (${Date.now() - startTime}ms)`)
-						return result
-					}
-					// Idle but no assistant message — fallback chain may have been exhausted
-					logInfo(`[subagent-sync] Child ${childSessionID} idle but no assistant response found`)
-					return null
-				}
-			} catch (err) {
-				logInfo(`[subagent-sync] Error checking child session: ${err}`)
-			}
-		}
-
-		// Enforce timeout only when child has NOT started streaming
+	// Phase 1: Wait for fallback dispatch to complete (retry flags to clear)
+	// This is a short spin-wait since dispatch happens within milliseconds.
+	while (deps.sessionRetryInFlight.has(childSessionID)) {
 		if (Date.now() - startTime >= maxWaitMs) {
-			logInfo(`[subagent-sync] Timed out waiting for child ${childSessionID} after ${maxWaitMs}ms`)
+			logInfo(`[subagent-sync] Timed out waiting for child ${childSessionID} dispatch after ${maxWaitMs}ms`)
 			return null
 		}
-
 		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
 	}
+
+	// Phase 2: Wait for the child session to go idle (model done generating).
+	// Use event-driven approach — handleSessionIdle will resolve our waiter.
+	const remainingMs = Math.max(1000, maxWaitMs - (Date.now() - startTime))
+
+	// If child is already streaming, give it much more time
+	const firstTokenReceived = deps.sessionFirstTokenReceived.get(childSessionID)
+	const idleTimeoutMs = firstTokenReceived
+		? Math.max(remainingMs, 120_000)  // At least 2 minutes if streaming
+		: remainingMs
+
+	const wentIdle = await waitForSessionIdle(deps, childSessionID, idleTimeoutMs)
+
+	if (!wentIdle) {
+		logInfo(`[subagent-sync] Timed out waiting for child ${childSessionID} after ${Date.now() - startTime}ms`)
+		return null
+	}
+
+	// Phase 3: Extract the assistant response
+	const result = await extractAssistantResponse(deps, childSessionID)
+	if (result) {
+		logInfo(`[subagent-sync] Got fallback result for ${childSessionID} (${Date.now() - startTime}ms)`)
+		return result
+	}
+
+	logInfo(`[subagent-sync] Child ${childSessionID} idle but no assistant response found`)
+	return null
 }
 
 /**

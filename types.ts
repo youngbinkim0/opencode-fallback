@@ -32,6 +32,20 @@ export interface FallbackResult {
 	maxAttemptsReached?: boolean
 }
 
+/** Returned by planFallback — describes what to do but does NOT mutate state. */
+export interface FallbackPlan {
+	success: true
+	newModel: string
+	failedModel: string
+	newFallbackIndex: number
+}
+
+export interface FallbackPlanFailure {
+	success: false
+	error: string
+	maxAttemptsReached?: boolean
+}
+
 export type MessagePart = { type: string } & Record<string, unknown>
 
 export type ReplayTier = 1 | 2 | 3
@@ -133,5 +147,7 @@ export interface HookDeps {
 	/** Cached parentID for child sessions.  `undefined` value means "looked up,
 	 *  no parent" so we distinguish from "never looked up" (key absent). */
 	sessionParentID: Map<string, string | null>
-
+	/** Resolvers for code awaiting a session to go idle (e.g. subagent-sync
+	 *  waiting for a child session's fallback response to complete). */
+	sessionIdleResolvers: Map<string, Array<() => void>>
 }

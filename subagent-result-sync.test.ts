@@ -52,6 +52,7 @@ function createMockDeps(overrides?: Partial<HookDeps>): HookDeps {
 		sessionFirstTokenReceived: new Map(),
 		sessionSelfAbortTimestamp: new Map(),
 		sessionParentID: new Map(),
+		sessionIdleResolvers: new Map(),
 		...overrides,
 	}
 }
@@ -145,7 +146,7 @@ describe("subagent-result-sync", () => {
 			deps.sessionRetryInFlight.add(childID)
 			;(deps.ctx.client.session.get as any).mockImplementation(() =>
 				Promise.resolve({
-					data: { status: "active" },
+					data: { status: "busy" },
 				})
 			)
 
@@ -184,17 +185,10 @@ describe("subagent-result-sync", () => {
 			deps.sessionFirstTokenReceived.set(childID, true)
 			deps.sessionAwaitingFallbackResult.add(childID)
 
-			// After several polls, clear the awaiting flag (simulates final response detected)
-			let pollCount = 0
-			setTimeout(() => {
-				deps.sessionAwaitingFallbackResult.delete(childID)
-			}, 250)
-			;(deps.ctx.client.session.get as any).mockImplementation(() => {
-				pollCount++
-				return Promise.resolve({
-					data: { status: "active" },
-				})
-			})
+			// Initial session.get returns busy (not idle yet)
+			;(deps.ctx.client.session.get as any).mockImplementation(() =>
+				Promise.resolve({ data: { status: "busy" } })
+			)
 			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
 				Promise.resolve({
 					data: [
@@ -204,20 +198,35 @@ describe("subagent-result-sync", () => {
 				})
 			)
 
-			// maxWaitMs is very short, but child is streaming so timeout should NOT apply
+			// After delay, clear awaiting and simulate session.idle event
+			setTimeout(() => {
+				deps.sessionAwaitingFallbackResult.delete(childID)
+				// Mock session.get to return idle now
+				;(deps.ctx.client.session.get as any).mockImplementation(() =>
+					Promise.resolve({ data: { status: "idle" } })
+				)
+				// Fire the idle resolver (simulates handleSessionIdle)
+				const resolvers = deps.sessionIdleResolvers.get(childID)
+				if (resolvers) {
+					for (const resolve of resolvers) resolve()
+					deps.sessionIdleResolvers.delete(childID)
+				}
+			}, 250)
+
+			// maxWaitMs is very short, but child is streaming so timeout is extended
 			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 100, pollIntervalMs: 50 })
 			expect(result).toBe("Streamed response after long generation.")
 		})
 
-		it("extracts response immediately when flags clear and first token received", async () => {
+		it("extracts response when flags clear, first token received, and session idle", async () => {
 			const deps = createMockDeps()
 			const childID = "ses_flags_clear"
 
-			// Flags already clear, first token received — should extract immediately
+			// Flags already clear, first token received, session idle — should extract
 			deps.sessionFirstTokenReceived.set(childID, true)
 
 			;(deps.ctx.client.session.get as any).mockImplementation(() =>
-				Promise.resolve({ data: { status: "active" } })
+				Promise.resolve({ data: { status: "idle" } })
 			)
 			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
 				Promise.resolve({
@@ -240,18 +249,10 @@ describe("subagent-result-sync", () => {
 			deps.sessionAwaitingFallbackResult.add(childID)
 			deps.sessionFirstTokenReceived.set(childID, true)
 
-			// After several polls, clear awaiting and go idle
-			let pollCount = 0
-			setTimeout(() => {
-				deps.sessionAwaitingFallbackResult.delete(childID)
-			}, 200)
-			;(deps.ctx.client.session.get as any).mockImplementation(() => {
-				pollCount++
-				// Only called after awaiting flag clears
-				return Promise.resolve({
-					data: { status: pollCount >= 2 ? "idle" : "active" },
-				})
-			})
+			// Initial session.get returns busy
+			;(deps.ctx.client.session.get as any).mockImplementation(() =>
+				Promise.resolve({ data: { status: "busy" } })
+			)
 			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
 				Promise.resolve({
 					data: [
@@ -261,21 +262,34 @@ describe("subagent-result-sync", () => {
 				})
 			)
 
-			// maxWaitMs is very short but child is streaming — should NOT timeout
+			// After delay, clear awaiting and fire idle event
+			setTimeout(() => {
+				deps.sessionAwaitingFallbackResult.delete(childID)
+				;(deps.ctx.client.session.get as any).mockImplementation(() =>
+					Promise.resolve({ data: { status: "idle" } })
+				)
+				const resolvers = deps.sessionIdleResolvers.get(childID)
+				if (resolvers) {
+					for (const resolve of resolvers) resolve()
+					deps.sessionIdleResolvers.delete(childID)
+				}
+			}, 200)
+
+			// maxWaitMs is very short but child is streaming — timeout is extended
 			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 100, pollIntervalMs: 50 })
 			expect(result).toBe("Response after streaming while awaiting.")
 		})
 
-		it("times out when child is active but NOT streaming (no first token)", async () => {
+		it("times out when child is busy but NOT streaming (no first token)", async () => {
 			const deps = createMockDeps()
 			const childID = "ses_stuck"
 
-			// No first token — child is active but stuck (no progress)
+			// No first token — child is busy but stuck (no progress)
 			// sessionFirstTokenReceived NOT set for this child
 
 			;(deps.ctx.client.session.get as any).mockImplementation(() =>
 				Promise.resolve({
-					data: { status: "active" },
+					data: { status: "busy" },
 				})
 			)
 

@@ -11,7 +11,13 @@ import {
 	extractErrorContentFromParts,
 	detectErrorInTextParts,
 } from "./error-classifier"
-import { createFallbackState, prepareFallback } from "./fallback-state"
+import {
+	createFallbackState,
+	prepareFallback,
+	planFallback,
+	snapshotFallbackState,
+	restoreFallbackState,
+} from "./fallback-state"
 import { getFallbackModelsForSession } from "./config-reader"
 import { logInfo, logError } from "./logger"
 
@@ -384,20 +390,20 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 					}
 				}
 
-				const result = prepareFallback(
+				const plan = planFallback(
 					sessionID,
 					state,
 					fallbackModels,
 					config,
 				)
 
-				if (result.success && result.newModel) {
+				if (plan.success) {
 					if (config.notify_on_fallback) {
 						deps.ctx.client.tui
 							.showToast({
 								body: {
 									title: "Model Fallback",
-									message: `Switching to ${result.newModel?.split("/").pop() || result.newModel} for next request`,
+									message: `Switching to ${plan.newModel?.split("/").pop() || plan.newModel} for next request`,
 									variant: "warning",
 									duration: 5000,
 								},
@@ -407,9 +413,10 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 
 					await helpers.autoRetryWithFallback(
 						sessionID,
-						result.newModel,
+						plan.newModel,
 						resolvedAgent,
-						"message.updated"
+						"message.updated",
+						plan
 					)
 				}
 			} finally {

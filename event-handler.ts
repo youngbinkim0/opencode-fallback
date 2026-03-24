@@ -7,7 +7,13 @@ import {
 	classifyErrorType,
 	isRetryableError,
 } from "./error-classifier"
-import { createFallbackState, prepareFallback } from "./fallback-state"
+import {
+	createFallbackState,
+	prepareFallback,
+	planFallback,
+	snapshotFallbackState,
+	restoreFallbackState,
+} from "./fallback-state"
 import { getFallbackModelsForSession } from "./config-reader"
 
 export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
@@ -69,11 +75,94 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		logInfo("Cleared fallback retry state on session.stop", { sessionID })
 	}
 
-	const handleSessionIdle = (props: Record<string, unknown> | undefined) => {
+	const handleSessionIdle = async (props: Record<string, unknown> | undefined) => {
 		const sessionID = props?.sessionID as string | undefined
 		if (!sessionID) return
 
+		// Resolve any idle waiters FIRST (e.g. subagent-sync waiting for
+		// a child session's fallback to complete). This must happen before
+		// the sessionAwaitingFallbackResult early-return below, because
+		// the waiter needs to know the child went idle regardless.
+		const idleResolvers = deps.sessionIdleResolvers.get(sessionID)
+		if (idleResolvers && idleResolvers.length > 0) {
+			logInfo("session.idle resolving waiters", {
+				sessionID,
+				waiterCount: idleResolvers.length,
+			})
+			for (const resolve of idleResolvers) resolve()
+			deps.sessionIdleResolvers.delete(sessionID)
+		}
+
 		if (sessionAwaitingFallbackResult.has(sessionID)) {
+			// ── SILENT MODEL FAILURE DETECTION ──
+			// If we dispatched a fallback model (sessionAwaitingFallbackResult is
+			// set) but no first token was ever received, the model silently failed
+			// (e.g. model_not_found, quota exceeded, empty response). Treat this
+			// idle as a real failure and advance the fallback chain immediately
+			// rather than waiting for the full TTFT timeout.
+			const firstTokenReceived = deps.sessionFirstTokenReceived.get(sessionID)
+			if (!firstTokenReceived) {
+				const state = sessionStates.get(sessionID)
+				if (state) {
+					logInfo("session.idle detected silent model failure (no first token received)", {
+						sessionID,
+						currentModel: state.currentModel,
+						attemptCount: state.attemptCount,
+					})
+
+					// Clear awaiting state so the retry machinery can operate
+					sessionAwaitingFallbackResult.delete(sessionID)
+					helpers.clearSessionFallbackTimeout(sessionID)
+
+					// Acquire retry lock
+					if (sessionRetryInFlight.has(sessionID)) {
+						logInfo("session.idle silent failure — retry already in flight, skipping", {
+							sessionID,
+						})
+						return
+					}
+					sessionRetryInFlight.add(sessionID)
+
+					try {
+						const resolvedAgent = await helpers.resolveAgentForSessionFromContext(
+							sessionID,
+							undefined
+						)
+						const fallbackModels = getFallbackModelsForSession(
+							sessionID,
+							resolvedAgent,
+							deps.agentConfigs,
+							deps.globalFallbackModels
+						)
+						if (fallbackModels.length === 0) {
+							logInfo("session.idle silent failure — no fallback models configured", {
+								sessionID,
+							})
+							return
+						}
+
+						const plan = planFallback(sessionID, state, fallbackModels, config)
+						if (plan.success) {
+							await helpers.autoRetryWithFallback(
+								sessionID,
+								plan.newModel,
+								resolvedAgent,
+								"session.idle.silent-failure",
+								plan
+							)
+						} else {
+							logInfo("session.idle silent failure — no more fallback models available", {
+								sessionID,
+								error: plan.error,
+							})
+						}
+					} finally {
+						sessionRetryInFlight.delete(sessionID)
+					}
+					return
+				}
+			}
+
 			logInfo("session.idle while awaiting fallback result; keeping timeout armed", {
 				sessionID,
 			})
@@ -189,18 +278,18 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			sessionAwaitingFallbackResult.delete(sessionID)
 			helpers.clearSessionFallbackTimeout(sessionID)
 
-			const result = prepareFallback(sessionID, state, fallbackModels, config)
+			const plan = planFallback(sessionID, state, fallbackModels, config)
 
-			if (result.success && result.newModel) {
+			if (plan.success) {
 				if (config.notify_on_fallback) {
-					const modelName = result.newModel?.split("/").pop() || result.newModel
+					const modelName = plan.newModel?.split("/").pop() || plan.newModel
 					deps.ctx.client.tui
 						.showToast({
 							body: {
 								title: "Retry Detected -- Switching Model",
 								variant: "warning",
 								duration: 5000,
-								message: `${status.message || "Provider retrying"} -> ${modelName} (attempt ${state.attemptCount} of ${fallbackModels.length})`,
+								message: `${status.message || "Provider retrying"} -> ${modelName} (attempt ${state.attemptCount + 1} of ${fallbackModels.length})`,
 							},
 						})
 						.catch(() => {})
@@ -208,16 +297,17 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 
 				await helpers.autoRetryWithFallback(
 					sessionID,
-					result.newModel,
+					plan.newModel,
 					resolvedAgent,
-					"session.status"
+					"session.status",
+					plan
 				)
-			} else if (!result.success) {
+			} else if (!plan.success) {
 				logError("session.status fallback failed", {
 					sessionID,
-					error: result.error,
+					error: plan.error,
 				})
-				if (result.maxAttemptsReached && config.notify_on_fallback) {
+				if (plan.maxAttemptsReached && config.notify_on_fallback) {
 					await deps.ctx.client.tui
 						.showToast({
 							body: {
@@ -248,6 +338,16 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 
 		// Ignore stale errors from models we already moved past
 		const currentState = sessionStates.get(sessionID)
+		if (currentState?.pendingFallbackModel) {
+			logInfo("Ignoring session.error while fallback replay is pending", {
+				sessionID,
+				pendingFallbackModel: currentState.pendingFallbackModel,
+				currentModel: currentState.currentModel,
+				errorName: extractErrorName(error),
+			})
+			return
+		}
+
 		if (currentState && errorModel && errorModel !== currentState.currentModel) {
 			logInfo("Ignoring stale session.error from previous model", {
 				sessionID,
@@ -260,7 +360,11 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 
 		// If we're awaiting a fallback result, this session.error is likely
 		// a stale abort from the previous model (session.error doesn't carry
-		// a model field, so we can't check which model caused it)
+		// a model field, so we can't reliably tell which model caused it).
+		//
+		// If the fallback model itself fails silently (no message.updated error,
+		// no first token), the session.idle handler will detect it via the
+		// "silent model failure" path and advance the chain.
 		if (sessionAwaitingFallbackResult.has(sessionID)) {
 			logInfo("Ignoring session.error while awaiting fallback result (likely stale abort)", {
 				sessionID,
@@ -290,6 +394,20 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			)
 
 			helpers.clearSessionFallbackTimeout(sessionID)
+
+			// Re-check pendingFallbackModel after the await — message.updated may
+			// have created state and called prepareFallback while we were resolving
+			// the agent.  This is the primary guard against the dual-handler race.
+			const stateAfterAwait = sessionStates.get(sessionID)
+			if (stateAfterAwait?.pendingFallbackModel) {
+				logInfo("Ignoring session.error — fallback replay became pending during agent resolution", {
+					sessionID,
+					pendingFallbackModel: stateAfterAwait.pendingFallbackModel,
+					currentModel: stateAfterAwait.currentModel,
+					errorName: extractErrorName(error),
+				})
+				return
+			}
 
 			logInfo("session.error received", {
 				sessionID,
@@ -347,6 +465,15 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 					state = createFallbackState(currentModel)
 					sessionStates.set(sessionID, state)
 					sessionLastAccess.set(sessionID, Date.now())
+				} else if (!errorModel && sessionRetryInFlight.has(sessionID)) {
+					// No state, no model on the error, and message.updated holds the
+					// retry lock — this is a stale session.error for the same failure
+					// that message.updated is already handling.  Defer entirely.
+					logInfo("Deferring to message.updated handler (no state, no errorModel, retry in flight)", {
+						sessionID,
+						errorName: extractErrorName(error),
+					})
+					return
 				} else {
 					const agentConfig =
 						resolvedAgent && deps.agentConfigs
@@ -382,12 +509,12 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 				sessionLastAccess.set(sessionID, Date.now())
 			}
 
-			const result = prepareFallback(sessionID, state, fallbackModels, config)
+			const plan = planFallback(sessionID, state, fallbackModels, config)
 
-			if (result.success && result.newModel) {
+			if (plan.success) {
 				if (config.notify_on_fallback) {
-					const modelName = result.newModel?.split("/").pop() || result.newModel
-					const attemptInfo = `attempt ${state.attemptCount} of ${fallbackModels.length}`
+					const modelName = plan.newModel?.split("/").pop() || plan.newModel
+					const attemptInfo = `attempt ${state.attemptCount + 1} of ${fallbackModels.length}`
 					deps.ctx.client.tui
 						.showToast({
 							body: {
@@ -402,14 +529,15 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 
 				await helpers.autoRetryWithFallback(
 					sessionID,
-					result.newModel,
+					plan.newModel,
 					resolvedAgent,
-					"session.error"
+					"session.error",
+					plan
 				)
 			} else {
 				logError("Fallback preparation failed", {
 					sessionID,
-					error: result.error,
+					error: plan.error,
 				})
 			}
 		} finally {
@@ -459,11 +587,11 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		sessionAwaitingFallbackResult.delete(sessionID)
 		helpers.clearSessionFallbackTimeout(sessionID)
 
-			const result = prepareFallback(sessionID, state, fallbackModels, config)
+			const plan = planFallback(sessionID, state, fallbackModels, config)
 
-			if (result.success && result.newModel) {
+			if (plan.success) {
 			if (config.notify_on_fallback) {
-				const modelName = result.newModel?.split("/").pop() || result.newModel
+				const modelName = plan.newModel?.split("/").pop() || plan.newModel
 				deps.ctx.client.tui
 					.showToast({
 						body: {
@@ -478,16 +606,17 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 
 			await helpers.autoRetryWithFallback(
 				sessionID,
-				result.newModel,
+				plan.newModel,
 				resolvedAgent,
-				"session.status.immediate"
+				"session.status.immediate",
+				plan
 			)
-		} else if (!result.success) {
+		} else if (!plan.success) {
 			logError("Immediate fallback preparation failed", {
 				sessionID,
-				error: result.error,
+				error: plan.error,
 			})
-			if (result.maxAttemptsReached && config.notify_on_fallback) {
+			if (plan.maxAttemptsReached && config.notify_on_fallback) {
 				await deps.ctx.client.tui
 					.showToast({
 						body: {
@@ -520,7 +649,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			return
 		}
 		if (event.type === "session.idle") {
-			handleSessionIdle(props)
+			await handleSessionIdle(props)
 			return
 		}
 		if (event.type === "session.error") {

@@ -1,5 +1,34 @@
-import type { FallbackState, FallbackResult, FallbackPluginConfig } from "./types"
+import type { FallbackState, FallbackResult, FallbackPluginConfig, FallbackPlan, FallbackPlanFailure } from "./types"
 import { logInfo } from "./logger"
+
+export interface FallbackStateSnapshot {
+	currentModel: string
+	fallbackIndex: number
+	failedModels: Map<string, number>
+	attemptCount: number
+	pendingFallbackModel?: string
+}
+
+export function snapshotFallbackState(state: FallbackState): FallbackStateSnapshot {
+	return {
+		currentModel: state.currentModel,
+		fallbackIndex: state.fallbackIndex,
+		failedModels: new Map(state.failedModels),
+		attemptCount: state.attemptCount,
+		pendingFallbackModel: state.pendingFallbackModel,
+	}
+}
+
+export function restoreFallbackState(
+	state: FallbackState,
+	snapshot: FallbackStateSnapshot
+): void {
+	state.currentModel = snapshot.currentModel
+	state.fallbackIndex = snapshot.fallbackIndex
+	state.failedModels = new Map(snapshot.failedModels)
+	state.attemptCount = snapshot.attemptCount
+	state.pendingFallbackModel = snapshot.pendingFallbackModel
+}
 
 export function createFallbackState(originalModel: string): FallbackState {
 	return {
@@ -77,6 +106,73 @@ export function prepareFallback(
 	state.pendingFallbackModel = nextModel
 
 	return { success: true, newModel: nextModel }
+}
+
+/**
+ * Phase 1: Determine the next fallback model WITHOUT mutating state.
+ * Returns a plan that can be committed later via commitFallback().
+ */
+export function planFallback(
+	sessionID: string,
+	state: FallbackState,
+	fallbackModels: string[],
+	config: Required<FallbackPluginConfig>,
+): FallbackPlan | FallbackPlanFailure {
+	if (state.attemptCount >= config.max_fallback_attempts) {
+		logInfo(`Max fallback attempts reached for session ${sessionID} (${state.attemptCount})`)
+		return {
+			success: false,
+			error: "Max fallback attempts reached",
+			maxAttemptsReached: true,
+		}
+	}
+
+	const nextModel = findNextAvailableFallback(state, fallbackModels, config.cooldown_seconds)
+
+	if (!nextModel) {
+		logInfo(`No available fallback models for session ${sessionID}`)
+		return {
+			success: false,
+			error: "No available fallback models (all in cooldown or exhausted)",
+		}
+	}
+
+	logInfo(
+		`Planned fallback for session ${sessionID}: ${state.currentModel} -> ${nextModel} (will be attempt ${state.attemptCount + 1})`
+	)
+
+	return {
+		success: true,
+		newModel: nextModel,
+		failedModel: state.currentModel,
+		newFallbackIndex: fallbackModels.indexOf(nextModel),
+	}
+}
+
+/**
+ * Phase 2: Commit a planned fallback to state. Call this AFTER the replay
+ * dispatch to promptAsync succeeds, so state only advances when the new
+ * model is actually being called.
+ *
+ * Idempotent: if the state already shows this plan's model (i.e. another
+ * handler already committed the same plan), this is a no-op and returns false.
+ */
+export function commitFallback(
+	state: FallbackState,
+	plan: FallbackPlan,
+): boolean {
+	// Already committed by another handler (e.g. message.updated + session.error
+	// both dispatched to the same model)
+	if (state.currentModel === plan.newModel && state.failedModels.has(plan.failedModel)) {
+		return false
+	}
+
+	state.fallbackIndex = plan.newFallbackIndex
+	state.failedModels.set(plan.failedModel, Date.now())
+	state.attemptCount++
+	state.currentModel = plan.newModel
+	state.pendingFallbackModel = undefined
+	return true
 }
 
 export function recoverToOriginal(
