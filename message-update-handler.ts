@@ -173,6 +173,47 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 
 		if (sessionID && role === "assistant" && !error) {
 			if (!sessionAwaitingFallbackResult.has(sessionID)) {
+				// ── PRIMARY MODEL TTFT TIMEOUT ──
+				// When the primary model sends its first message.updated (no error,
+				// no awaiting flag), schedule a TTFT timeout so that a hung primary
+				// model triggers the fallback chain.  Subsequent message.updated
+				// events mark firstTokenReceived=true, which causes the timeout
+				// handler to skip the abort (model is streaming fine).
+				if (
+					model &&
+					config.timeout_seconds > 0 &&
+					!deps.sessionFirstTokenReceived.get(sessionID) &&
+					!sessionStates.has(sessionID)
+				) {
+					// Create state eagerly so the timeout handler can find it
+					const state = createFallbackState(model)
+					sessionStates.set(sessionID, state)
+					sessionLastAccess.set(sessionID, Date.now())
+
+					// Resolve agent asynchronously for timeout handler
+					const agent = info?.agent as string | undefined
+					helpers.resolveAgentForSessionFromContext(sessionID, agent)
+						.then((resolvedAgent) => {
+							const fallbackModels = getFallbackModelsForSession(
+								sessionID,
+								resolvedAgent,
+								deps.agentConfigs,
+								deps.globalFallbackModels
+							)
+							if (fallbackModels.length > 0) {
+								helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
+								logInfo("Scheduled primary model TTFT timeout", {
+									sessionID,
+									model,
+									timeoutSeconds: config.timeout_seconds,
+								})
+							}
+						})
+						.catch(() => {})
+				} else if (sessionStates.has(sessionID)) {
+					// Subsequent successful message.updated — model is streaming
+					deps.sessionFirstTokenReceived.set(sessionID, true)
+				}
 				return
 			}
 
