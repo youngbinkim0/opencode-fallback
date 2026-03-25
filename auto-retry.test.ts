@@ -357,4 +357,146 @@ describe("auto-retry integration", () => {
 			})
 		})
 	})
+
+	describe("#given autoRetryWithFallback race condition guards", () => {
+		describe("#when state has already been advanced by another handler (plan-based)", () => {
+			test("#then returns false and sets deferredToOtherHandler", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+				})
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("google/antigravity")
+				// Simulate: another handler already advanced to anthropic
+				state.currentModel = "anthropic/claude-opus-4-6"
+				state.attemptCount = 1
+				deps.sessionStates.set("ses_race", state)
+
+				const helpers = createAutoRetryHelpers(deps)
+				const result = await helpers.autoRetryWithFallback(
+					"ses_race",
+					"anthropic/claude-opus-4-6",
+					undefined,
+					"session.error",
+					{
+						success: true as const,
+						newModel: "anthropic/claude-opus-4-6",
+						failedModel: "google/antigravity",
+						newFallbackIndex: 0,
+					}
+				)
+
+				expect(result).toBe(false)
+				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+			})
+		})
+
+		describe("#when sessionAwaitingFallbackResult is already set by another handler", () => {
+			test("#then returns false (duplicate dispatch prevention)", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+				})
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("google/antigravity")
+				deps.sessionStates.set("ses_dup", state)
+				// Another handler already claimed the dispatch
+				deps.sessionAwaitingFallbackResult.add("ses_dup")
+
+				const helpers = createAutoRetryHelpers(deps)
+				const result = await helpers.autoRetryWithFallback(
+					"ses_dup",
+					"anthropic/claude-opus-4-6",
+					undefined,
+					"session.error",
+					{
+						success: true as const,
+						newModel: "anthropic/claude-opus-4-6",
+						failedModel: "google/antigravity",
+						newFallbackIndex: 0,
+					}
+				)
+
+				expect(result).toBe(false)
+				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+				// sessionAwaitingFallbackResult should NOT be cleared (other handler owns it)
+				expect(deps.sessionAwaitingFallbackResult.has("ses_dup")).toBe(true)
+			})
+		})
+
+		describe("#when state advances during async work (post-await stale check)", () => {
+			test("#then returns false after detecting stale state", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+				})
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("google/antigravity")
+				deps.sessionStates.set("ses_stale", state)
+
+				// Override abort to advance state during the async window
+				;(deps.ctx.client.session.abort as any).mockImplementation(async () => {
+					state.currentModel = "anthropic/claude-opus-4-6"
+					state.attemptCount = 1
+				})
+
+				const helpers = createAutoRetryHelpers(deps)
+				// Use session.status source (triggers abort + delay)
+				const result = await helpers.autoRetryWithFallback(
+					"ses_stale",
+					"anthropic/claude-opus-4-6",
+					undefined,
+					"session.status",
+					{
+						success: true as const,
+						newModel: "anthropic/claude-opus-4-6",
+						failedModel: "google/antigravity",
+						newFallbackIndex: 0,
+					}
+				)
+
+				expect(result).toBe(false)
+				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+			})
+		})
+
+		describe("#when source is session.idle.silent-failure", () => {
+			test("#then skips abort (model already stopped)", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+				})
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("google/antigravity")
+				deps.sessionStates.set("ses_silent", state)
+
+				const helpers = createAutoRetryHelpers(deps)
+				await helpers.autoRetryWithFallback(
+					"ses_silent",
+					"anthropic/claude-opus-4-6",
+					undefined,
+					"session.idle.silent-failure",
+					{
+						success: true as const,
+						newModel: "anthropic/claude-opus-4-6",
+						failedModel: "google/antigravity",
+						newFallbackIndex: 0,
+					}
+				)
+
+				// Should NOT abort — model already stopped
+				expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
+				// Should dispatch
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
+			})
+		})
+	})
 })

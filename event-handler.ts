@@ -163,9 +163,15 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 				}
 			}
 
-			logInfo("session.idle while awaiting fallback result; keeping timeout armed", {
+			// First token was received and session went idle — the fallback
+			// model completed its work (possibly with only tool calls, no text).
+			// Clear the awaiting state so the session isn't stuck.
+			logInfo("session.idle with first token received — fallback model completed", {
 				sessionID,
 			})
+			sessionAwaitingFallbackResult.delete(sessionID)
+			helpers.clearSessionFallbackTimeout(sessionID)
+			sessionRetryInFlight.delete(sessionID)
 			return
 		}
 

@@ -326,5 +326,73 @@ describe("subagent-result-sync", () => {
 			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 1000, pollIntervalMs: 50 })
 			expect(result).toBe("Part one. Part two.")
 		})
+
+		it("resets timeout when sessionLastMessageTime is updated (activity-aware)", async () => {
+			const deps = createMockDeps()
+			const childID = "ses_activity"
+
+			// Session stays busy, no idle event
+			;(deps.ctx.client.session.get as any).mockImplementation(() =>
+				Promise.resolve({ data: { status: "busy" } })
+			)
+			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
+				Promise.resolve({
+					data: [
+						{ info: { role: "assistant" }, parts: [{ type: "text", text: "Final response." }] },
+					],
+				})
+			)
+
+			// Simulate message activity arriving every 80ms for 300ms
+			// With maxWaitMs=150ms, this should keep the timeout from firing
+			const activityInterval = setInterval(() => {
+				deps.sessionLastMessageTime.set(childID, Date.now())
+			}, 80)
+
+			// After 350ms, go idle
+			setTimeout(() => {
+				clearInterval(activityInterval)
+				const resolvers = deps.sessionIdleResolvers.get(childID)
+				if (resolvers) {
+					for (const r of resolvers) r()
+					deps.sessionIdleResolvers.delete(childID)
+				}
+			}, 350)
+
+			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 150, pollIntervalMs: 50 })
+			// Should succeed because activity kept resetting the timeout
+			expect(result).toBe("Final response.")
+		})
+
+		it("detects idle via polling when session.idle event never fires", async () => {
+			const deps = createMockDeps()
+			const childID = "ses_poll_idle"
+
+			// Start busy, go idle after 100ms (no session.idle event fired)
+			let callCount = 0
+			;(deps.ctx.client.session.get as any).mockImplementation(() => {
+				callCount++
+				return Promise.resolve({
+					data: { status: callCount >= 3 ? "idle" : "busy" },
+				})
+			})
+			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
+				Promise.resolve({
+					data: [
+						{ info: { role: "assistant" }, parts: [{ type: "text", text: "Polled result." }] },
+					],
+				})
+			)
+
+			// Keep activity going so we don't timeout before polling detects idle
+			deps.sessionLastMessageTime.set(childID, Date.now())
+			const keepAlive = setInterval(() => {
+				deps.sessionLastMessageTime.set(childID, Date.now())
+			}, 40)
+			setTimeout(() => clearInterval(keepAlive), 300)
+
+			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 500, pollIntervalMs: 50 })
+			expect(result).toBe("Polled result.")
+		})
 	})
 })

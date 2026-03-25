@@ -4,6 +4,10 @@ import {
 	isModelInCooldown,
 	findNextAvailableFallback,
 	prepareFallback,
+	planFallback,
+	commitFallback,
+	snapshotFallbackState,
+	restoreFallbackState,
 	recoverToOriginal,
 } from "./fallback-state"
 import { DEFAULT_CONFIG } from "./constants"
@@ -333,6 +337,177 @@ describe("fallback-state", () => {
 				expect(state.failedModels.size).toBe(snapshotFailedModelsSize)
 				expect(state.failedModels.get("anthropic/claude-opus-4-6")).toBe(failedTimestamp)
 			})
+		})
+	})
+
+	describe("#given planFallback", () => {
+		describe("#when there is an available fallback model", () => {
+			test("#then returns a plan without mutating state", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				const fallbackModels = ["google/model-a", "openai/model-b"]
+
+				const plan = planFallback("ses_1", state, fallbackModels, DEFAULT_CONFIG)
+
+				expect(plan.success).toBe(true)
+				if (plan.success) {
+					expect(plan.newModel).toBe("google/model-a")
+					expect(plan.failedModel).toBe("anthropic/claude-opus-4-6")
+					expect(plan.newFallbackIndex).toBe(0)
+				}
+				// State must NOT be mutated
+				expect(state.currentModel).toBe("anthropic/claude-opus-4-6")
+				expect(state.attemptCount).toBe(0)
+				expect(state.failedModels.size).toBe(0)
+				expect(state.fallbackIndex).toBe(-1)
+			})
+		})
+
+		describe("#when max attempts have been reached", () => {
+			test("#then returns failure with maxAttemptsReached", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.attemptCount = DEFAULT_CONFIG.max_fallback_attempts
+
+				const plan = planFallback("ses_1", state, ["google/model-a"], DEFAULT_CONFIG)
+
+				expect(plan.success).toBe(false)
+				if (!plan.success) {
+					expect(plan.maxAttemptsReached).toBe(true)
+				}
+			})
+		})
+
+		describe("#when no available fallback models exist", () => {
+			test("#then returns failure", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.fallbackIndex = 1
+				state.failedModels.set("google/model-a", Date.now())
+				state.failedModels.set("openai/model-b", Date.now())
+
+				const plan = planFallback("ses_1", state, ["google/model-a", "openai/model-b"], DEFAULT_CONFIG)
+
+				expect(plan.success).toBe(false)
+			})
+		})
+
+		describe("#when called twice without committing", () => {
+			test("#then returns the same plan both times (state unchanged)", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				const fallbackModels = ["google/model-a", "openai/model-b"]
+
+				const plan1 = planFallback("ses_1", state, fallbackModels, DEFAULT_CONFIG)
+				const plan2 = planFallback("ses_1", state, fallbackModels, DEFAULT_CONFIG)
+
+				expect(plan1.success).toBe(true)
+				expect(plan2.success).toBe(true)
+				if (plan1.success && plan2.success) {
+					expect(plan1.newModel).toBe(plan2.newModel)
+					expect(plan1.failedModel).toBe(plan2.failedModel)
+				}
+			})
+		})
+	})
+
+	describe("#given commitFallback", () => {
+		describe("#when committing a valid plan", () => {
+			test("#then updates state correctly and returns true", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				const fallbackModels = ["google/model-a", "openai/model-b"]
+				const plan = planFallback("ses_1", state, fallbackModels, DEFAULT_CONFIG)
+
+				expect(plan.success).toBe(true)
+				if (!plan.success) return
+
+				const committed = commitFallback(state, plan)
+
+				expect(committed).toBe(true)
+				expect(state.currentModel).toBe("google/model-a")
+				expect(state.attemptCount).toBe(1)
+				expect(state.failedModels.has("anthropic/claude-opus-4-6")).toBe(true)
+				expect(state.fallbackIndex).toBe(0)
+				expect(state.pendingFallbackModel).toBeUndefined()
+			})
+		})
+
+		describe("#when committing the same plan twice (idempotency)", () => {
+			test("#then second commit returns false and state is unchanged", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				const fallbackModels = ["google/model-a", "openai/model-b"]
+				const plan = planFallback("ses_1", state, fallbackModels, DEFAULT_CONFIG)
+				if (!plan.success) return
+
+				const first = commitFallback(state, plan)
+				expect(first).toBe(true)
+				expect(state.attemptCount).toBe(1)
+
+				const second = commitFallback(state, plan)
+				expect(second).toBe(false)
+				// attemptCount must NOT have incremented again
+				expect(state.attemptCount).toBe(1)
+				expect(state.currentModel).toBe("google/model-a")
+			})
+		})
+
+		describe("#when plan + commit are used to advance through chain", () => {
+			test("#then each step advances correctly", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				const fallbackModels = ["google/model-a", "openai/model-b", "github/model-c"]
+
+				// Step 1
+				const plan1 = planFallback("ses_1", state, fallbackModels, DEFAULT_CONFIG)
+				expect(plan1.success).toBe(true)
+				if (plan1.success) commitFallback(state, plan1)
+				expect(state.currentModel).toBe("google/model-a")
+				expect(state.attemptCount).toBe(1)
+
+				// Step 2
+				const plan2 = planFallback("ses_1", state, fallbackModels, DEFAULT_CONFIG)
+				expect(plan2.success).toBe(true)
+				if (plan2.success) {
+					expect(plan2.failedModel).toBe("google/model-a")
+					expect(plan2.newModel).toBe("openai/model-b")
+					commitFallback(state, plan2)
+				}
+				expect(state.currentModel).toBe("openai/model-b")
+				expect(state.attemptCount).toBe(2)
+
+				// Step 3
+				const plan3 = planFallback("ses_1", state, fallbackModels, DEFAULT_CONFIG)
+				expect(plan3.success).toBe(true)
+				if (plan3.success) {
+					expect(plan3.newModel).toBe("github/model-c")
+					commitFallback(state, plan3)
+				}
+				expect(state.attemptCount).toBe(3)
+			})
+		})
+	})
+
+	describe("#given snapshotFallbackState / restoreFallbackState", () => {
+		test("#then snapshot captures and restore reverts state", () => {
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			state.currentModel = "google/model-a"
+			state.fallbackIndex = 1
+			state.attemptCount = 2
+			state.failedModels.set("anthropic/claude-opus-4-6", 1000)
+			state.pendingFallbackModel = "google/model-a"
+
+			const snap = snapshotFallbackState(state)
+
+			// Mutate state
+			state.currentModel = "openai/model-b"
+			state.fallbackIndex = 2
+			state.attemptCount = 3
+			state.failedModels.set("google/model-a", 2000)
+			state.pendingFallbackModel = undefined
+
+			restoreFallbackState(state, snap)
+
+			expect(state.currentModel).toBe("google/model-a")
+			expect(state.fallbackIndex).toBe(1)
+			expect(state.attemptCount).toBe(2)
+			expect(state.failedModels.size).toBe(1)
+			expect(state.failedModels.has("anthropic/claude-opus-4-6")).toBe(true)
+			expect(state.pendingFallbackModel).toBe("google/model-a")
 		})
 	})
 })

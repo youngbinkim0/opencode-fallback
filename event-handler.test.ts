@@ -162,7 +162,7 @@ describe("createEventHandler", () => {
 			expect(call[3]).toBe("session.idle.silent-failure")
 		})
 
-		test("#then idle is suppressed (normal) when first token WAS received", async () => {
+		test("#then idle clears awaiting state when first token WAS received (model completed)", async () => {
 			const sessionID = "ses_streaming_ok"
 			const state = createFallbackState("github-copilot/claude-opus-4.6")
 			state.currentModel = "google/gemini-pro"
@@ -192,8 +192,72 @@ describe("createEventHandler", () => {
 				sessionRetryInFlight: new Set(),
 				sessionAwaitingFallbackResult: new Set([sessionID]),
 				sessionFallbackTimeouts: new Map(),
-				// First token WAS received — model is streaming fine
+				// First token WAS received — model streamed and is now idle
 				sessionFirstTokenReceived: new Map([[sessionID, true]]),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const clearSessionFallbackTimeout = mock(() => {})
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout,
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: {
+					type: "session.idle",
+					properties: { sessionID },
+				},
+			})
+
+			// Should NOT trigger fallback — model completed normally
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+			// Awaiting should be CLEARED — session went idle after streaming
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+			// Timeout should be cleared
+			expect(clearSessionFallbackTimeout).toHaveBeenCalledWith(sessionID)
+		})
+	})
+
+	describe("#when session.error arrives while sessionAwaitingFallbackResult is set", () => {
+		test("#then session.error is ignored as likely stale", async () => {
+			const sessionID = "ses_awaiting_error"
+			const state = createFallbackState("google/antigravity")
+			state.currentModel = "anthropic/claude-opus-4-6"
+			state.attemptCount = 1
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {},
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
 				sessionSelfAbortTimestamp: new Map(),
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
@@ -214,15 +278,202 @@ describe("createEventHandler", () => {
 
 			await handler({
 				event: {
+					type: "session.error",
+					properties: {
+						sessionID,
+						error: { name: "UnknownError", message: "stale error" },
+					},
+				},
+			})
+
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+			expect(helpers.resolveAgentForSessionFromContext).not.toHaveBeenCalled()
+		})
+	})
+
+	describe("#when session.error arrives with stale errorModel", () => {
+		test("#then session.error is ignored", async () => {
+			const sessionID = "ses_stale_model"
+			const state = createFallbackState("google/antigravity")
+			state.currentModel = "anthropic/claude-opus-4-6"
+			state.attemptCount = 1
+			state.failedModels.set("google/antigravity", Date.now())
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {},
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: {
+					type: "session.error",
+					properties: {
+						sessionID,
+						model: "google/antigravity",
+						error: { name: "UnknownError", message: "stale error from old model" },
+					},
+				},
+			})
+
+			// Should be ignored because errorModel !== currentModel
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+	})
+
+	describe("#when session.error arrives with pendingFallbackModel after await", () => {
+		test("#then session.error is ignored due to post-await recheck", async () => {
+			const sessionID = "ses_post_await"
+			// No state initially — will be created by message.updated concurrently
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: { test: { model: "google/antigravity", fallback_models: ["anthropic/claude-opus-4-6"] } },
+				globalFallbackModels: [],
+				sessionStates: new Map(),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			// Simulate: during resolveAgentForSessionFromContext, state gets created
+			// with pendingFallbackModel set (by message.updated handler running concurrently)
+			const resolveAgentMock = mock(async () => {
+				const state = createFallbackState("google/antigravity")
+				state.pendingFallbackModel = "anthropic/claude-opus-4-6"
+				deps.sessionStates.set(sessionID, state)
+				return "test"
+			})
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: resolveAgentMock,
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: {
+					type: "session.error",
+					properties: {
+						sessionID,
+						error: { statusCode: 429, message: "rate limited" },
+					},
+				},
+			})
+
+			// Should not retry — pendingFallbackModel was set during agent resolution
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+	})
+
+	describe("#when session.idle resolves idle waiters before checking awaiting state", () => {
+		test("#then waiters are resolved even when sessionAwaitingFallbackResult is set", async () => {
+			const sessionID = "ses_idle_waiters"
+			let waiterResolved = false
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {},
+				globalFallbackModels: [],
+				sessionStates: new Map(),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map([[sessionID, true]]),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map([[sessionID, [() => { waiterResolved = true }]]]),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: {
 					type: "session.idle",
 					properties: { sessionID },
 				},
 			})
 
-			// Should NOT trigger fallback — model was streaming fine
-			expect(autoRetryWithFallback).not.toHaveBeenCalled()
-			// Awaiting should still be set (normal suppression)
-			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(true)
+			expect(waiterResolved).toBe(true)
 		})
 	})
 })
