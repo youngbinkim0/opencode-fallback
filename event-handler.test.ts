@@ -49,6 +49,7 @@ describe("createEventHandler", () => {
 				sessionSelfAbortTimestamp: new Map(),
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
 			}
 
 			const resolveAgentForSessionFromContext = mock(async () => "planner")
@@ -129,6 +130,7 @@ describe("createEventHandler", () => {
 				sessionSelfAbortTimestamp: new Map(),
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -195,6 +197,7 @@ describe("createEventHandler", () => {
 				sessionSelfAbortTimestamp: new Map(),
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)

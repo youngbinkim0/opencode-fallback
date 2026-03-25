@@ -152,6 +152,10 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				: undefined)
 
 		if (sessionID && role === "assistant") {
+			// Track last message activity — used by subagent-sync to detect
+			// that the child session is still alive and reset its timeout.
+			deps.sessionLastMessageTime.set(sessionID, Date.now())
+
 			logInfo("message.updated received", {
 				sessionID,
 				model,

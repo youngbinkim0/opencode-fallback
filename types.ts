@@ -150,4 +150,7 @@ export interface HookDeps {
 	/** Resolvers for code awaiting a session to go idle (e.g. subagent-sync
 	 *  waiting for a child session's fallback response to complete). */
 	sessionIdleResolvers: Map<string, Array<() => void>>
+	/** Timestamp of the last message.updated event per session.
+	 *  Used by subagent-sync to detect child activity and reset timeouts. */
+	sessionLastMessageTime: Map<string, number>
 }

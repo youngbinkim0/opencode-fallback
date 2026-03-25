@@ -42,6 +42,7 @@ function createMockDeps(overrides?: Partial<{
 		sessionSelfAbortTimestamp: new Map(),
 		sessionParentID: new Map(),
 		sessionIdleResolvers: new Map(),
+		sessionLastMessageTime: new Map(),
 	}
 }
 

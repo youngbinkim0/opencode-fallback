@@ -46,42 +46,41 @@ function getSessionStatusType(
 	return undefined
 }
 
-/** Maximum time to wait for a streaming child session (5 minutes). */
-const STREAMING_MAX_WAIT_MS = 5 * 60 * 1000
-
 /**
  * Wait for a child session to go idle using a hybrid approach:
  *
  * 1. Event-driven: registers a resolver that handleSessionIdle triggers
  * 2. Polling fallback: periodically checks session.get() status
- * 3. Streaming-aware: dynamically extends the deadline when the child
- *    starts generating tokens (firstTokenReceived becomes true)
+ * 3. Activity-aware: resets the timeout whenever a message.updated is
+ *    received for the child session (tracked via sessionLastMessageTime)
  *
  * The polling fallback is essential because plugin reinitialization (e.g.
  * hot-reload) wipes the sessionIdleResolvers map, orphaning any registered
  * event-driven waiters.  The poller survives reinit because it uses the
  * SDK client directly.
+ *
+ * Timeout behavior: the inactivityMs timeout resets every time we see a
+ * new message.updated for the child.  As long as messages keep arriving,
+ * the child is making progress and we keep waiting.  We only time out
+ * after inactivityMs of silence.
  */
 function waitForSessionIdle(
 	deps: HookDeps,
 	sessionID: string,
-	baseMaxWaitMs: number,
-	startTime: number,
+	inactivityMs: number,
 	pollIntervalMs: number = 2000,
 ): Promise<boolean> {
 	return new Promise<boolean>((resolve) => {
 		let settled = false
 		let pollTimer: ReturnType<typeof setInterval> | undefined
 		let timeoutTimer: ReturnType<typeof setTimeout> | undefined
-		let streamingDetected = false
+		let lastSeenMessageTime = deps.sessionLastMessageTime.get(sessionID) ?? Date.now()
 
 		const settle = (result: boolean) => {
 			if (settled) return
 			settled = true
-			// Clean up all timers
 			if (pollTimer) clearInterval(pollTimer)
 			if (timeoutTimer) clearTimeout(timeoutTimer)
-			// Clean up resolver from map (search by reference identity)
 			const resolvers = deps.sessionIdleResolvers.get(sessionID)
 			if (resolvers) {
 				const idx = resolvers.indexOf(onIdleRef)
@@ -91,7 +90,6 @@ function waitForSessionIdle(
 			resolve(result)
 		}
 
-		// Stable reference for event-driven resolver (used for cleanup)
 		const onIdleRef = () => settle(true)
 
 		// Register resolver for session.idle event (primary path)
@@ -102,33 +100,26 @@ function waitForSessionIdle(
 		}
 		resolvers.push(onIdleRef)
 
-		// Schedule initial timeout
-		const scheduleTimeout = (ms: number) => {
+		// Schedule the inactivity timeout
+		const resetTimeout = () => {
 			if (timeoutTimer) clearTimeout(timeoutTimer)
-			timeoutTimer = setTimeout(() => settle(false), ms)
+			timeoutTimer = setTimeout(() => settle(false), inactivityMs)
 		}
-		scheduleTimeout(baseMaxWaitMs)
+		resetTimeout()
 
-		// Polling fallback — survives plugin reinit and detects streaming
+		// Polling: check for idle status AND for new message activity
 		const pollStatus = () => {
 			if (settled) return
 
-			// ── Streaming-aware deadline extension ──
-			// firstTokenReceived can become true at any point during the wait
-			// (set by message-update-handler when the first assistant token
-			// arrives).  When detected, extend the deadline generously —
-			// the child is making progress and will eventually go idle.
-			if (!streamingDetected && deps.sessionFirstTokenReceived.get(sessionID)) {
-				streamingDetected = true
-				const elapsed = Date.now() - startTime
-				const newDeadline = Math.max(
-					baseMaxWaitMs - elapsed,
-					STREAMING_MAX_WAIT_MS - elapsed,
-				)
-				logInfo(`[subagent-sync] Child ${sessionID} started streaming, extending deadline by ${Math.round(newDeadline / 1000)}s`)
-				scheduleTimeout(newDeadline)
+			// Check if new message.updated events arrived since last poll.
+			// If so, the child is still working — reset the timeout.
+			const currentMessageTime = deps.sessionLastMessageTime.get(sessionID)
+			if (currentMessageTime && currentMessageTime > lastSeenMessageTime) {
+				lastSeenMessageTime = currentMessageTime
+				resetTimeout()
 			}
 
+			// Also poll session.get() as a fallback for idle detection
 			deps.ctx.client.session.get({ path: { id: sessionID } })
 				.then((sessionInfo) => {
 					if (settled) return
@@ -140,9 +131,7 @@ function waitForSessionIdle(
 						settle(true)
 					}
 				})
-				.catch(() => {
-					// Ignore — will retry on next poll
-				})
+				.catch(() => {})
 		}
 
 		// Immediate check + start periodic polling
@@ -157,7 +146,8 @@ function waitForSessionIdle(
  *
  * - Event-driven session.idle detection (fastest path)
  * - Polling fallback via session.get() (survives plugin reinit)
- * - Streaming-aware timeout extension (child making progress → wait longer)
+ * - Activity-aware timeout: resets every time a message.updated is received
+ *   for the child, so active sessions never time out prematurely
  *
  * Returns null if the wait times out or no valid assistant response is found.
  */
@@ -183,14 +173,15 @@ export async function waitForChildFallbackResult(
 	}
 
 	// Phase 2: Wait for the child session to go idle (model done generating).
-	// Hybrid: event-driven + polling + streaming-aware deadline extension.
+	// Hybrid: event-driven idle resolver + polling via session.get().
+	// The timeout resets every time a message.updated is received for the
+	// child, so actively streaming sessions never time out prematurely.
 	const remainingMs = Math.max(1000, maxWaitMs - (Date.now() - startTime))
 
 	const wentIdle = await waitForSessionIdle(
 		deps,
 		childSessionID,
 		remainingMs,
-		startTime,
 		pollIntervalMs,
 	)
 
