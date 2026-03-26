@@ -92,8 +92,12 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			const state = sessionStates.get(sessionID)
 			if (!state) return
 
+			// If another handler (e.g. session.idle silent-failure or
+			// session.status) already holds the retry lock, it is already
+			// advancing the fallback chain.  Don't interfere.
 			if (sessionRetryInFlight.has(sessionID)) {
-				logInfo("Overriding in-flight retry due to session timeout", { sessionID })
+				logInfo("Timeout fired but retry already in flight, deferring", { sessionID })
+				return
 			}
 
 			// For TTFT timeouts we MUST abort even for child sessions — the
@@ -207,21 +211,42 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		//
 		// Status sources (session.status, session.status.immediate): the model
 		// is still in a provider retry loop — abort is needed to stop it.
-		const modelAlreadyStopped = source === "session.error" || source === "message.updated" || source === "session.idle.silent-failure"
+		const modelAlreadyStopped = source === "session.error" || source === "message.updated"
 		const callerAlreadyAborted = source === "session.timeout"
+		// session.idle.silent-failure: the model went idle without producing
+		// tokens.  No NEW abort is needed, but a recent abort (e.g. from
+		// session.timeout or session.status) may still be propagating.
+		// We must wait for propagation before sending the replay.
+		const mayHaveRecentAbort = source === "session.idle.silent-failure"
 
 		if (modelAlreadyStopped) {
 			logInfo(`Skipping abort — model already stopped (${source})`, {
 				sessionID,
 				newModel,
 			})
-		} else if (callerAlreadyAborted) {
-			logInfo(`Caller already aborted (${source}), waiting for propagation`, {
-				sessionID,
-			})
-			await new Promise<void>((resolve) =>
-				setTimeout(() => resolve(), POST_ABORT_DELAY_MS)
-			)
+		} else if (callerAlreadyAborted || mayHaveRecentAbort) {
+			const selfAbortTs = deps.sessionSelfAbortTimestamp.get(sessionID)
+			const msSinceAbort = selfAbortTs ? Date.now() - selfAbortTs : undefined
+			if (selfAbortTs && msSinceAbort !== undefined && msSinceAbort < POST_ABORT_DELAY_MS * 2) {
+				logInfo(`Waiting for recent abort propagation (${source})`, {
+					sessionID,
+					msSinceAbort,
+				})
+				// Wait the remaining time until the abort propagation window closes
+				const remainingMs = Math.max(0, POST_ABORT_DELAY_MS - msSinceAbort)
+				if (remainingMs > 0) {
+					await new Promise<void>((resolve) =>
+						setTimeout(() => resolve(), remainingMs)
+					)
+				}
+			} else if (callerAlreadyAborted) {
+				logInfo(`Caller already aborted (${source}), waiting for propagation`, {
+					sessionID,
+				})
+				await new Promise<void>((resolve) =>
+					setTimeout(() => resolve(), POST_ABORT_DELAY_MS)
+				)
+			}
 		} else {
 			await abortSessionRequest(sessionID, `pre-fallback.${source}`)
 			await new Promise<void>((resolve) =>
@@ -330,6 +355,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						// actually succeeded. This prevents race conditions where
 						// session.error sees an advanced state before any API call
 						// was made.
+						let commitSucceeded = true
 						if (plan) {
 							const stateToCommit = sessionStates.get(sessionID)
 							if (stateToCommit) {
@@ -342,12 +368,26 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 										attemptCount: stateToCommit.attemptCount,
 									})
 								} else {
-									logInfo(`Fallback state already committed by another handler, skipping duplicate (${source})`, {
+									// Another handler already committed the same plan.
+									// We've sent a duplicate replay that we can't un-send.
+									// Abort it to prevent the provider from processing
+									// two requests for the same session, then bail out
+									// so we don't schedule a competing timeout.
+									logInfo(`Fallback state already committed by another handler — aborting duplicate replay (${source})`, {
 										sessionID,
 										newModel: plan.newModel,
 									})
+									commitSucceeded = false
+									await abortSessionRequest(sessionID, `duplicate-replay.${source}`)
 								}
 							}
+						}
+
+						if (!commitSucceeded) {
+							// Let the handler that won the commit own the awaiting
+							// state and timeout.  Mark ourselves as deferred.
+							deferredToOtherHandler = true
+							return false
 						}
 
 						// sessionAwaitingFallbackResult already set before dispatch

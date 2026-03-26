@@ -499,4 +499,58 @@ describe("auto-retry integration", () => {
 			})
 		})
 	})
+
+	describe("#given autoRetryWithFallback with a plan whose state is committed during dispatch", () => {
+		describe("#when commitFallback returns false (another handler committed during async work)", () => {
+			test("#then aborts the duplicate replay and returns false", async () => {
+				let promptCallCount = 0
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+					promptAsyncFn: async () => {
+						promptCallCount++
+						// Simulate: during the promptAsync call, another handler
+						// commits the same plan to state (race condition)
+						const { commitFallback } = await import("./fallback-state")
+						const state = deps.sessionStates.get("test-session")
+						if (state) {
+							commitFallback(state, {
+								success: true,
+								newModel: "openai/gpt-4o",
+								failedModel: "anthropic/claude-opus-4-6",
+								newFallbackIndex: 0,
+							})
+						}
+					},
+				})
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				deps.sessionStates.set("test-session", state)
+				deps.sessionLastAccess.set("test-session", Date.now())
+
+				const helpers = createAutoRetryHelpers(deps)
+				const result = await helpers.autoRetryWithFallback(
+					"test-session",
+					"openai/gpt-4o",
+					undefined,
+					"session.error",
+					{
+						success: true,
+						newModel: "openai/gpt-4o",
+						failedModel: "anthropic/claude-opus-4-6",
+						newFallbackIndex: 0,
+					}
+				)
+
+				// Should return false since it deferred to the other handler
+				expect(result).toBe(false)
+				// The prompt was sent (can't prevent that — commit check is post-dispatch)
+				expect(promptCallCount).toBe(1)
+				// Should have aborted the duplicate replay
+				expect(deps.ctx.client.session.abort).toHaveBeenCalled()
+			})
+		})
+	})
 })

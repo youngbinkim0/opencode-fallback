@@ -342,6 +342,29 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			return
 		}
 
+		// ── SELF-ABORT GUARD ──
+		// If this is a MessageAbortedError from a plugin-initiated abort
+		// (TTFT timeout, pre-fallback abort, etc.), suppress it.  The handler
+		// that initiated the abort is already dispatching the fallback.
+		// We check this FIRST, before any stale-model or pending guards,
+		// because those guards may not yet reflect the in-progress transition.
+		const SELF_ABORT_WINDOW_MS = 2000
+		const selfAbortTs = deps.sessionSelfAbortTimestamp.get(sessionID)
+		const errorName = extractErrorName(error)
+		if (
+			errorName === "MessageAbortedError" &&
+			selfAbortTs &&
+			Date.now() - selfAbortTs < SELF_ABORT_WINDOW_MS
+		) {
+			logInfo("Ignoring self-inflicted MessageAbortedError in session.error", {
+				sessionID,
+				msSinceAbort: Date.now() - selfAbortTs,
+				awaitingFallback: sessionAwaitingFallbackResult.has(sessionID),
+				retryInFlight: sessionRetryInFlight.has(sessionID),
+			})
+			return
+		}
+
 		// Ignore stale errors from models we already moved past
 		const currentState = sessionStates.get(sessionID)
 		if (currentState?.pendingFallbackModel) {

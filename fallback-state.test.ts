@@ -120,6 +120,32 @@ describe("fallback-state", () => {
 				expect(result).toBeUndefined()
 			})
 		})
+
+		describe("#when the next candidate is the same as currentModel", () => {
+			test("#then skips it and returns the model after", () => {
+				const state = createFallbackState("google/model-a")
+				// currentModel was changed to google/model-a (e.g. by session.status creating state with agent model)
+				state.currentModel = "google/model-a"
+				state.fallbackIndex = -1
+
+				const fallbackModels = ["google/model-a", "openai/model-b", "github/model-c"]
+				const result = findNextAvailableFallback(state, fallbackModels, 60)
+
+				expect(result).toBe("openai/model-b")
+			})
+
+			test("#then returns undefined if all candidates are the current model or in cooldown", () => {
+				const state = createFallbackState("google/model-a")
+				state.currentModel = "google/model-a"
+				state.fallbackIndex = -1
+
+				// Only fallback model is the same as currentModel
+				const fallbackModels = ["google/model-a"]
+				const result = findNextAvailableFallback(state, fallbackModels, 60)
+
+				expect(result).toBeUndefined()
+			})
+		})
 	})
 
 	describe("#given prepareFallback", () => {

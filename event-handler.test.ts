@@ -422,6 +422,191 @@ describe("createEventHandler", () => {
 		})
 	})
 
+	describe("#when session.error receives MessageAbortedError from plugin-initiated abort", () => {
+		test("#then it is suppressed when sessionSelfAbortTimestamp is recent", async () => {
+			const sessionID = "ses_self_abort_error"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: { test: { model: "anthropic/claude-opus-4-6", fallback_models: ["openai/gpt-4o"] } },
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				// Plugin aborted this session 100ms ago
+				sessionSelfAbortTimestamp: new Map([[sessionID, Date.now() - 100]]),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: {
+					type: "session.error",
+					properties: {
+						sessionID,
+						error: { name: "MessageAbortedError", message: "Message was aborted" },
+					},
+				},
+			})
+
+			// Should NOT trigger fallback — the abort was self-inflicted
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+			expect(helpers.resolveAgentForSessionFromContext).not.toHaveBeenCalled()
+		})
+
+		test("#then it is NOT suppressed when abort timestamp is old (>2s)", async () => {
+			const sessionID = "ses_old_abort_error"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: { test: { model: "anthropic/claude-opus-4-6", fallback_models: ["openai/gpt-4o"] } },
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				// Plugin aborted this session 3 seconds ago — outside the 2s window
+				sessionSelfAbortTimestamp: new Map([[sessionID, Date.now() - 3000]]),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: {
+					type: "session.error",
+					properties: {
+						sessionID,
+						error: { name: "MessageAbortedError", message: "Message was aborted" },
+					},
+				},
+			})
+
+			// MessageAbortedError is NOT retryable and not in fallback chain,
+			// so without the self-abort guard it should be skipped by the
+			// retryable check — NOT dispatched.
+			// The point is the self-abort guard didn't fire (timestamp too old).
+			// The error will fall through to isRetryableError which returns false.
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+
+		test("#then it is suppressed even without sessionAwaitingFallbackResult set", async () => {
+			const sessionID = "ses_no_awaiting_abort"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: { test: { model: "anthropic/claude-opus-4-6", fallback_models: ["openai/gpt-4o"] } },
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				// NOT in sessionAwaitingFallbackResult — simulates the micro-window
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map([[sessionID, Date.now() - 50]]),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: {
+					type: "session.error",
+					properties: {
+						sessionID,
+						error: { name: "MessageAbortedError", message: "Message was aborted" },
+					},
+				},
+			})
+
+			// Should be suppressed by self-abort guard, NOT by awaiting guard
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+			expect(helpers.resolveAgentForSessionFromContext).not.toHaveBeenCalled()
+		})
+	})
+
 	describe("#when session.idle resolves idle waiters before checking awaiting state", () => {
 		test("#then waiters are resolved even when sessionAwaitingFallbackResult is set", async () => {
 			const sessionID = "ses_idle_waiters"
@@ -474,6 +659,88 @@ describe("createEventHandler", () => {
 			})
 
 			expect(waiterResolved).toBe(true)
+		})
+	})
+
+	describe("#when session.status fires while sessionAwaitingFallbackResult is set", () => {
+		test("#then it advances the fallback chain to the next model (quota exceeded on current)", async () => {
+			const sessionID = "ses_status_advance"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			state.currentModel = "github-copilot/grok-code-fast-1"
+			state.attemptCount = 1
+			state.fallbackIndex = 0
+			state.failedModels.set("anthropic/claude-opus-4-6", Date.now())
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {
+					fast: {
+						model: "anthropic/claude-opus-4-6",
+						fallback_models: [
+							"github-copilot/grok-code-fast-1",
+							"openai/gpt-4o",
+						],
+					},
+				},
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				// Fallback already dispatched — awaiting result
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "fast"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: {
+					type: "session.status",
+					properties: {
+						sessionID,
+						status: {
+							type: "retry",
+							attempt: 1,
+							message: "Too Many Requests: quota exceeded",
+							next: Date.now() + 999999999,
+						},
+					},
+				},
+			})
+
+			// Should advance to next model (openai/gpt-4o), not stay on grok-code-fast-1
+			expect(autoRetryWithFallback).toHaveBeenCalledTimes(1)
+			const call = autoRetryWithFallback.mock.calls[0]
+			expect(call[1]).toBe("openai/gpt-4o")
+			// Awaiting should have been cleared
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
 		})
 	})
 })

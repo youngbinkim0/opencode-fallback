@@ -215,23 +215,45 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 						})
 						.catch(() => {})
 				} else if (sessionStates.has(sessionID)) {
-					// Subsequent successful message.updated — model is streaming
-					deps.sessionFirstTokenReceived.set(sessionID, true)
+					// Subsequent successful message.updated — model is streaming.
+					// Only mark TTFT if the event carries actual text content;
+					// empty initial frames should not prevent the timeout from
+					// firing on a hung model.
+					const eventHasContent = parts?.some(
+						(p) => p.type === "text" && typeof p.text === "string" && p.text.trim().length > 0
+					)
+					if (eventHasContent) {
+						deps.sessionFirstTokenReceived.set(sessionID, true)
+					}
 				}
 				return
 			}
 
-			// TTFT: mark that first token has been received — prevents TTFT timeout from aborting
-			deps.sessionFirstTokenReceived.set(sessionID, true)
-
+			// Check whether actual text content has arrived.  OpenCode sends an
+			// initial message.updated when it *creates* the assistant message
+			// slot — before any tokens arrive.  We must NOT mark TTFT as
+			// received for that empty frame; otherwise the timeout handler
+			// skips the abort and the session gets stuck forever.
 			const hasVisible = await checkVisibleResponse(ctx, sessionID, info)
 			if (!hasVisible) {
+				// Also check the event's own parts for any text content.
+				// If the event parts have text, the model is streaming even
+				// though the full-message fetch didn't find a complete response.
+				const eventHasText = parts?.some(
+					(p) => p.type === "text" && typeof p.text === "string" && p.text.trim().length > 0
+				)
+				if (eventHasText) {
+					deps.sessionFirstTokenReceived.set(sessionID, true)
+				}
 				logError(
 					"Assistant update observed without visible final response; keeping fallback timeout",
-					{ sessionID, model }
+					{ sessionID, model, firstTokenReceived: deps.sessionFirstTokenReceived.get(sessionID) ?? false }
 				)
 				return
 			}
+
+			// Full visible response confirmed — model produced real content
+			deps.sessionFirstTokenReceived.set(sessionID, true)
 
 			sessionAwaitingFallbackResult.delete(sessionID)
 			helpers.clearSessionFallbackTimeout(sessionID)
@@ -259,23 +281,30 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				return
 			}
 
-			// Safety net: if this is a MessageAbortedError on the current model
-			// and we recently called session.abort() ourselves (within 2s window),
-			// this is likely a self-inflicted abort from the previous fallback
-			// transition.  Ignore it — the model hasn't actually failed.
+			// Safety net: if this is a MessageAbortedError and we recently
+			// called session.abort() ourselves (within 2s window), this is a
+			// self-inflicted abort from the fallback transition.  Ignore it —
+			// the timeout handler (or whichever handler initiated the abort) is
+			// already dispatching the fallback.
+			//
+			// We intentionally do NOT require sessionAwaitingFallbackResult to
+			// be set: there is a micro-window between when the abort API call
+			// returns and when the dispatching handler gets to set the awaiting
+			// flag.  The MessageAbortedError event can arrive in that gap.
 			const SELF_ABORT_WINDOW_MS = 2000
 			const errorName = extractErrorName(error)
 			const selfAbortTs = deps.sessionSelfAbortTimestamp.get(sessionID)
 			if (
 				errorName === "MessageAbortedError" &&
 				selfAbortTs &&
-				Date.now() - selfAbortTs < SELF_ABORT_WINDOW_MS &&
-				sessionAwaitingFallbackResult.has(sessionID)
+				Date.now() - selfAbortTs < SELF_ABORT_WINDOW_MS
 			) {
-				logInfo("Ignoring self-inflicted MessageAbortedError on current fallback model", {
+				logInfo("Ignoring self-inflicted MessageAbortedError (abort initiated by plugin)", {
 					sessionID,
 					model,
 					msSinceAbort: Date.now() - selfAbortTs,
+					awaitingFallback: sessionAwaitingFallbackResult.has(sessionID),
+					retryInFlight: sessionRetryInFlight.has(sessionID),
 				})
 				return
 			}

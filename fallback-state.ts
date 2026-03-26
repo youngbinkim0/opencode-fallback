@@ -59,6 +59,12 @@ export function findNextAvailableFallback(
 ): string | undefined {
 	for (let i = state.fallbackIndex + 1; i < fallbackModels.length; i++) {
 		const candidate = fallbackModels[i]
+		// Never select the model that is currently failing — that would
+		// create an infinite retry loop.
+		if (candidate === state.currentModel) {
+			logInfo(`Skipping fallback model identical to current: ${candidate} (index ${i})`)
+			continue
+		}
 		if (!isModelInCooldown(candidate, state, cooldownSeconds)) {
 			return candidate
 		}

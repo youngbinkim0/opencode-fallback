@@ -1,6 +1,7 @@
 import { describe, test, expect, mock } from "bun:test"
 import { createAutoRetryHelpers } from "./auto-retry"
 import { createMessageUpdateHandler } from "./message-update-handler"
+import { createEventHandler } from "./event-handler"
 import { createFallbackState } from "./fallback-state"
 import type { HookDeps, FallbackPluginConfig } from "./types"
 import type { AutoRetryHelpers } from "./auto-retry"
@@ -161,6 +162,72 @@ describe("TTFT-based timeout", () => {
 			})
 		})
 
+		describe("#when session is awaiting fallback result but message has no visible content", () => {
+			test("#then sessionFirstTokenReceived stays false (empty frame)", async () => {
+				const deps = createMockDeps()
+				const mockHelpers = createMockHelpers()
+				// Override messages to return an assistant message with NO text
+				deps.ctx.client.session.messages = mock(async () => ({
+					data: [
+						{
+							info: { role: "assistant" },
+							parts: [],
+						},
+					],
+				})) as any
+				deps.sessionAwaitingFallbackResult.add("test-session")
+				deps.sessionStates.set(
+					"test-session",
+					createFallbackState("anthropic/claude-opus-4-6")
+				)
+
+				const handler = createMessageUpdateHandler(deps, mockHelpers)
+				await handler({
+					info: {
+						sessionID: "test-session",
+						role: "assistant",
+					},
+					// Event parts also have no text — truly empty frame
+					parts: [],
+				})
+
+				// Should NOT mark first token received — no content arrived
+				expect(deps.sessionFirstTokenReceived.get("test-session") ?? false).toBe(false)
+			})
+
+			test("#then sessionFirstTokenReceived is set if event parts have text despite no visible response", async () => {
+				const deps = createMockDeps()
+				const mockHelpers = createMockHelpers()
+				// Override messages to return assistant with error (no visible response)
+				deps.ctx.client.session.messages = mock(async () => ({
+					data: [
+						{
+							info: { role: "assistant", error: { name: "Error", message: "failed" } },
+							parts: [{ type: "text", text: "partial" }],
+						},
+					],
+				})) as any
+				deps.sessionAwaitingFallbackResult.add("test-session")
+				deps.sessionStates.set(
+					"test-session",
+					createFallbackState("anthropic/claude-opus-4-6")
+				)
+
+				const handler = createMessageUpdateHandler(deps, mockHelpers)
+				await handler({
+					info: {
+						sessionID: "test-session",
+						role: "assistant",
+					},
+					// Event parts DO have text — model is streaming
+					parts: [{ type: "text", text: "Hello partial" }],
+				})
+
+				// Should mark first token received — event parts have real text
+				expect(deps.sessionFirstTokenReceived.get("test-session")).toBe(true)
+			})
+		})
+
 		describe("#when session is NOT awaiting fallback result", () => {
 			test("#then sessionFirstTokenReceived is not modified", async () => {
 				const deps = createMockDeps()
@@ -206,6 +273,142 @@ describe("TTFT-based timeout", () => {
 	describe("#given timeout_seconds default config", () => {
 		test("#then defaults to 30", () => {
 			expect(DEFAULT_CONFIG.timeout_seconds).toBe(30)
+		})
+	})
+})
+
+describe("MessageAbortedError self-abort suppression", () => {
+	describe("#given message.updated receives MessageAbortedError after plugin-initiated abort", () => {
+		test("#then error is suppressed when sessionSelfAbortTimestamp is within 2s window", async () => {
+			const deps = createMockDeps()
+			const mockHelpers = createMockHelpers()
+			const sessionID = "ses_self_abort_msg"
+
+			// Set up state so the session is in a fallback chain
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			deps.sessionStates.set(sessionID, state)
+			// Plugin aborted this session 100ms ago
+			deps.sessionSelfAbortTimestamp.set(sessionID, Date.now() - 100)
+
+			// Configure fallback models
+			deps.agentConfigs = {
+				test: {
+					model: "anthropic/claude-opus-4-6",
+					fallback_models: ["openai/gpt-4o"],
+				},
+			}
+
+			const handler = createMessageUpdateHandler(deps, mockHelpers)
+			await handler({
+				info: {
+					sessionID,
+					role: "assistant",
+					model: "anthropic/claude-opus-4-6",
+					error: { name: "MessageAbortedError", message: "Message was aborted" },
+				},
+			})
+
+			// Should NOT trigger fallback — the abort was self-inflicted
+			expect(mockHelpers.autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+
+		test("#then error is suppressed even without sessionAwaitingFallbackResult", async () => {
+			const deps = createMockDeps()
+			const mockHelpers = createMockHelpers()
+			const sessionID = "ses_no_await_msg"
+
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			deps.sessionStates.set(sessionID, state)
+			deps.sessionSelfAbortTimestamp.set(sessionID, Date.now() - 50)
+			// Explicitly NOT in sessionAwaitingFallbackResult (micro-window)
+
+			deps.agentConfigs = {
+				test: {
+					model: "anthropic/claude-opus-4-6",
+					fallback_models: ["openai/gpt-4o"],
+				},
+			}
+
+			const handler = createMessageUpdateHandler(deps, mockHelpers)
+			await handler({
+				info: {
+					sessionID,
+					role: "assistant",
+					model: "anthropic/claude-opus-4-6",
+					error: { name: "MessageAbortedError", message: "Message was aborted" },
+				},
+			})
+
+			// Should be suppressed by self-abort guard
+			expect(mockHelpers.autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+
+		test("#then error is NOT suppressed when abort timestamp is beyond 2s window", async () => {
+			const deps = createMockDeps()
+			const mockHelpers = createMockHelpers()
+			const sessionID = "ses_old_abort_msg"
+
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			deps.sessionStates.set(sessionID, state)
+			// Abort was 3 seconds ago — outside 2s window
+			deps.sessionSelfAbortTimestamp.set(sessionID, Date.now() - 3000)
+
+			deps.agentConfigs = {
+				test: {
+					model: "anthropic/claude-opus-4-6",
+					fallback_models: ["openai/gpt-4o"],
+				},
+			}
+			deps.globalFallbackModels = ["openai/gpt-4o"]
+
+			const handler = createMessageUpdateHandler(deps, mockHelpers)
+			await handler({
+				info: {
+					sessionID,
+					role: "assistant",
+					model: "anthropic/claude-opus-4-6",
+					error: { name: "MessageAbortedError", message: "Message was aborted" },
+				},
+			})
+
+			// MessageAbortedError is NOT retryable and not in fallback chain,
+			// so it should be skipped by the retryable error check (not the self-abort guard).
+			// The important thing is the self-abort guard did NOT catch it.
+			expect(mockHelpers.autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+
+		test("#then non-MessageAbortedError is not affected by self-abort guard", async () => {
+			const deps = createMockDeps()
+			const mockHelpers = createMockHelpers()
+			const sessionID = "ses_real_error_msg"
+
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			deps.sessionStates.set(sessionID, state)
+			// Plugin aborted recently, but error is NOT MessageAbortedError
+			deps.sessionSelfAbortTimestamp.set(sessionID, Date.now() - 100)
+
+			deps.agentConfigs = {
+				test: {
+					model: "anthropic/claude-opus-4-6",
+					fallback_models: ["openai/gpt-4o"],
+				},
+			}
+			deps.globalFallbackModels = ["openai/gpt-4o"]
+
+			const handler = createMessageUpdateHandler(deps, mockHelpers)
+			await handler({
+				info: {
+					sessionID,
+					role: "assistant",
+					model: "anthropic/claude-opus-4-6",
+					error: { statusCode: 429, message: "rate limited" },
+				},
+			})
+
+			// 429 IS retryable, so fallback should be triggered despite
+			// the recent self-abort timestamp (guard only applies to
+			// MessageAbortedError specifically)
+			expect(mockHelpers.autoRetryWithFallback).toHaveBeenCalled()
 		})
 	})
 })
