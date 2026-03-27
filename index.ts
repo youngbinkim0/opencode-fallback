@@ -173,8 +173,17 @@ export default async function OpenCodeFallbackPlugin(
 					(props?.sessionID as string | undefined) ??
 					(info?.sessionID as string | undefined) ??
 					(info?.id as string | undefined)
+				// Extract model from activity event so handleActivity can
+				// distinguish stale activity from the failed model vs real
+				// activity from the fallback model.
+				const activityModel =
+					(info?.model as string | undefined) ??
+					(typeof info?.providerID === "string" && typeof info?.modelID === "string"
+						? `${info.providerID}/${info.modelID}`
+						: undefined) ??
+					(props?.model as string | undefined)
 				if (sessionID) {
-					await handleActivity(sessionID)
+					await handleActivity(sessionID, activityModel)
 				}
 			}
 			

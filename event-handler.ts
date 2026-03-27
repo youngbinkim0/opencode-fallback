@@ -26,7 +26,26 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		sessionFallbackTimeouts,
 	} = deps
 
-	const handleActivity = async (sessionID: string) => {
+	const handleActivity = async (sessionID: string, activityModel?: string) => {
+		// If a fallback is awaiting results and we know the model that produced
+		// this activity, verify it matches the current fallback model.  Stale
+		// activity from the failed model (e.g. k2p5 emitting a final
+		// message.part.delta while gemini-flash is being dispatched) must NOT
+		// mark firstTokenReceived or reset the timeout — that would cause
+		// session.idle to declare "fallback model completed" before the actual
+		// fallback model has produced anything.
+		if (activityModel && sessionAwaitingFallbackResult.has(sessionID)) {
+			const state = sessionStates.get(sessionID)
+			if (state && state.failedModels.has(activityModel)) {
+				logInfo("Ignoring activity from already-failed model", {
+					sessionID,
+					activityModel,
+					currentModel: state.currentModel,
+				})
+				return
+			}
+		}
+
 		// Any model activity (text deltas, tool calls, diffs) proves the model
 		// is alive and producing output.  Mark first token received so the TTFT
 		// timeout handler skips the abort when it eventually fires.
@@ -37,7 +56,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		if (sessionAwaitingFallbackResult.has(sessionID)) {
 			const resolvedAgent = resolveAgentForSession(sessionID, undefined)
 			helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
-			logInfo("Resetting fallback timeout due to activity", { sessionID })
+			logInfo("Resetting fallback timeout due to activity", { sessionID, activityModel })
 			return
 		}
 

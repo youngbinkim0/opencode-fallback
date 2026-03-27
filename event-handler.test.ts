@@ -1537,5 +1537,184 @@ describe("createEventHandler", () => {
 			// Even for non-awaiting sessions, activity should set firstTokenReceived
 			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBe(true)
 		})
+
+		test("#activity from already-failed model is ignored during active fallback", async () => {
+			const sessionID = "ses_stale_activity"
+			const state = createFallbackState("kimi-for-coding/k2p5")
+			state.currentModel = "google/gemini-flash"
+			state.failedModels.set("kimi-for-coding/k2p5", Date.now())
+			state.attemptCount = 1
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+						},
+						tui: {
+							showToast: mock(async () => {}),
+						},
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: undefined,
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(), // NOT set yet
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
+			}
+
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => undefined),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleActivity } = createEventHandler(deps, helpers)
+
+			// Activity from the failed model k2p5 — should be ignored
+			await handleActivity(sessionID, "kimi-for-coding/k2p5")
+
+			// firstTokenReceived must NOT be set (stale activity)
+			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBeUndefined()
+			// Timeout should NOT be rescheduled
+			expect(helpers.scheduleSessionFallbackTimeout).not.toHaveBeenCalled()
+		})
+
+		test("#activity from the fallback model IS accepted during active fallback", async () => {
+			const sessionID = "ses_real_activity"
+			const state = createFallbackState("kimi-for-coding/k2p5")
+			state.currentModel = "google/gemini-flash"
+			state.failedModels.set("kimi-for-coding/k2p5", Date.now())
+			state.attemptCount = 1
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+						},
+						tui: {
+							showToast: mock(async () => {}),
+						},
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: undefined,
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
+			}
+
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => undefined),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleActivity } = createEventHandler(deps, helpers)
+
+			// Activity from the fallback model — should be accepted
+			await handleActivity(sessionID, "google/gemini-flash")
+
+			// firstTokenReceived MUST be set
+			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBe(true)
+			// Timeout should be rescheduled
+			expect(helpers.scheduleSessionFallbackTimeout).toHaveBeenCalled()
+		})
+
+		test("#activity with no model info is accepted (backwards compatible)", async () => {
+			const sessionID = "ses_no_model_activity"
+			const state = createFallbackState("kimi-for-coding/k2p5")
+			state.currentModel = "google/gemini-flash"
+			state.failedModels.set("kimi-for-coding/k2p5", Date.now())
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+						},
+						tui: {
+							showToast: mock(async () => {}),
+						},
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: undefined,
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
+			}
+
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => undefined),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleActivity } = createEventHandler(deps, helpers)
+
+			// Activity with no model — should still be accepted (backward compat)
+			await handleActivity(sessionID, undefined)
+
+			// firstTokenReceived should be set
+			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBe(true)
+			// Timeout should be rescheduled
+			expect(helpers.scheduleSessionFallbackTimeout).toHaveBeenCalled()
+		})
 	})
 })
