@@ -55,6 +55,37 @@ describe("fallback-state", () => {
 				expect(isModelInCooldown("google/gemini-pro", state, 60)).toBe(false)
 			})
 		})
+
+		describe("#when cooldown boundary values are used", () => {
+			test("#then zero and negative cooldowns never keep a model in cooldown", () => {
+				const originalNow = Date.now
+				Date.now = () => 10_000
+
+				try {
+					const state = createFallbackState("anthropic/claude-opus-4-6")
+					state.failedModels.set("google/gemini-pro", 10_000)
+
+					expect(isModelInCooldown("google/gemini-pro", state, 0)).toBe(false)
+					expect(isModelInCooldown("google/gemini-pro", state, -5)).toBe(false)
+				} finally {
+					Date.now = originalNow
+				}
+			})
+
+			test("#then exact cooldown expiry is treated as available", () => {
+				const originalNow = Date.now
+				Date.now = () => 70_000
+
+				try {
+					const state = createFallbackState("anthropic/claude-opus-4-6")
+					state.failedModels.set("google/gemini-pro", 10_000)
+
+					expect(isModelInCooldown("google/gemini-pro", state, 60)).toBe(false)
+				} finally {
+					Date.now = originalNow
+				}
+			})
+		})
 	})
 
 	describe("#given findNextAvailableFallback", () => {
@@ -470,6 +501,35 @@ describe("fallback-state", () => {
 				// attemptCount must NOT have incremented again
 				expect(state.attemptCount).toBe(1)
 				expect(state.currentModel).toBe("google/model-a")
+			})
+		})
+
+		describe("#when committing a stale plan after a newer fallback already committed", () => {
+			test("#then stale commit is ignored and newer state is preserved", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				const fallbackModels = ["google/model-a", "openai/model-b", "github/model-c"]
+
+				const plan1 = planFallback("ses_1", state, fallbackModels, DEFAULT_CONFIG)
+				expect(plan1.success).toBe(true)
+				if (!plan1.success) return
+
+				expect(commitFallback(state, plan1)).toBe(true)
+				expect(state.currentModel).toBe("google/model-a")
+
+				const plan2 = planFallback("ses_1", state, fallbackModels, DEFAULT_CONFIG)
+				expect(plan2.success).toBe(true)
+				if (!plan2.success) return
+
+				expect(commitFallback(state, plan2)).toBe(true)
+				expect(state.currentModel).toBe("openai/model-b")
+				expect(state.attemptCount).toBe(2)
+
+				const staleCommit = commitFallback(state, plan1)
+
+				expect(staleCommit).toBe(false)
+				expect(state.currentModel).toBe("openai/model-b")
+				expect(state.fallbackIndex).toBe(1)
+				expect(state.attemptCount).toBe(2)
 			})
 		})
 
