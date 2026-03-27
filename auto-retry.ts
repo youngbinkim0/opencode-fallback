@@ -1,7 +1,7 @@
 import type { HookDeps, MessagePart, FallbackPlan } from "./types"
 import { logInfo, logError } from "./logger"
 import { getFallbackModelsForSession, resolveAgentForSession } from "./config-reader"
-import { prepareFallback, planFallback, commitFallback } from "./fallback-state"
+import { prepareFallback, planFallback, commitFallback, createFallbackState } from "./fallback-state"
 import { replayWithDegradation } from "./message-replay"
 
 const SESSION_TTL_MS = 30 * 60 * 1000
@@ -296,46 +296,104 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		deps.sessionFirstTokenReceived.set(sessionID, false)
 		let retryDispatched = false
 		try {
-			// ── COMPACTION FALLBACK PATH ──
-			// Compaction user messages contain `type: "compaction"` parts which
-			// `promptAsync` cannot accept (SDK only allows text/file/agent/subtask).
-			// The `session.command("compact")` API ignores the `model` parameter
-			// for compaction — OpenCode resolves the model internally.
+			// ── COMPACTION SESSION: PROPAGATE FAILURE TO PARENT ──
+			// Compaction sessions are internal OpenCode operations with a fixed
+			// model binding.  Neither `session.command("compact")` nor
+			// `promptAsync` with a model override can change the model on a
+			// compaction session — OpenCode resolves the model from the session
+			// config, ignoring the API parameter.
 			//
-			// Strategy: skip the compaction parts entirely and find the REAL last
-			// user message (the one that triggered auto-compaction). Replay that
-			// on the fallback model via `promptAsync` — the fallback model may
-			// have a larger context window and handle the full history directly.
-			//
-			// This falls through to the normal replay path below, which already
-			// handles message fetch, degradation tiers, and dispatch.  We just
-			// need to make sure the message fetch skips `type: "compaction"` parts
-			// and finds a real user message with replayable content.
+			// Instead of retrying on this session, propagate the model failure
+			// to the parent session's fallback state.  This ensures the parent
+			// session switches to the fallback model for subsequent prompts.
 			if (resolvedAgent === "compaction") {
-				logInfo(`Compaction fallback: replaying last user message via promptAsync (${source})`, {
+				// Look up the model that actually failed on this compaction session.
+				// Since we're inside autoRetryWithFallback, the plan's failedModel
+				// is the model that errored.
+				const failedModel = plan?.failedModel
+				logInfo(`Compaction session failed — propagating model failure to parent (${source})`, {
 					sessionID,
-					model: newModel,
+					failedModel,
 				})
 
-				// Show toast notification for compaction fallback trigger
-				if (config.notify_on_fallback) {
-					const modelName = newModel.split("/").pop() || newModel
-					await ctx.client.tui
-						.showToast({
-							body: {
-								title: "Compaction Fallback",
-								message: `Compaction failed — retrying on ${modelName}`,
-								variant: "warning",
-								duration: 5000,
-							},
+				// Look up the parent session
+				const parentID = await getParentSessionID(sessionID)
+				if (parentID && failedModel) {
+					const existingParentState = sessionStates.get(parentID)
+					const parentState = existingParentState ?? createFallbackState(failedModel)
+					if (!existingParentState) {
+						sessionStates.set(parentID, parentState)
+					}
+
+					// Register the failed model in the parent's failedModels map
+					// so the next chat.message on the parent will trigger fallback.
+					if (!parentState.failedModels.has(failedModel)) {
+						parentState.failedModels.set(failedModel, Date.now())
+						logInfo("Registered compaction model failure on parent session", {
+							sessionID,
+							parentID,
+							failedModel,
+							parentCurrentModel: parentState.currentModel,
 						})
-						.catch(() => {})
+					}
+
+					// If the parent is still on the failed model, plan the fallback
+					// so the chat.message hook can apply it immediately.
+					if (parentState.currentModel === failedModel) {
+						const parentAgent = resolveAgentForSession(parentID, undefined)
+						const parentFallbackModels = getFallbackModelsForSession(
+							parentID,
+							parentAgent,
+							deps.agentConfigs,
+							deps.globalFallbackModels
+						)
+
+						if (parentFallbackModels.length > 0) {
+							const parentPlan = planFallback(parentID, parentState, parentFallbackModels, config)
+							if (parentPlan.success) {
+								commitFallback(parentState, parentPlan)
+								logInfo("Pre-committed fallback on parent session due to compaction failure", {
+									parentID,
+									from: failedModel,
+									to: parentPlan.newModel,
+								})
+
+								if (config.notify_on_fallback) {
+									const modelName = parentPlan.newModel.split("/").pop() || parentPlan.newModel
+									await ctx.client.tui
+										.showToast({
+											body: {
+												title: "Model Fallback",
+												message: `${failedModel.split("/").pop()} failed during compaction — switching to ${modelName}`,
+												variant: "warning",
+												duration: 5000,
+											},
+										})
+										.catch(() => {})
+								}
+							}
+						}
+					}
+				} else {
+					logInfo("No parent session found for compaction — cannot propagate failure", {
+						sessionID,
+					})
+
+					if (config.notify_on_fallback) {
+						await ctx.client.tui
+							.showToast({
+								body: {
+									title: "Compaction Failed",
+									message: "Compaction failed — model override not supported",
+									variant: "warning",
+									duration: 5000,
+								},
+							})
+							.catch(() => {})
+					}
 				}
 
-				// Clear the compaction agent so the normal replay path doesn't
-				// pass agent="compaction" to promptAsync (which would confuse
-				// OpenCode into treating this as a compaction request).
-				resolvedAgent = undefined
+				return false
 			}
 
 			// ── NORMAL REPLAY DISPATCH PATH ──
