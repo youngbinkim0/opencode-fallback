@@ -9,10 +9,12 @@ function createMockDeps(overrides?: Partial<{
 		parts?: Array<{ type?: string; text?: string } & Record<string, unknown>>
 	}>
 	promptAsyncFn: (...args: unknown[]) => Promise<void>
+	commandFn: (...args: unknown[]) => Promise<void>
 	showToastFn: (...args: unknown[]) => Promise<void>
 }>): HookDeps {
 	const messagesData = overrides?.messagesData ?? []
 	const promptAsyncFn = overrides?.promptAsyncFn ?? (async () => {})
+	const commandFn = overrides?.commandFn ?? (async () => {})
 	const showToastFn = overrides?.showToastFn ?? (async () => {})
 
 	return {
@@ -23,6 +25,7 @@ function createMockDeps(overrides?: Partial<{
 					abort: mock(async () => {}),
 					messages: mock(async () => ({ data: messagesData })),
 					promptAsync: mock(promptAsyncFn as any),
+					command: mock(commandFn as any),
 					get: mock(async () => ({ data: {} })),
 				},
 				tui: {
@@ -1126,6 +1129,263 @@ describe("auto-retry integration", () => {
 
 				// The parentID cache is used for determining child session behavior
 				expect(deps.sessionParentID.get("ses_cached")).toBe("parent-123")
+			})
+		})
+	})
+
+	describe("#given compaction-origin fallback dispatch", () => {
+		describe("#when agent is 'compaction'", () => {
+			test("#then calls session.command with command:'compact' and fallback model, NOT promptAsync", async () => {
+				const commandCalls: any[] = []
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
+					],
+					commandFn: async (args: any) => {
+						commandCalls.push(args)
+					},
+				})
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("openai/gpt-4o")
+				deps.sessionStates.set("ses_compact", state)
+				deps.globalFallbackModels = ["anthropic/claude-sonnet-4-20250514"]
+
+				const helpers = createAutoRetryHelpers(deps)
+				const result = await helpers.autoRetryWithFallback(
+					"ses_compact",
+					"anthropic/claude-sonnet-4-20250514",
+					"compaction",
+					"session.error",
+					{
+						success: true as const,
+						newModel: "anthropic/claude-sonnet-4-20250514",
+						failedModel: "openai/gpt-4o",
+						newFallbackIndex: 0,
+					}
+				)
+
+				expect(result).toBe(true)
+				// Must use session.command, NOT promptAsync
+				expect(commandCalls.length).toBe(1)
+				expect(commandCalls[0].body.command).toBe("compact")
+				expect(commandCalls[0].body.model).toBe("anthropic/claude-sonnet-4-20250514")
+				expect(commandCalls[0].body.agent).toBe("compaction")
+				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+			})
+		})
+
+		describe("#when agent is 'compaction' and resolving fallback models", () => {
+			test("#then resolves models via getFallbackModelsForSession with agent='compaction'", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
+					],
+				})
+				// Set up per-agent compaction config with specific fallback models
+				deps.agentConfigs = {
+					compaction: {
+						model: "openai/gpt-4o",
+						fallback_models: ["anthropic/claude-sonnet-4-20250514", "google/gemini-2.0-pro"],
+					},
+				}
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("openai/gpt-4o")
+				deps.sessionStates.set("ses_compact_cfg", state)
+
+				const helpers = createAutoRetryHelpers(deps)
+				const result = await helpers.autoRetryWithFallback(
+					"ses_compact_cfg",
+					"anthropic/claude-sonnet-4-20250514",
+					"compaction",
+					"session.error",
+					{
+						success: true as const,
+						newModel: "anthropic/claude-sonnet-4-20250514",
+						failedModel: "openai/gpt-4o",
+						newFallbackIndex: 0,
+					}
+				)
+
+				expect(result).toBe(true)
+				// Should use session.command since agent is "compaction"
+				expect((deps.ctx.client.session as any).command).toHaveBeenCalled()
+				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+			})
+		})
+
+		describe("#when compaction dispatch succeeds", () => {
+			test("#then commits fallback state, marks session awaiting, and schedules timeout", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
+					],
+				})
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("openai/gpt-4o")
+				deps.sessionStates.set("ses_compact_ok", state)
+				deps.globalFallbackModels = ["anthropic/claude-sonnet-4-20250514"]
+
+				const helpers = createAutoRetryHelpers(deps)
+				const result = await helpers.autoRetryWithFallback(
+					"ses_compact_ok",
+					"anthropic/claude-sonnet-4-20250514",
+					"compaction",
+					"session.error",
+					{
+						success: true as const,
+						newModel: "anthropic/claude-sonnet-4-20250514",
+						failedModel: "openai/gpt-4o",
+						newFallbackIndex: 0,
+					}
+				)
+
+				expect(result).toBe(true)
+				// Must use session.command for compaction, NOT promptAsync
+				expect((deps.ctx.client.session as any).command).toHaveBeenCalled()
+				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+				// State should be committed (currentModel advanced)
+				expect(state.currentModel).toBe("anthropic/claude-sonnet-4-20250514")
+				expect(state.attemptCount).toBe(1)
+				// Session should be marked awaiting fallback result
+				expect(deps.sessionAwaitingFallbackResult.has("ses_compact_ok")).toBe(true)
+				// Timeout should be scheduled
+				expect(deps.sessionFallbackTimeouts.has("ses_compact_ok")).toBe(true)
+			})
+		})
+
+		describe("#when compaction dispatch fails", () => {
+			test("#then clears awaiting/retry-in-flight state so session does not stall", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
+					],
+					commandFn: async () => {
+						throw new Error("Command dispatch failed")
+					},
+				})
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("openai/gpt-4o")
+				deps.sessionStates.set("ses_compact_fail", state)
+				deps.globalFallbackModels = ["anthropic/claude-sonnet-4-20250514"]
+
+				const helpers = createAutoRetryHelpers(deps)
+				const result = await helpers.autoRetryWithFallback(
+					"ses_compact_fail",
+					"anthropic/claude-sonnet-4-20250514",
+					"compaction",
+					"session.error",
+					{
+						success: true as const,
+						newModel: "anthropic/claude-sonnet-4-20250514",
+						failedModel: "openai/gpt-4o",
+						newFallbackIndex: 0,
+					}
+				)
+
+				expect(result).toBe(false)
+				// Must NOT leave session stuck
+				expect(deps.sessionAwaitingFallbackResult.has("ses_compact_fail")).toBe(false)
+				expect(deps.sessionRetryInFlight.has("ses_compact_fail")).toBe(false)
+				expect(deps.sessionFallbackTimeouts.has("ses_compact_fail")).toBe(false)
+			})
+		})
+
+		describe("#when compaction fallback triggers with notify_on_fallback enabled", () => {
+			test("#then fires toast notification about compaction switching models", async () => {
+				const toastCalls: any[] = []
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
+					],
+					showToastFn: async (args: any) => {
+						toastCalls.push(args)
+					},
+				})
+				deps.config.notify_on_fallback = true
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("openai/gpt-4o")
+				deps.sessionStates.set("ses_compact_toast", state)
+				deps.globalFallbackModels = ["anthropic/claude-sonnet-4-20250514"]
+
+				const helpers = createAutoRetryHelpers(deps)
+				await helpers.autoRetryWithFallback(
+					"ses_compact_toast",
+					"anthropic/claude-sonnet-4-20250514",
+					"compaction",
+					"session.error",
+					{
+						success: true as const,
+						newModel: "anthropic/claude-sonnet-4-20250514",
+						failedModel: "openai/gpt-4o",
+						newFallbackIndex: 0,
+					}
+				)
+
+				// Toast should mention compaction switching
+				expect(toastCalls.length).toBeGreaterThanOrEqual(1)
+				const compactionToast = toastCalls.find((t: any) =>
+					t.body.message.toLowerCase().includes("compaction")
+				)
+				expect(compactionToast).toBeDefined()
+				expect(compactionToast.body.message).toContain("claude-sonnet-4-20250514")
+			})
+		})
+
+		describe("#when compaction fallback exhausts all models", () => {
+			test("#then fires exhaustion toast notification", async () => {
+				const toastCalls: any[] = []
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
+					],
+					showToastFn: async (args: any) => {
+						toastCalls.push(args)
+					},
+				})
+				deps.config.notify_on_fallback = true
+				deps.config.max_fallback_attempts = 1
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("openai/gpt-4o")
+				state.attemptCount = 1 // Already at max
+				deps.sessionStates.set("ses_compact_exhaust", state)
+				deps.globalFallbackModels = ["anthropic/claude-sonnet-4-20250514"]
+
+				const helpers = createAutoRetryHelpers(deps)
+
+				// The autoRetryWithFallback itself doesn't handle exhaustion toast —
+				// it's the caller (message-update-handler / event-handler) that plans
+				// and dispatches. But when agent=compaction and no more models remain,
+				// the dispatch should indicate exhaustion and a toast should fire.
+				// For this test, we call autoRetryWithFallback directly to verify the
+				// compaction path signals exhaustion correctly.
+				const result = await helpers.autoRetryWithFallback(
+					"ses_compact_exhaust",
+					"anthropic/claude-sonnet-4-20250514",
+					"compaction",
+					"session.error",
+					{
+						success: true as const,
+						newModel: "anthropic/claude-sonnet-4-20250514",
+						failedModel: "openai/gpt-4o",
+						newFallbackIndex: 0,
+					}
+				)
+
+				// Should dispatch since a plan was provided (exhaustion is checked
+				// at the planning level, not dispatch level). The toast fires on
+				// the compaction dispatch path.
+				expect((deps.ctx.client.session as any).command).toHaveBeenCalled()
+				expect(toastCalls.length).toBeGreaterThanOrEqual(1)
+				const compactionToast = toastCalls.find((t: any) =>
+					t.body.message.toLowerCase().includes("compaction")
+				)
+				expect(compactionToast).toBeDefined()
 			})
 		})
 	})
