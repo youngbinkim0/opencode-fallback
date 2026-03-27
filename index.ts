@@ -14,6 +14,7 @@ import { normalizeFallbackModelsField } from "./config-reader"
 import { isEmptyTaskResult, extractChildSessionID, waitForChildFallbackResult } from "./subagent-result-sync"
 import { readFileSync, existsSync } from "fs"
 import { join } from "path"
+import { parse as parseJsonc } from "jsonc-parser"
 import { logInfo } from "./logger"
 
 declare function setInterval(
@@ -33,20 +34,10 @@ function loadPluginConfig(directory: string): Partial<FallbackPluginConfig> {
 		if (existsSync(configPath)) {
 			try {
 				const content = readFileSync(configPath, "utf-8")
-				// Strip JSONC comments and trailing commas safely
-				const jsonContent = content
-					// Remove block comments /* ... */
-					.replace(/\/\*[\s\S]*?\*\//g, "")
-					// Remove single line comments // ... but avoid removing // inside strings (like http://)
-					.replace(/(".*?(?<!\\)"|'.*?(?<!\\)')|\/\/.*$/gm, (match, stringLiteral) => 
-						stringLiteral ? stringLiteral : ""
-					)
-					// Remove trailing commas
-					.replace(/,(\s*[\]}])/g, "$1")
-					
-				return JSON.parse(jsonContent) as Partial<FallbackPluginConfig>
-			} catch {
-				logInfo(`[${PLUGIN_NAME}] Failed to parse config: ${configPath}`)
+				// parseJsonc handles // comments, /* */ blocks, and trailing commas seamlessly
+				return parseJsonc(content) as Partial<FallbackPluginConfig>
+			} catch (err) {
+				logInfo(`[${PLUGIN_NAME}] Failed to parse config: ${configPath}`, err as Record<string, unknown>)
 			}
 		}
 	}
