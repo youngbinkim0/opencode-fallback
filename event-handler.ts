@@ -44,8 +44,11 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			sessionLastAccess.delete(sessionID)
 			sessionRetryInFlight.delete(sessionID)
 			sessionAwaitingFallbackResult.delete(sessionID)
+			deps.sessionFirstTokenReceived.delete(sessionID)
 			deps.sessionSelfAbortTimestamp.delete(sessionID)
 			deps.sessionParentID.delete(sessionID)
+			deps.sessionIdleResolvers.delete(sessionID)
+			deps.sessionLastMessageTime.delete(sessionID)
 			helpers.clearSessionFallbackTimeout(sessionID)
 		}
 	}
@@ -104,24 +107,29 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			if (!firstTokenReceived) {
 				const state = sessionStates.get(sessionID)
 				if (state) {
-					logInfo("session.idle detected silent model failure (no first token received)", {
+				logInfo("session.idle detected silent model failure (no first token received)", {
+					sessionID,
+					currentModel: state.currentModel,
+					attemptCount: state.attemptCount,
+				})
+
+				// Acquire retry lock BEFORE clearing the timeout.  The TTFT
+				// timeout callback may already be queued in the event loop
+				// (clearTimeout only prevents future scheduling, not already-
+				// queued macrotasks).  By holding the lock first, any racing
+				// timeout callback will see sessionRetryInFlight and bail out
+				// at its own lock check, preventing dual planFallback calls.
+				if (sessionRetryInFlight.has(sessionID)) {
+					logInfo("session.idle silent failure — retry already in flight, skipping", {
 						sessionID,
-						currentModel: state.currentModel,
-						attemptCount: state.attemptCount,
 					})
+					return
+				}
+				sessionRetryInFlight.add(sessionID)
 
-					// Clear awaiting state so the retry machinery can operate
-					sessionAwaitingFallbackResult.delete(sessionID)
-					helpers.clearSessionFallbackTimeout(sessionID)
-
-					// Acquire retry lock
-					if (sessionRetryInFlight.has(sessionID)) {
-						logInfo("session.idle silent failure — retry already in flight, skipping", {
-							sessionID,
-						})
-						return
-					}
-					sessionRetryInFlight.add(sessionID)
+				// Now safe to clear awaiting state and timeout
+				sessionAwaitingFallbackResult.delete(sessionID)
+				helpers.clearSessionFallbackTimeout(sessionID)
 
 					try {
 						const resolvedAgent = await helpers.resolveAgentForSessionFromContext(
@@ -616,9 +624,9 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		sessionAwaitingFallbackResult.delete(sessionID)
 		helpers.clearSessionFallbackTimeout(sessionID)
 
-			const plan = planFallback(sessionID, state, fallbackModels, config)
+		const plan = planFallback(sessionID, state, fallbackModels, config)
 
-			if (plan.success) {
+		if (plan.success) {
 			if (config.notify_on_fallback) {
 				const modelName = plan.newModel?.split("/").pop() || plan.newModel
 				deps.ctx.client.tui

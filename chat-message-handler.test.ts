@@ -240,4 +240,271 @@ describe("chat-message-handler", () => {
 			})
 		})
 	})
+
+	describe("#given user manually selects the current fallback model", () => {
+		describe("#when requestedModel equals currentModel but differs from originalModel", () => {
+			test("#then originalModel is updated to adopt fallback as new primary (no future recovery)", async () => {
+				const deps = createMockDeps({ notify_on_fallback: true })
+				const helpers = createMockHelpers()
+				// State: original=opus, current=gemini (fallback), cooldown NOT expired
+				const state = createFallbackedState("anthropic/claude-opus-4-6", "google/gemini-pro", false)
+				deps.sessionStates.set("test-session", state)
+
+				const handler = createChatMessageHandler(deps, helpers)
+				const input: ChatMessageInput = {
+					sessionID: "test-session",
+					model: {
+						providerID: "google",
+						modelID: "gemini-pro",
+					},
+				}
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "google", modelID: "gemini-pro" },
+					},
+				}
+
+				await handler(input, output)
+
+				// originalModel should now be adopted to gemini-pro
+				expect(state.originalModel).toBe("google/gemini-pro")
+				expect(state.currentModel).toBe("google/gemini-pro")
+				// failedModels should be cleared so cooldown doesn't interfere
+				expect(state.failedModels.size).toBe(0)
+				expect(state.attemptCount).toBe(0)
+				// No recovery toast should have been shown
+				expect(deps.ctx.client.tui.showToast).not.toHaveBeenCalled()
+			})
+		})
+
+		describe("#when cooldown later expires after adoption", () => {
+			test("#then recovery does NOT trigger (originalModel === currentModel)", async () => {
+				const deps = createMockDeps({ notify_on_fallback: true })
+				const helpers = createMockHelpers()
+				// State: original=opus, current=gemini (fallback), cooldown expired
+				const state = createFallbackedState("anthropic/claude-opus-4-6", "google/gemini-pro", true)
+				deps.sessionStates.set("test-session", state)
+
+				const handler = createChatMessageHandler(deps, helpers)
+
+				// Step 1: User manually selects gemini-pro (adopts it)
+				await handler(
+					{
+						sessionID: "test-session",
+						model: { providerID: "google", modelID: "gemini-pro" },
+					},
+					{ message: { model: { providerID: "google", modelID: "gemini-pro" } } }
+				)
+
+				expect(state.originalModel).toBe("google/gemini-pro")
+
+				// Step 2: Next chat.message — recovery check should NOT fire
+				await handler(
+					{ sessionID: "test-session" },
+					{ message: { model: { providerID: "google", modelID: "gemini-pro" } } }
+				)
+
+				// No recovery toast — originalModel === currentModel
+				expect(deps.ctx.client.tui.showToast).not.toHaveBeenCalled()
+				// Still on gemini-pro
+				expect(state.currentModel).toBe("google/gemini-pro")
+			})
+		})
+	})
+
+	describe("#given config.enabled is false", () => {
+		describe("#when any chat.message arrives", () => {
+			test("#then handler returns immediately without processing", async () => {
+				const deps = createMockDeps({ enabled: false })
+				const helpers = createMockHelpers()
+				const state = createFallbackedState("anthropic/claude-opus-4-6", "google/gemini-pro", true)
+				deps.sessionStates.set("test-session", state)
+
+				const handler = createChatMessageHandler(deps, helpers)
+				const input: ChatMessageInput = { sessionID: "test-session" }
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "anthropic", modelID: "claude-opus-4-6" },
+					},
+				}
+
+				await handler(input, output)
+
+				// State should not be modified
+				expect(state.currentModel).toBe("google/gemini-pro")
+				// Model should not be overridden
+				expect(output.message.model!.providerID).toBe("anthropic")
+			})
+		})
+	})
+
+	describe("#given no state exists for session", () => {
+		describe("#when chat.message arrives for unknown session", () => {
+			test("#then handler returns immediately", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+
+				const handler = createChatMessageHandler(deps, helpers)
+				const input: ChatMessageInput = { sessionID: "ses_unknown" }
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "anthropic", modelID: "claude-opus-4-6" },
+					},
+				}
+
+				await handler(input, output)
+
+				// No state created, model not modified
+				expect(deps.sessionStates.has("ses_unknown")).toBe(false)
+				expect(output.message.model!.providerID).toBe("anthropic")
+			})
+		})
+	})
+
+	describe("#given manual model change detection", () => {
+		describe("#when requested model differs from state and is NOT in fallback chain", () => {
+			test("#then state is reset to new model and old retry is aborted", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_manual"
+
+				const state = createFallbackedState("anthropic/claude-opus-4-6", "google/gemini-pro", false)
+				deps.sessionStates.set(sessionID, state)
+				deps.sessionRetryInFlight.add(sessionID)
+
+				const handler = createChatMessageHandler(deps, helpers)
+				const input: ChatMessageInput = {
+					sessionID,
+					model: {
+						providerID: "openai",
+						modelID: "gpt-4o",
+					},
+				}
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "openai", modelID: "gpt-4o" },
+					},
+				}
+
+				await handler(input, output)
+
+				// State should be reset to the new manual model
+				const newState = deps.sessionStates.get(sessionID)!
+				expect(newState.originalModel).toBe("openai/gpt-4o")
+				expect(newState.currentModel).toBe("openai/gpt-4o")
+				expect(newState.attemptCount).toBe(0)
+				// Should have aborted the in-flight retry
+				expect(helpers.abortSessionRequest).toHaveBeenCalledWith(sessionID, "manual-model-change")
+				expect(deps.sessionRetryInFlight.has(sessionID)).toBe(false)
+			})
+		})
+	})
+
+	describe("#given pending fallback model matching requested model", () => {
+		describe("#when requestedModel equals pendingFallbackModel", () => {
+			test("#then clears pending and returns without resetting state", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_pending_match"
+
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.currentModel = "anthropic/claude-opus-4-6"
+				state.pendingFallbackModel = "google/gemini-pro"
+				deps.sessionStates.set(sessionID, state)
+
+				const handler = createChatMessageHandler(deps, helpers)
+				const input: ChatMessageInput = {
+					sessionID,
+					model: {
+						providerID: "google",
+						modelID: "gemini-pro",
+					},
+				}
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "google", modelID: "gemini-pro" },
+					},
+				}
+
+				await handler(input, output)
+
+				// pendingFallbackModel should be cleared
+				expect(state.pendingFallbackModel).toBeUndefined()
+				// State should NOT be reset (still original model)
+				expect(state.originalModel).toBe("anthropic/claude-opus-4-6")
+				// No abort should have been called
+				expect(helpers.abortSessionRequest).not.toHaveBeenCalled()
+			})
+		})
+	})
+
+	describe("#given model override with nested provider path", () => {
+		describe("#when fallback model has multiple slashes", () => {
+			test("#then providerID is first segment, modelID is the rest", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_nested"
+
+				// Use createFallbackedState to properly set up cooldown so recovery doesn't fire
+				const state = createFallbackedState("anthropic/claude-opus-4-6", "google/models/gemini-2.0-pro", false)
+				deps.sessionStates.set(sessionID, state)
+
+				const handler = createChatMessageHandler(deps, helpers)
+				const input: ChatMessageInput = { sessionID }
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "anthropic", modelID: "claude-opus-4-6" },
+					},
+				}
+
+				await handler(input, output)
+
+				// Should override with the fallback model's nested path
+				expect(output.message.model!.providerID).toBe("google")
+				expect(output.message.model!.modelID).toBe("models/gemini-2.0-pro")
+			})
+		})
+	})
+
+	describe("#given chat.message during active retry with model mismatch", () => {
+		describe("#when the requested model is in the fallback chain", () => {
+			test("#then it does NOT mutate state.currentModel", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_no_mutate"
+
+				const state = createFallbackState("google/antigravity-gemini-3-flash")
+				deps.sessionStates.set(sessionID, state)
+				// Simulate active retry in flight
+				deps.sessionRetryInFlight.add(sessionID)
+				deps.agentConfigs = {
+					sonnet: {
+						model: "google/antigravity-gemini-3-flash",
+						fallback_models: ["anthropic/claude-sonnet-4-6", "openai/gpt-4o"],
+					},
+				}
+
+				const handler = createChatMessageHandler(deps, helpers)
+
+				const input: ChatMessageInput = {
+					sessionID,
+					agent: "sonnet",
+					model: {
+						providerID: "anthropic",
+						modelID: "claude-sonnet-4-6",
+					},
+				}
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "anthropic", modelID: "claude-sonnet-4-6" },
+					},
+				}
+
+				await handler(input, output)
+
+				// currentModel should NOT have been changed — commitFallback owns that
+				expect(state.currentModel).toBe("google/antigravity-gemini-3-flash")
+			})
+		})
+	})
 })

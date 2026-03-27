@@ -506,6 +506,8 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				deps.sessionFirstTokenReceived.delete(sessionID)
 				deps.sessionSelfAbortTimestamp.delete(sessionID)
 				deps.sessionParentID.delete(sessionID)
+				deps.sessionIdleResolvers.delete(sessionID)
+				deps.sessionLastMessageTime.delete(sessionID)
 				clearSessionFallbackTimeout(sessionID)
 				cleanedCount++
 			}

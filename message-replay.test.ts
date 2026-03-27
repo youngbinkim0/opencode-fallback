@@ -220,5 +220,117 @@ describe("message-replay", () => {
 				expect(result.error).toBe("string error")
 			})
 		})
+
+		describe("#when parts contain unknown types not in any tier set", () => {
+			test("#then tier 1 tries all, tier 2 drops unknowns, tier 3 drops unknowns and images", async () => {
+				const unknownParts: MessagePart[] = [
+					{ type: "custom_widget", data: "widget-data" },
+					{ type: "audio", url: "audio.mp3" },
+				]
+				const callHistory: number[] = []
+				const sendFn = mock(async (parts: MessagePart[]) => {
+					callHistory.push(parts.length)
+					throw new Error("Rejected")
+				})
+
+				const result = await replayWithDegradation(unknownParts, sendFn)
+
+				expect(result.success).toBe(false)
+				// Tier 1: 2 parts (all), Tier 2: 0 parts (skipped — no text/image), Tier 3: 0 parts (skipped — no text)
+				// Only 1 call because tiers 2 and 3 produce empty arrays
+				expect(callHistory).toEqual([2])
+			})
+		})
+
+		describe("#when parts have empty string type", () => {
+			test("#then empty type is treated as unknown (filtered out in tier 2 and 3)", () => {
+				const emptyTypeParts: MessagePart[] = [{ type: "", data: "something" }]
+				const t1 = filterPartsByTier(emptyTypeParts, 1)
+				const t2 = filterPartsByTier(emptyTypeParts, 2)
+				const t3 = filterPartsByTier(emptyTypeParts, 3)
+				expect(t1.length).toBe(1)
+				expect(t2.length).toBe(0)
+				expect(t3.length).toBe(0)
+			})
+		})
+
+		describe("#when sendFn throws undefined", () => {
+			test("#then error is stringified as 'undefined'", async () => {
+				const sendFn = mock(async (_parts: MessagePart[]) => {
+					throw undefined
+				})
+
+				const result = await replayWithDegradation(textOnlyParts, sendFn)
+
+				expect(result.success).toBe(false)
+				expect(result.error).toBe("undefined")
+			})
+		})
+
+		describe("#when sendFn throws null", () => {
+			test("#then error is stringified as 'null'", async () => {
+				const sendFn = mock(async (_parts: MessagePart[]) => {
+					throw null
+				})
+
+				const result = await replayWithDegradation(textOnlyParts, sendFn)
+
+				expect(result.success).toBe(false)
+				expect(result.error).toBe("null")
+			})
+		})
+
+		describe("#when all parts are images (no text)", () => {
+			test("#then tier 2 includes them, tier 3 produces empty", async () => {
+				const imageOnlyParts: MessagePart[] = [
+					{ type: "image", url: "img1.png" },
+					{ type: "image", url: "img2.png" },
+				]
+				const sendFn = mock(async (_parts: MessagePart[]) => {})
+
+				const result = await replayWithDegradation(imageOnlyParts, sendFn)
+
+				// Tier 1 succeeds (same as tier 2 for image-only)
+				expect(result.success).toBe(true)
+				expect(result.tier).toBe(1)
+				expect(result.sentParts?.length).toBe(2)
+				expect(result.droppedTypes).toEqual([])
+			})
+		})
+
+		describe("#when tier 1 and 2 have same length but tier 3 succeeds", () => {
+			test("#then tier 2 is skipped and tier 3 is the second attempt", async () => {
+				// text + image = 2 parts in both tier 1 and tier 2
+				const parts: MessagePart[] = [textPart, imagePart]
+				let callCount = 0
+				const sendFn = mock(async (p: MessagePart[]) => {
+					callCount++
+					if (p.some((x) => x.type !== "text")) throw new Error("No images!")
+				})
+
+				const result = await replayWithDegradation(parts, sendFn)
+
+				expect(result.success).toBe(true)
+				expect(result.tier).toBe(3)
+				// Only 2 calls: tier 1 (rejected), tier 2 skipped (same length), tier 3 (accepted)
+				expect(callCount).toBe(2)
+				expect(result.droppedTypes).toContain("image")
+			})
+		})
+
+		describe("#when multiple text parts exist", () => {
+			test("#then all text parts survive to tier 3", async () => {
+				const multiText: MessagePart[] = [
+					{ type: "text", text: "part 1" },
+					{ type: "text", text: "part 2" },
+					{ type: "text", text: "part 3" },
+					{ type: "image", url: "img.png" },
+				]
+
+				const t3 = filterPartsByTier(multiText, 3)
+				expect(t3.length).toBe(3)
+				expect(t3.every((p) => p.type === "text")).toBe(true)
+			})
+		})
 	})
 })

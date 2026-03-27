@@ -14,11 +14,11 @@
 
 ## v1.1 Phases
 
-- [ ] **Phase 5: Error Classification & State Audit** — Audit error-classifier.ts and fallback-state.ts for correctness bugs, dead code, and test gaps
-- [ ] **Phase 6: Config & Retry Logic Audit** — Audit config-reader.ts and auto-retry.ts for precedence bugs, missed retry conditions, dead code
-- [ ] **Phase 7: Replay & Timeout/Event Audit** — Audit message-replay.ts, event-handler.ts, message-update-handler.ts for timer leaks, race conditions, dropped parts
-- [ ] **Phase 8: Chat Handler & Subagent Sync Audit** — Audit chat-message-handler.ts and subagent-result-sync.ts for recovery races, polling bugs, boundary conditions
-- [ ] **Phase 9: Plugin Init & Consolidation** — Audit index.ts hook registration, add logger.ts tests, cross-module regression tests, final coverage sweep
+- [x] **Phase 5: Error Classification & State Audit** — Audit error-classifier.ts and fallback-state.ts for correctness bugs, dead code, and test gaps (completed 2026-03-27)
+- [x] **Phase 6: Config & Retry Logic Audit** — Audit config-reader.ts and auto-retry.ts for precedence bugs, missed retry conditions, dead code (completed 2026-03-27)
+- [x] **Phase 7: Replay & Timeout/Event Audit** — Audit message-replay.ts, event-handler.ts, message-update-handler.ts for timer leaks, race conditions, dropped parts (completed 2026-03-27)
+- [x] **Phase 8: Chat Handler & Subagent Sync Audit** — Audit chat-message-handler.ts and subagent-result-sync.ts for recovery races, polling bugs, boundary conditions (completed 2026-03-27)
+- [x] **Phase 9: Plugin Init & Consolidation** — Audit index.ts hook registration, add logger.ts tests, cross-module regression tests, final coverage sweep (completed 2026-03-27)
 
 ## Phase Details
 
@@ -47,11 +47,11 @@ Plans:
   2. Every retry decision condition in auto-retry.ts is exercised — including edge cases where retry should NOT fire
   3. Dead code in both modules identified and removed
   4. Adversarial inputs tested: malformed config files, missing fields, wrong types, empty arrays
-**Plans:** 0/2 plans complete
+**Plans:** 2/2 plans complete
 
 Plans:
-- [ ] 06-01-PLAN.md — Audit config-reader.ts: precedence logic, edge cases, dead code, comprehensive tests
-- [ ] 06-02-PLAN.md — Audit auto-retry.ts: retry decision paths, false positive/negative conditions, dead code, tests
+- [x] 06-01-PLAN.md — Audit config-reader.ts: precedence logic, edge cases, dead code, comprehensive tests
+- [x] 06-02-PLAN.md — Audit auto-retry.ts: retry decision paths, false positive/negative conditions, dead code, tests
 
 ### Phase 7: Replay & Timeout/Event Audit
 **Goal**: Message replay preserves all part types and TTFT timeout logic has no timer leaks or race conditions — no silently dropped content, no mid-stream aborts
@@ -63,11 +63,11 @@ Plans:
   3. message-update-handler.ts has a dedicated test file with full coverage
   4. No timer leaks: every armed timer is cleared in all exit paths (success, error, fallback)
   5. Race conditions tested: token arrival simultaneous with timeout, multiple rapid message updates
-**Plans:** 0/2 plans complete
+**Plans:** 2/2 plans complete
 
 Plans:
-- [ ] 07-01-PLAN.md — Audit message-replay.ts: part type handling, degradation logic, dead code, edge case tests
-- [ ] 07-02-PLAN.md — Audit event-handler.ts + message-update-handler.ts: timer lifecycle, race conditions, create test file for message-update-handler
+- [x] 07-01-PLAN.md — Audit message-replay.ts: part type handling, degradation logic, dead code, edge case tests
+- [x] 07-02-PLAN.md — Audit event-handler.ts + message-update-handler.ts: timer lifecycle, race conditions, create test file for message-update-handler
 
 ### Phase 8: Chat Handler & Subagent Sync Audit
 **Goal**: Recovery logic and subagent sync have no prompt-boundary races or polling bugs — recovery fires exactly when it should, subagent wait always terminates correctly
@@ -79,11 +79,11 @@ Plans:
   3. Subagent polling always terminates within bounded time — including when fallback itself fails
   4. Empty result detection catches all variants (whitespace, malformed XML, partial tags)
   5. Race conditions tested: recovery trigger during active retry, concurrent subagent completions, overlapping tool.execute.after calls
-**Plans:** 0/2 plans complete
+**Plans:** 2/2 plans complete
 
 Plans:
-- [ ] 08-01-PLAN.md — Audit chat-message-handler.ts: recovery logic, model override, prompt-boundary races, tests
-- [ ] 08-02-PLAN.md — Audit subagent-result-sync.ts: polling logic, empty detection variants, bounded wait, race tests
+- [x] 08-01-PLAN.md — Audit chat-message-handler.ts: recovery logic, model override, prompt-boundary races, tests
+- [x] 08-02-PLAN.md — Audit subagent-result-sync.ts: polling logic, empty detection variants, bounded wait, race tests
 
 ### Phase 9: Plugin Init & Consolidation
 **Goal**: Plugin initialization is correct, logger is tested, and cross-module integration has regression coverage for every bug found in phases 5-8
@@ -95,11 +95,11 @@ Plans:
   3. Regression tests exist for every bug fixed in phases 5-8
   4. Final coverage sweep: every branch in every source module has at least one test
   5. All tests pass (existing 178+ new tests)
-**Plans:** 0/2 plans complete
+**Plans:** 2/2 plans complete
 
 Plans:
-- [ ] 09-01-PLAN.md — Audit index.ts: hook registration, initialization order, logger.ts tests
-- [ ] 09-02-PLAN.md — Consolidation: regression tests for all bugs found, final coverage sweep, test run
+- [x] 09-01-PLAN.md — Audit index.ts: hook registration, initialization order, logger.ts tests
+- [x] 09-02-PLAN.md — Consolidation: regression tests for all bugs found, final coverage sweep, test run
 
 ## Progress
 
@@ -109,12 +109,27 @@ Phases 5 → 6 → 7 → 8 → 9 (dependency chain: foundational → dependent �
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 5. Error Classification & State | 2/2 | Complete | 2026-03-27 |
-| 6. Config & Retry Logic | 0/2 | Pending | — |
-| 7. Replay & Timeout/Event | 0/2 | Pending | — |
-| 8. Chat Handler & Subagent Sync | 0/2 | Pending | — |
-| 9. Plugin Init & Consolidation | 0/2 | Pending | — |
+| 6. Config & Retry Logic | 2/2 | Complete | 2026-03-27 |
+| 7. Replay & Timeout/Event | 2/2 | Complete | 2026-03-27 |
+| 8. Chat Handler & Subagent Sync | 2/2 | Complete | 2026-03-27 |
+| 9. Plugin Init & Consolidation | 2/2 | Complete | 2026-03-27 |
+| 10. TTFT & Race Fix | 1/1 | Complete | 2026-03-27 |
 
 **Totals:**
-- Phases: 5
-- Plans: 10
-- Requirements: 17 mapped
+- Phases: 6
+- Plans: 11
+- Requirements: 17 mapped + 2 production bugs fixed
+
+### Phase 10: Fix TTFT timeout false-abort and dual-handler race condition
+
+**Goal:** Fix two production bugs found during log audit: (1) TTFT timeout aborts actively streaming primary models because firstTokenReceived is never set; (2) session.idle silent-failure and TTFT timeout both independently plan fallback for the same condition
+**Depends on:** Phase 9 (bugs discovered during log review after audit)
+**Success Criteria** (what must be TRUE):
+  1. Any non-error message.updated for an existing session marks firstTokenReceived=true and reschedules the TTFT timeout
+  2. session.idle silent-failure handler acquires retryInFlight lock BEFORE clearing the fallback timeout
+  3. Regression tests verify both fixes with exact sequences observed in production logs
+  4. All tests pass (358+)
+**Plans:** 1/1 plans complete
+
+Plans:
+- [x] 10-01 — Fix P0 TTFT false-abort + P1 dual-handler race + regression tests (completed 2026-03-27)

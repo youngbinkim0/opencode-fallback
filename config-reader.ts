@@ -67,7 +67,27 @@ export function getFallbackModelsForSession(
 	// Tier 1: Per-agent fallback_models
 	if (resolvedAgent && agents) {
 		const models = readFallbackModels(resolvedAgent, agents)
-		if (models.length > 0) return models
+		
+		// Implicitly include the agent's configured primary model as a
+		// last-resort fallback candidate — but only when fallback_models
+		// was explicitly configured with entries.  If the user didn't set
+		// fallback_models at all (or set it to []), we don't inject the
+		// primary — they didn't opt into fallback for this agent.
+		//
+		// This handles the case where the user manually switches to a
+		// fallback model and it later fails: the configured primary
+		// becomes available as a recovery target instead of the chain
+		// appearing exhausted.
+		if (models.length > 0) {
+			const agentConfig = agents[resolvedAgent]
+			if (isRecord(agentConfig) && typeof agentConfig.model === "string") {
+				const primaryModel = agentConfig.model
+				if (!models.includes(primaryModel)) {
+					models.unshift(primaryModel)
+				}
+			}
+			return models
+		}
 	}
 
 	// Tier 2: Global fallback_models from plugin config

@@ -87,6 +87,69 @@ describe("OpenCodeFallbackPlugin", () => {
 			})
 		})
 
+		describe("#when config hook is called with singular 'agent' key", () => {
+			it("#then captures agent configs from singular key", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+
+				const opencodeConfig = {
+					agent: {
+						opus: {
+							model: "anthropic/claude-opus-4-6",
+							fallback_models: ["google/gemini-pro"],
+						},
+					},
+				}
+
+				plugin.config(opencodeConfig)
+
+				// Trigger a session.error to verify agent configs are accessible
+				;(ctx.client.session.messages as any).mockImplementation(() =>
+					Promise.resolve({
+						data: [
+							{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+						],
+					})
+				)
+
+				await plugin.event({
+					event: {
+						type: "session.error",
+						properties: {
+							sessionID: "ses-opus-singular",
+							error: { statusCode: 429, message: "Rate limited" },
+							model: "anthropic/claude-opus-4-6",
+						},
+					},
+				})
+
+				// If agent config was captured, fallback should proceed
+				expect(ctx.client.session.promptAsync).toHaveBeenCalled()
+			})
+		})
+
+		describe("#when config hook is called with non-object agents", () => {
+			it("#then agentConfigs is set to undefined", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+
+				plugin.config({ agents: "not-an-object" } as any)
+
+				// Trigger session.error — no fallback models since no agent config
+				await plugin.event({
+					event: {
+						type: "session.error",
+						properties: {
+							sessionID: "ses-bad-config",
+							error: { statusCode: 429, message: "Rate limited" },
+							model: "anthropic/claude-opus-4-6",
+						},
+					},
+				})
+
+				// No fallback — no agent configs
+				expect(ctx.client.session.promptAsync).not.toHaveBeenCalled()
+			})
+		})
+
 		describe("#when session.error event is received", () => {
 			it("#then event handler processes the error without aborting (model already stopped)", async () => {
 				const plugin = await OpenCodeFallbackPlugin(ctx)

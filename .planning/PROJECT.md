@@ -28,10 +28,9 @@ Uninterrupted AI coding sessions — when one model fails, work continues automa
 
 ### Active
 
-- [ ] Auto-recovery to primary model after cooldown expires
-- [ ] Global fallback config (default chain for agents without their own)
-- [ ] Full message replay on retry (all part types, not just text)
-- [ ] TTFT-based timeout (time-to-first-token instead of fixed timer)
+- [ ] Proactive logic audit — scrutinize every fallback path for correctness bugs, race conditions, edge cases
+- [ ] Dead code removal — eliminate unreachable code paths and simplify overly complex implementations (without over-simplifying logic that serves a purpose)
+- [ ] Test hardening — fill coverage gaps, add adversarial edge cases (malformed input, weird timing, race conditions), regression tests for any bugs found
 
 ### Out of Scope
 
@@ -79,5 +78,14 @@ Uninterrupted AI coding sessions — when one model fails, work continues automa
 | Auto-recovery via cooldown timer on primary model | Simplest path; check if primary's cooldown expired before each new prompt | — Pending |
 | Full part replay including non-text | Users send images/files; dropping them silently on retry degrades the prompt | — Pending |
 
+## Current Milestone: v1.1 Logic Review
+
+**Goal:** Proactive audit of the entire fallback plugin — find bugs, prune dead code, harden tests until every logic path is scrutinized and covered.
+
+**Target features:**
+- Bug hunting: fresh-eyes audit of every logic path for correctness issues, race conditions, edge cases
+- Code pruning: remove dead code paths and simplify where safe, preserve logic that has a reason to exist
+- Test hardening: fill coverage gaps, add adversarial edge cases (malformed input, weird timing, race conditions), regression tests for anything found
+
 ---
-*Last updated: 2026-03-18 after initialization*
+*Last updated: 2026-03-26 after milestone v1.1 start*

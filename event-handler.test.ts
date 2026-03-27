@@ -662,6 +662,358 @@ describe("createEventHandler", () => {
 		})
 	})
 
+	describe("#when session.deleted fires", () => {
+		test("#then all session maps and sets are cleaned up", async () => {
+			const sessionID = "ses_to_delete"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {},
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map([[sessionID, Date.now()]]),
+				sessionRetryInFlight: new Set([sessionID]),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map([[sessionID, true]]),
+				sessionSelfAbortTimestamp: new Map([[sessionID, Date.now()]]),
+				sessionParentID: new Map([[sessionID, "parent-1"]]),
+				sessionIdleResolvers: new Map([[sessionID, [() => {}]]]),
+				sessionLastMessageTime: new Map([[sessionID, Date.now()]]),
+			}
+
+			const clearSessionFallbackTimeout = mock(() => {})
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout,
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: {
+					type: "session.deleted",
+					properties: { info: { id: sessionID } },
+				},
+			})
+
+			expect(deps.sessionStates.has(sessionID)).toBe(false)
+			expect(deps.sessionLastAccess.has(sessionID)).toBe(false)
+			expect(deps.sessionRetryInFlight.has(sessionID)).toBe(false)
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+			expect(deps.sessionFirstTokenReceived.has(sessionID)).toBe(false)
+			expect(deps.sessionSelfAbortTimestamp.has(sessionID)).toBe(false)
+			expect(deps.sessionParentID.has(sessionID)).toBe(false)
+			expect(deps.sessionIdleResolvers.has(sessionID)).toBe(false)
+			expect(deps.sessionLastMessageTime.has(sessionID)).toBe(false)
+			expect(clearSessionFallbackTimeout).toHaveBeenCalledWith(sessionID)
+		})
+	})
+
+	describe("#when session.stop fires with active fallback state", () => {
+		test("#then it aborts, clears timeout, and cleans up retry state", async () => {
+			const sessionID = "ses_stop_active"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			state.pendingFallbackModel = "openai/gpt-4o"
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {},
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set([sessionID]),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const abortSessionRequest = mock(async () => {})
+			const clearSessionFallbackTimeout = mock(() => {})
+			const helpers = {
+				abortSessionRequest,
+				clearSessionFallbackTimeout,
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: {
+					type: "session.stop",
+					properties: { sessionID },
+				},
+			})
+
+			// Should abort because retryInFlight or awaitingFallbackResult was set
+			expect(abortSessionRequest).toHaveBeenCalledWith(sessionID, "session.stop")
+			expect(clearSessionFallbackTimeout).toHaveBeenCalledWith(sessionID)
+			expect(deps.sessionRetryInFlight.has(sessionID)).toBe(false)
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+			expect(state.pendingFallbackModel).toBeUndefined()
+		})
+	})
+
+	describe("#when config.enabled is false", () => {
+		test("#then all events are ignored", async () => {
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG, enabled: false },
+				agentConfigs: {},
+				globalFallbackModels: [],
+				sessionStates: new Map(),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			// Fire a session.error — should be completely ignored
+			await handler({
+				event: {
+					type: "session.error",
+					properties: {
+						sessionID: "ses_disabled",
+						error: { statusCode: 429, message: "rate limited" },
+					},
+				},
+			})
+
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+			expect(helpers.resolveAgentForSessionFromContext).not.toHaveBeenCalled()
+		})
+	})
+
+	describe("#when session.status fires with non-retry status type", () => {
+		test("#then it is ignored", async () => {
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {},
+				globalFallbackModels: [],
+				sessionStates: new Map(),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: {
+					type: "session.status",
+					properties: {
+						sessionID: "ses_status",
+						status: { type: "progress", message: "Working..." },
+					},
+				},
+			})
+
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+	})
+
+	describe("#when session.error fires without sessionID", () => {
+		test("#then it is silently ignored", async () => {
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {},
+				globalFallbackModels: [],
+				sessionStates: new Map(),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			// Should not throw
+			await handler({
+				event: {
+					type: "session.error",
+					properties: {
+						error: { statusCode: 500, message: "server error" },
+					},
+				},
+			})
+
+			expect(helpers.autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+	})
+
+	describe("#when session.idle fires with retry already in flight (silent failure path)", () => {
+		test("#then it skips the silent failure retry", async () => {
+			const sessionID = "ses_idle_lock"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: { test: { model: "anthropic/claude-opus-4-6", fallback_models: ["openai/gpt-4o"] } },
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				// Lock already held by another handler
+				sessionRetryInFlight: new Set([sessionID]),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map([[sessionID, false]]),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: { type: "session.idle", properties: { sessionID } },
+			})
+
+			// Should skip because retry lock is already held
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+	})
+
 	describe("#when session.status fires while sessionAwaitingFallbackResult is set", () => {
 		test("#then it advances the fallback chain to the next model (quota exceeded on current)", async () => {
 			const sessionID = "ses_status_advance"
@@ -741,6 +1093,77 @@ describe("createEventHandler", () => {
 			expect(call[1]).toBe("openai/gpt-4o")
 			// Awaiting should have been cleared
 			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+		})
+	})
+
+	describe("#given P1 regression: session.idle silent-failure acquires lock before clearing timeout", () => {
+		test("#then retryInFlight is set before clearSessionFallbackTimeout is called", async () => {
+			const sessionID = "ses_idle_race"
+			const state = createFallbackState("google/gemini-pro")
+			state.currentModel = "google/gemini-pro"
+			state.attemptCount = 1
+
+			const callOrder: string[] = []
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: { test: { model: "anthropic/claude-opus-4-6", fallback_models: ["google/gemini-pro", "openai/gpt-4o"] } },
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map([[sessionID, false]]),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const clearSessionFallbackTimeout = mock(() => {
+				callOrder.push("clearTimeout")
+				// At this point, retryInFlight should already be set
+				// (this is the fix — lock acquired BEFORE clearing timeout)
+				expect(deps.sessionRetryInFlight.has(sessionID)).toBe(true)
+			})
+
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout,
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => {
+					callOrder.push("autoRetry")
+					return true
+				}),
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+			}
+
+			const handler = createEventHandler(deps, helpers)
+
+			await handler({
+				event: { type: "session.idle", properties: { sessionID } },
+			})
+
+			// Verify the order: lock acquired, then timeout cleared, then retry dispatched
+			expect(callOrder[0]).toBe("clearTimeout")
+			expect(callOrder[1]).toBe("autoRetry")
+			// The key assertion: retryInFlight was set WHEN clearTimeout was called
+			// (verified inside the mock above)
+			expect(clearSessionFallbackTimeout).toHaveBeenCalledWith(sessionID)
 		})
 	})
 })

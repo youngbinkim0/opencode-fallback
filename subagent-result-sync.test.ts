@@ -84,6 +84,22 @@ describe("subagent-result-sync", () => {
 			const output = 'Some random output without tags'
 			expect(isEmptyTaskResult(output)).toBe(false)
 		})
+
+		it("returns false for partial opening tag only", () => {
+			const output = '<task_result>Content here but no closing tag'
+			expect(isEmptyTaskResult(output)).toBe(false)
+		})
+
+		it("returns false for task_result with only a single space of content", () => {
+			// A single space IS whitespace, so this should be true
+			const output = '<task_result> </task_result>'
+			expect(isEmptyTaskResult(output)).toBe(true)
+		})
+
+		it("returns false when content has leading/trailing whitespace around text", () => {
+			const output = '<task_result>  \n  Real content here  \n  </task_result>'
+			expect(isEmptyTaskResult(output)).toBe(false)
+		})
 	})
 
 	describe("extractChildSessionID", () => {
@@ -104,6 +120,16 @@ describe("subagent-result-sync", () => {
 
 		it("returns null when output is empty", () => {
 			expect(extractChildSessionID("")).toBeNull()
+		})
+
+		it("returns null when task_id has no ses_ prefix", () => {
+			const output = 'task_id: abc123def (for resuming...)'
+			expect(extractChildSessionID(output)).toBeNull()
+		})
+
+		it("extracts first match when multiple task_ids present", () => {
+			const output = 'task_id: ses_first123\ntask_id: ses_second456'
+			expect(extractChildSessionID(output)).toBe("ses_first123")
 		})
 	})
 
@@ -362,6 +388,79 @@ describe("subagent-result-sync", () => {
 			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 150, pollIntervalMs: 50 })
 			// Should succeed because activity kept resetting the timeout
 			expect(result).toBe("Final response.")
+		})
+
+		it("returns null when session.get throws on all polls", async () => {
+			const deps = createMockDeps()
+			const childID = "ses_get_error"
+
+			;(deps.ctx.client.session.get as any).mockImplementation(() =>
+				Promise.reject(new Error("API unavailable"))
+			)
+
+			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 200, pollIntervalMs: 50 })
+			// Should timeout since polling never detects idle and no event fires
+			expect(result).toBeNull()
+		})
+
+		it("returns null when assistant message has no text parts", async () => {
+			const deps = createMockDeps()
+			const childID = "ses_no_text"
+
+			;(deps.ctx.client.session.get as any).mockImplementation(() =>
+				Promise.resolve({ data: { status: "idle" } })
+			)
+			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
+				Promise.resolve({
+					data: [
+						{
+							info: { role: "assistant" },
+							parts: [
+								{ type: "tool_use", text: "" },
+								{ type: "image", url: "img.png" },
+							],
+						},
+					],
+				})
+			)
+
+			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 300, pollIntervalMs: 50 })
+			expect(result).toBeNull()
+		})
+
+		it("returns null when session.messages throws during extraction", async () => {
+			const deps = createMockDeps()
+			const childID = "ses_msg_error"
+
+			;(deps.ctx.client.session.get as any).mockImplementation(() =>
+				Promise.resolve({ data: { status: "idle" } })
+			)
+			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
+				Promise.reject(new Error("Messages API error"))
+			)
+
+			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 300, pollIntervalMs: 50 })
+			expect(result).toBeNull()
+		})
+
+		it("handles session status as object with type field", async () => {
+			const deps = createMockDeps()
+			const childID = "ses_obj_status"
+
+			// Return status as object { type: "idle" } instead of string
+			;(deps.ctx.client.session.get as any).mockImplementation(() =>
+				Promise.resolve({ data: { status: { type: "idle" } } })
+			)
+			;(deps.ctx.client.session.messages as any).mockImplementation(() =>
+				Promise.resolve({
+					data: [
+						{ info: { role: "assistant" }, parts: [{ type: "text", text: "Object status result." }] },
+					],
+				})
+			)
+
+			const result = await waitForChildFallbackResult(deps, childID, { maxWaitMs: 300, pollIntervalMs: 50 })
+			expect(result).toBe("Object status result.")
 		})
 
 		it("detects idle via polling when session.idle event never fires", async () => {

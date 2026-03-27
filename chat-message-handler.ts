@@ -26,6 +26,37 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 
 		sessionLastAccess.set(sessionID, Date.now())
 
+		const requestedModel = input.model
+			? `${input.model.providerID}/${input.model.modelID}`
+			: undefined
+
+		// If the user explicitly requests the model they're already on (the
+		// fallback), adopt it as the new primary.  Without this, the recovery
+		// logic would later "recover" back to the old originalModel when its
+		// cooldown expires — even though the user deliberately chose to stay
+		// on the current model.  This prevents a spurious "Recovered to X"
+		// notification after a manual model selection.
+		//
+		// IMPORTANT: This check must happen BEFORE the recovery check below.
+		// Otherwise recovery fires first, resetting to originalModel, and the
+		// adoption check never sees the mismatch.
+		if (
+			requestedModel &&
+			requestedModel === state.currentModel &&
+			state.currentModel !== state.originalModel
+		) {
+			logInfo("Adopting current model as new primary (user confirmed manual selection)", {
+				sessionID,
+				model: requestedModel,
+				previousOriginal: state.originalModel,
+			})
+			state.originalModel = requestedModel
+			state.failedModels.clear()
+			state.fallbackIndex = -1
+			state.attemptCount = 0
+			return
+		}
+
 		// Auto-recovery: check if primary model's cooldown has expired
 		if (state.currentModel !== state.originalModel) {
 			if (
@@ -55,10 +86,6 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 			}
 		}
 
-		const requestedModel = input.model
-			? `${input.model.providerID}/${input.model.modelID}`
-			: undefined
-
 		if (requestedModel && requestedModel !== state.currentModel) {
 			if (
 				state.pendingFallbackModel &&
@@ -87,8 +114,10 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 						requestedModel,
 						currentModel: state.currentModel,
 					})
-					// Update state to match what's actually being sent
-					state.currentModel = requestedModel
+					// Do NOT update state.currentModel here — let commitFallback
+					// handle the state transition atomically.  Setting currentModel
+					// during an active retry confuses commitFallback's idempotency
+					// check and can cause it to abort a live replay.
 					return
 				}
 			}

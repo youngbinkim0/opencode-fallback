@@ -21,14 +21,6 @@ import {
 import { getFallbackModelsForSession } from "./config-reader"
 import { logInfo, logError } from "./logger"
 
-function logMessage(level: "info" | "error", message: string, context?: Record<string, unknown>): void {
-	if (level === "error") {
-		logError(message, context)
-	} else {
-		logInfo(message, context)
-	}
-}
-
 export function hasVisibleAssistantResponse(
 	extractAutoRetrySignalFn: typeof extractAutoRetrySignal
 ) {
@@ -215,15 +207,25 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 						})
 						.catch(() => {})
 				} else if (sessionStates.has(sessionID)) {
-					// Subsequent successful message.updated — model is streaming.
-					// Only mark TTFT if the event carries actual text content;
-					// empty initial frames should not prevent the timeout from
-					// firing on a hung model.
-					const eventHasContent = parts?.some(
-						(p) => p.type === "text" && typeof p.text === "string" && p.text.trim().length > 0
-					)
-					if (eventHasContent) {
-						deps.sessionFirstTokenReceived.set(sessionID, true)
+					// Subsequent successful message.updated — model is active.
+					// Mark first token received and reschedule the timeout.
+					// The timeout's purpose is to detect models that go completely
+					// silent (hung/dead). Any non-error message.updated proves the
+					// model is alive, so we push the timeout forward. Only when
+					// the model produces no updates for the full timeout_seconds
+					// interval does the timeout fire.
+					deps.sessionFirstTokenReceived.set(sessionID, true)
+					// Reschedule the timeout — resets the clock on every activity.
+					// If a timeout was scheduled but model is streaming, this
+					// prevents the false-abort that occurred when the model was
+					// actively producing tokens but firstTokenReceived was never set.
+					if (deps.sessionFallbackTimeouts.has(sessionID)) {
+						const agent = info?.agent as string | undefined
+						helpers.resolveAgentForSessionFromContext(sessionID, agent)
+							.then((resolvedAgent) => {
+								helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
+							})
+							.catch(() => {})
 					}
 				}
 				return
