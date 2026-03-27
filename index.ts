@@ -56,12 +56,11 @@ export default async function OpenCodeFallbackPlugin(
 
 	// Config getter that builds config on first access
 	const getConfig = (): Required<FallbackPluginConfig> => {
-		if (!mergedConfig) {
-			mergedConfig = {
-				enabled:
-					configOverrides?.enabled ??
-					fileConfig?.enabled ??
-					DEFAULT_CONFIG.enabled,
+		mergedConfig ??= {
+			enabled:
+				configOverrides?.enabled ??
+				fileConfig?.enabled ??
+				DEFAULT_CONFIG.enabled,
 			retry_on_errors:
 				configOverrides?.retry_on_errors ??
 				fileConfig?.retry_on_errors ??
@@ -71,23 +70,27 @@ export default async function OpenCodeFallbackPlugin(
 				fileConfig?.retryable_error_patterns ??
 				DEFAULT_CONFIG.retryable_error_patterns,
 			max_fallback_attempts:
-					configOverrides?.max_fallback_attempts ??
-					fileConfig?.max_fallback_attempts ??
-					DEFAULT_CONFIG.max_fallback_attempts,
-				cooldown_seconds:
-					configOverrides?.cooldown_seconds ??
-					fileConfig?.cooldown_seconds ??
-					DEFAULT_CONFIG.cooldown_seconds,
-		 	timeout_seconds:
-			configOverrides?.timeout_seconds ??
-			fileConfig?.timeout_seconds ??
-			DEFAULT_CONFIG.timeout_seconds,
+				configOverrides?.max_fallback_attempts ??
+				fileConfig?.max_fallback_attempts ??
+				DEFAULT_CONFIG.max_fallback_attempts,
+			cooldown_seconds:
+				configOverrides?.cooldown_seconds ??
+				fileConfig?.cooldown_seconds ??
+				DEFAULT_CONFIG.cooldown_seconds,
+			timeout_seconds:
+				configOverrides?.timeout_seconds ??
+				fileConfig?.timeout_seconds ??
+				DEFAULT_CONFIG.timeout_seconds,
 			notify_on_fallback:
-					configOverrides?.notify_on_fallback ??
-					fileConfig?.notify_on_fallback ??
-					DEFAULT_CONFIG.notify_on_fallback,
-			}
+				configOverrides?.notify_on_fallback ??
+				fileConfig?.notify_on_fallback ??
+				DEFAULT_CONFIG.notify_on_fallback,
+			fallback_models:
+				configOverrides?.fallback_models ??
+				fileConfig?.fallback_models ??
+				DEFAULT_CONFIG.fallback_models,
 		}
+
 		return mergedConfig
 	}
 
