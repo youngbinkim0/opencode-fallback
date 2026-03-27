@@ -155,6 +155,8 @@ Primary model fails (rate limit, quota, model not found, …)
 
 **Message replay** — the last user message is re-sent with a three-tier degradation strategy: (1) all parts, (2) text + images only, (3) text only — maximising compatibility across providers.
 
+**Compaction-aware fallback** — when `/compact` fails, the plugin detects compaction by checking the `agent: "compaction"` field and retries via `session.command` instead of `promptAsync` (compaction messages contain parts that `promptAsync` cannot accept). Fallback models are resolved per-agent — configure a `"compaction"` agent in your fallback config, or fall back to the global chain. Toast notifications fire on compaction fallback trigger and when all fallback models are exhausted. The same TTFT timeout applies: compaction streaming produces `compaction_delta` events that keep the timer alive just like normal chat tokens. When compaction completes successfully, the plugin clears all fallback tracking state via the `session.compacted` event.
+
 ---
 
 ## Built-in Error Patterns
