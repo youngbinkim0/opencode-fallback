@@ -113,6 +113,18 @@ export interface PluginContext {
 				}
 				query: { directory: string }
 			}) => Promise<void>
+			/** Re-dispatch a command (e.g. compaction) on a specific model.
+			 *  Used for compaction fallback because `promptAsync` cannot accept
+			 *  `type: "compaction"` parts — only text/file/agent/subtask. */
+			command: (args: {
+				path: { id: string }
+				body: {
+					command: string
+					model?: string
+					agent?: string
+				}
+				query: { directory: string }
+			}) => Promise<void>
 			get: (args: {
 				path: { id: string }
 			}) => Promise<{ data?: Record<string, unknown> }>

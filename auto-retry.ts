@@ -17,6 +17,39 @@ declare function clearTimeout(timeout: ReturnType<typeof globalThis.setTimeout>)
 // because OpenCode's abort is session-wide and takes time to fully propagate.
 const POST_ABORT_DELAY_MS = 150
 
+function summarizeParts(parts: MessagePart[] | undefined): {
+	count: number
+	types: string[]
+	textChars: number
+	hasToolCall: boolean
+} {
+	if (!parts || parts.length === 0) {
+		return { count: 0, types: [], textChars: 0, hasToolCall: false }
+	}
+
+	const typeSet = new Set<string>()
+	let textChars = 0
+	let hasToolCall = false
+
+	for (const part of parts) {
+		typeSet.add(part.type)
+		const textValue = (part as Record<string, unknown>).text
+		if (part.type === "text" && typeof textValue === "string") {
+			textChars += textValue.length
+		}
+		if (part.type === "tool_call") {
+			hasToolCall = true
+		}
+	}
+
+	return {
+		count: parts.length,
+		types: Array.from(typeSet),
+		textChars,
+		hasToolCall,
+	}
+}
+
 export function createAutoRetryHelpers(deps: HookDeps) {
 	const {
 		ctx,
@@ -258,6 +291,113 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		deps.sessionFirstTokenReceived.set(sessionID, false)
 		let retryDispatched = false
 		try {
+			// ── COMPACTION-SPECIFIC DISPATCH PATH ──
+			// Compaction user messages contain `type: "compaction"` parts which
+			// `promptAsync` cannot accept (SDK only allows text/file/agent/subtask).
+			// When agent is "compaction", bypass message fetch + replayWithDegradation
+			// and use `session.command` to re-dispatch compaction on the fallback model.
+			if (resolvedAgent === "compaction") {
+				// Second stale check after abort/delay
+				const postCheckState = sessionStates.get(sessionID)
+				const expectedCurrentModel = plan ? plan.failedModel : newModel
+				if (postCheckState && postCheckState.currentModel !== expectedCurrentModel) {
+					logInfo(`Skipping stale compaction fallback (${source}): state already at ${postCheckState.currentModel}, expected ${expectedCurrentModel}`, {
+						sessionID,
+						staleModel: newModel,
+						currentModel: postCheckState.currentModel,
+					})
+					deferredToOtherHandler = true
+					return false
+				}
+
+				// Duplicate dispatch guard
+				if (sessionAwaitingFallbackResult.has(sessionID)) {
+					logInfo(`Skipping duplicate compaction fallback dispatch (${source})`, {
+						sessionID,
+						model: newModel,
+					})
+					deferredToOtherHandler = true
+					return false
+				}
+
+				sessionAwaitingFallbackResult.add(sessionID)
+
+				logInfo(`Compaction fallback: dispatching via session.command (${source})`, {
+					sessionID,
+					model: newModel,
+				})
+
+				// Show toast notification for compaction fallback trigger
+				if (config.notify_on_fallback) {
+					const modelName = newModel.split("/").pop() || newModel
+					await ctx.client.tui
+						.showToast({
+							body: {
+								title: "Compaction Fallback",
+								message: `Compaction switching to ${modelName}`,
+								variant: "warning",
+								duration: 5000,
+							},
+						})
+						.catch(() => {})
+				}
+
+				await ctx.client.session.command({
+					path: { id: sessionID },
+					body: {
+						command: "compact",
+						model: newModel,
+						agent: "compaction",
+					},
+					query: { directory: ctx.directory },
+				})
+
+				logInfo(`Compaction command accepted by host (${source})`, {
+					sessionID,
+					model: newModel,
+				})
+
+				// Commit fallback plan after successful dispatch
+				let commitSucceeded = true
+				if (plan) {
+					const stateToCommit = sessionStates.get(sessionID)
+					if (stateToCommit) {
+						const committed = commitFallback(stateToCommit, plan)
+						if (committed) {
+							logInfo(`Committed compaction fallback state (${source})`, {
+								sessionID,
+								newModel: plan.newModel,
+								failedModel: plan.failedModel,
+								attemptCount: stateToCommit.attemptCount,
+							})
+						} else {
+							logInfo(`Compaction fallback state already committed — aborting duplicate (${source})`, {
+								sessionID,
+								newModel: plan.newModel,
+							})
+							commitSucceeded = false
+							await abortSessionRequest(sessionID, `duplicate-compaction.${source}`)
+						}
+					}
+				}
+
+				if (!commitSucceeded) {
+					deferredToOtherHandler = true
+					return false
+				}
+
+				scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
+				retryDispatched = true
+
+				logInfo(`Compaction fallback dispatched successfully (${source})`, {
+					sessionID,
+					model: newModel,
+				})
+
+				return retryDispatched
+			}
+
+			// ── NORMAL REPLAY DISPATCH PATH ──
 			const messagesResp = await ctx.client.session.messages({
 				path: { id: sessionID },
 				query: { directory: ctx.directory },
@@ -290,6 +430,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			}
 
 			const replayPartsRaw = lastUserPartsRaw ?? lastNonAssistantPartsRaw
+			const replaySource = lastUserPartsRaw ? "last-user" : lastNonAssistantPartsRaw ? "last-non-assistant" : "none"
 
 			if (replayPartsRaw && replayPartsRaw.length > 0) {
 				// Second stale check: re-verify after all async work (abort + delay +
@@ -298,15 +439,15 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				const postCheckState = sessionStates.get(sessionID)
 				const expectedCurrentModel = plan ? plan.failedModel : newModel
 				if (postCheckState && postCheckState.currentModel !== expectedCurrentModel) {
-					logInfo(`Skipping stale autoRetryWithFallback after async work (${source})`, {
+					logInfo(`Skipping stale autoRetryWithFallback (${source}): state already at ${postCheckState.currentModel}, expected failed model ${expectedCurrentModel}`, {
 						sessionID,
 						staleModel: newModel,
-						expectedCurrentModel,
 						currentModel: postCheckState.currentModel,
 					})
 					deferredToOtherHandler = true
 					return false
 				}
+
 
 				// If another handler already dispatched and is awaiting a result
 				// for this session, skip the duplicate dispatch.
@@ -327,6 +468,8 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				logInfo(`Auto-retrying with fallback model (${source})`, {
 					sessionID,
 					model: newModel,
+					agent: resolvedAgent,
+					replaySource,
 				})
 
 				// Cast raw parts to MessagePart (runtime parts may have any shape)
@@ -334,9 +477,23 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					(p): p is MessagePart => typeof p.type === "string"
 				)
 
+				logInfo(`Prepared replay payload (${source})`, {
+					sessionID,
+					model: newModel,
+					agent: resolvedAgent,
+					replaySource,
+					payload: summarizeParts(allParts),
+				})
+
 				if (allParts.length > 0) {
 					// Build the send function that calls promptAsync
 					const sendFn = async (parts: MessagePart[]): Promise<void> => {
+						logInfo(`Dispatching fallback replay (${source})`, {
+							sessionID,
+							model: newModel,
+							agent: resolvedAgent,
+							payload: summarizeParts(parts),
+						})
 						await ctx.client.session.promptAsync({
 							path: { id: sessionID },
 							body: {
@@ -345,6 +502,11 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 								parts,
 							},
 							query: { directory: ctx.directory },
+						})
+						logInfo(`Fallback replay accepted by host (${source})`, {
+							sessionID,
+							model: newModel,
+							agent: resolvedAgent,
 						})
 					}
 
@@ -399,6 +561,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 							tier: replayResult.tier,
 							sentPartsCount: replayResult.sentParts?.length,
 							droppedTypes: replayResult.droppedTypes,
+							replaySource,
 						})
 
 						// Show toast if parts were dropped (tier > 1)
@@ -425,6 +588,8 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			} else {
 				logInfo(`No replayable non-assistant message found for auto-retry (${source})`, {
 					sessionID,
+					model: newModel,
+					agent: resolvedAgent,
 				})
 			}
 		} catch (retryError) {
@@ -518,6 +683,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 	}
 
 	return {
+		getParentSessionID,
 		abortSessionRequest,
 		clearSessionFallbackTimeout,
 		scheduleSessionFallbackTimeout,
