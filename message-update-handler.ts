@@ -301,6 +301,13 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 			// Ignore stale errors from models we already moved past
 			const currentState = sessionStates.get(sessionID)
 			if (currentState && model && model !== currentState.currentModel) {
+				// If the error model is already in failedModels, this is a stale
+				// echo from a model that already failed and was replaced.  Never
+				// resync back to a model we already moved away from — that creates
+				// an infinite loop: stale error → resync → plan fallback → replay
+				// → stale error from the same model → resync again.
+				const isAlreadyFailed = currentState.failedModels.has(model)
+
 				const retryableStaleError = isRetryableError(
 					error,
 					config.retry_on_errors,
@@ -308,6 +315,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				)
 				const canResyncToErrorModel =
 					retryableStaleError &&
+					!isAlreadyFailed &&
 					!currentState.pendingFallbackModel &&
 					!sessionAwaitingFallbackResult.has(sessionID)
 
@@ -321,13 +329,14 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 					currentState.currentModel = model
 					sessionLastAccess.set(sessionID, Date.now())
 				} else {
-				logInfo("Ignoring stale error from previous model", {
-					sessionID,
-					staleModel: model,
-					currentModel: currentState.currentModel,
-					errorName: extractErrorName(error),
-				})
-				return
+					logInfo("Ignoring stale error from previous model", {
+						sessionID,
+						staleModel: model,
+						currentModel: currentState.currentModel,
+						errorName: extractErrorName(error),
+						isAlreadyFailed,
+					})
+					return
 				}
 			}
 

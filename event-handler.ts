@@ -462,6 +462,19 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			return
 		}
 
+		// If the error model has already been recorded as failed, this is a
+		// stale echo from a model that already triggered a fallback.  Suppress
+		// it to prevent duplicate fallback planning.
+		if (currentState && errorModel && currentState.failedModels.has(errorModel)) {
+			logInfo("Ignoring session.error from already-failed model", {
+				sessionID,
+				errorModel,
+				currentModel: currentState.currentModel,
+				errorName: extractErrorName(error),
+			})
+			return
+		}
+
 		// If we're awaiting a fallback result, this session.error is likely
 		// a stale abort from the previous model (session.error doesn't carry
 		// a model field, so we can't reliably tell which model caused it).

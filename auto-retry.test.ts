@@ -1136,13 +1136,12 @@ describe("auto-retry integration", () => {
 
 	describe("#given compaction-origin fallback dispatch", () => {
 		describe("#when agent is 'compaction'", () => {
-			test("#then skips compaction parts and replays real user message via promptAsync", async () => {
+			test("#then uses session.command to re-issue compact on fallback model", async () => {
+				const commandCalls: any[] = []
 				const deps = createMockDeps({
-					messagesData: [
-						{ info: { role: "user" }, parts: [{ type: "text", text: "explain quantum computing" }] },
-						{ info: { role: "assistant" }, parts: [{ type: "text", text: "Quantum computing..." }] },
-						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
-					],
+					commandFn: async (args: any) => {
+						commandCalls.push(args)
+					},
 				})
 
 				const { createFallbackState } = await import("./fallback-state")
@@ -1165,54 +1164,19 @@ describe("auto-retry integration", () => {
 				)
 
 				expect(result).toBe(true)
-				// Must use promptAsync (compaction parts are non-replayable via session.command)
-				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
-				// session.command should NOT be called
-				expect((deps.ctx.client.session as any).command).not.toHaveBeenCalled()
-			})
-		})
-
-		describe("#when only compaction parts exist and no prior user message", () => {
-			test("#then returns false (no replayable content)", async () => {
-				const deps = createMockDeps({
-					messagesData: [
-						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
-					],
-				})
-
-				const { createFallbackState } = await import("./fallback-state")
-				const state = createFallbackState("openai/gpt-4o")
-				deps.sessionStates.set("ses_compact_only", state)
-				deps.globalFallbackModels = ["anthropic/claude-sonnet-4-20250514"]
-
-				const helpers = createAutoRetryHelpers(deps)
-				const result = await helpers.autoRetryWithFallback(
-					"ses_compact_only",
-					"anthropic/claude-sonnet-4-20250514",
-					"compaction",
-					"session.error",
-					{
-						success: true as const,
-						newModel: "anthropic/claude-sonnet-4-20250514",
-						failedModel: "openai/gpt-4o",
-						newFallbackIndex: 0,
-					}
-				)
-
-				// No replayable user message found after filtering compaction parts
-				expect(result).toBe(false)
+				// Must use session.command with "compact" command
+				expect(commandCalls.length).toBe(1)
+				expect(commandCalls[0].command).toBe("compact")
+				expect(commandCalls[0].model).toBe("anthropic/claude-sonnet-4-20250514")
+				expect(commandCalls[0].sessionID).toBe("ses_compact")
+				// promptAsync should NOT be called (command path handles it)
 				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
 			})
 		})
 
-		describe("#when compaction dispatch succeeds via promptAsync", () => {
-			test("#then commits fallback state, marks session awaiting, and schedules timeout", async () => {
-				const deps = createMockDeps({
-					messagesData: [
-						{ info: { role: "user" }, parts: [{ type: "text", text: "hello world" }] },
-						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
-					],
-				})
+		describe("#when compaction command succeeds", () => {
+			test("#then commits fallback state, marks compaction-in-flight and awaiting", async () => {
+				const deps = createMockDeps()
 
 				const { createFallbackState } = await import("./fallback-state")
 				const state = createFallbackState("openai/gpt-4o")
@@ -1234,27 +1198,25 @@ describe("auto-retry integration", () => {
 				)
 
 				expect(result).toBe(true)
-				// Uses promptAsync (not session.command)
-				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
 				// State should be committed (currentModel advanced)
 				expect(state.currentModel).toBe("anthropic/claude-sonnet-4-20250514")
 				expect(state.attemptCount).toBe(1)
 				// Session should be marked awaiting fallback result
 				expect(deps.sessionAwaitingFallbackResult.has("ses_compact_ok")).toBe(true)
-				// Timeout should be scheduled
-				expect(deps.sessionFallbackTimeouts.has("ses_compact_ok")).toBe(true)
+				// Compaction should be marked in-flight
+				expect(deps.sessionCompactionInFlight.has("ses_compact_ok")).toBe(true)
 			})
 		})
 
-		describe("#when compaction replay dispatch fails", () => {
-			test("#then clears awaiting/retry-in-flight state so session does not stall", async () => {
+		describe("#when compaction command fails", () => {
+			test("#then falls through to promptAsync replay path", async () => {
 				const deps = createMockDeps({
 					messagesData: [
 						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
 						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
 					],
-					promptAsyncFn: async () => {
-						throw new Error("promptAsync dispatch failed")
+					commandFn: async () => {
+						throw new Error("command dispatch failed")
 					},
 				})
 
@@ -1277,11 +1239,53 @@ describe("auto-retry integration", () => {
 					}
 				)
 
+				// Falls through to promptAsync replay (with compaction parts filtered)
+				expect(result).toBe(true)
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
+				// compaction-in-flight should have been cleared when command failed
+				expect(deps.sessionCompactionInFlight.has("ses_compact_fail")).toBe(false)
+			})
+		})
+
+		describe("#when compaction command fails AND promptAsync also fails", () => {
+			test("#then clears all fallback state so session does not stall", async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
+					],
+					commandFn: async () => {
+						throw new Error("command dispatch failed")
+					},
+					promptAsyncFn: async () => {
+						throw new Error("promptAsync dispatch failed")
+					},
+				})
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("openai/gpt-4o")
+				deps.sessionStates.set("ses_compact_double_fail", state)
+				deps.globalFallbackModels = ["anthropic/claude-sonnet-4-20250514"]
+
+				const helpers = createAutoRetryHelpers(deps)
+				const result = await helpers.autoRetryWithFallback(
+					"ses_compact_double_fail",
+					"anthropic/claude-sonnet-4-20250514",
+					"compaction",
+					"session.error",
+					{
+						success: true as const,
+						newModel: "anthropic/claude-sonnet-4-20250514",
+						failedModel: "openai/gpt-4o",
+						newFallbackIndex: 0,
+					}
+				)
+
 				expect(result).toBe(false)
 				// Must NOT leave session stuck
-				expect(deps.sessionAwaitingFallbackResult.has("ses_compact_fail")).toBe(false)
-				expect(deps.sessionRetryInFlight.has("ses_compact_fail")).toBe(false)
-				expect(deps.sessionFallbackTimeouts.has("ses_compact_fail")).toBe(false)
+				expect(deps.sessionAwaitingFallbackResult.has("ses_compact_double_fail")).toBe(false)
+				expect(deps.sessionCompactionInFlight.has("ses_compact_double_fail")).toBe(false)
+				expect(deps.sessionFallbackTimeouts.has("ses_compact_double_fail")).toBe(false)
 			})
 		})
 
@@ -1289,10 +1293,6 @@ describe("auto-retry integration", () => {
 			test("#then fires toast notification about compaction failing", async () => {
 				const toastCalls: any[] = []
 				const deps = createMockDeps({
-					messagesData: [
-						{ info: { role: "user" }, parts: [{ type: "text", text: "help me" }] },
-						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
-					],
 					showToastFn: async (args: any) => {
 						toastCalls.push(args)
 					},
@@ -1328,30 +1328,25 @@ describe("auto-retry integration", () => {
 			})
 		})
 
-		describe("#when compaction fallback exhausts all models", () => {
-			test("#then fires exhaustion toast via normal fallback path", async () => {
-				const toastCalls: any[] = []
+		describe("#when only compaction parts exist and command fails", () => {
+			test("#then falls through to replay path but finds no replayable content", async () => {
 				const deps = createMockDeps({
 					messagesData: [
-						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
 						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
 					],
-					showToastFn: async (args: any) => {
-						toastCalls.push(args)
+					commandFn: async () => {
+						throw new Error("command dispatch failed")
 					},
 				})
-				deps.config.notify_on_fallback = true
-				deps.config.max_fallback_attempts = 1
 
 				const { createFallbackState } = await import("./fallback-state")
 				const state = createFallbackState("openai/gpt-4o")
-				state.attemptCount = 1 // Already at max
-				deps.sessionStates.set("ses_compact_exhaust", state)
+				deps.sessionStates.set("ses_compact_only", state)
 				deps.globalFallbackModels = ["anthropic/claude-sonnet-4-20250514"]
 
 				const helpers = createAutoRetryHelpers(deps)
 				const result = await helpers.autoRetryWithFallback(
-					"ses_compact_exhaust",
+					"ses_compact_only",
 					"anthropic/claude-sonnet-4-20250514",
 					"compaction",
 					"session.error",
@@ -1363,13 +1358,9 @@ describe("auto-retry integration", () => {
 					}
 				)
 
-				// Dispatch proceeds via promptAsync (compaction falls through to normal path)
-				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
-				expect(toastCalls.length).toBeGreaterThanOrEqual(1)
-				const compactionToast = toastCalls.find((t: any) =>
-					t.body.message.toLowerCase().includes("compaction")
-				)
-				expect(compactionToast).toBeDefined()
+				// Command failed, replay path has no replayable content
+				expect(result).toBe(false)
+				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
 			})
 		})
 	})

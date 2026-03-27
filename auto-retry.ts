@@ -297,27 +297,21 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		let retryDispatched = false
 		try {
 			// ── COMPACTION FALLBACK PATH ──
-			// Compaction user messages contain `type: "compaction"` parts which
-			// `promptAsync` cannot accept (SDK only allows text/file/agent/subtask).
-			// The `session.command` API also cannot override the compaction agent's
-			// model — OpenCode resolves the model internally via Agent.get("compaction").
+			// Compaction is a special internal command — replaying the last user
+			// message via `promptAsync` would just send "hi" (the pre-compaction
+			// user message) to the fallback model, which is not useful.  Instead,
+			// re-issue the `compact` command via `session.command` with the
+			// fallback model.  The SDK accepts a `model` string parameter.
 			//
-			// Strategy: skip the compaction parts entirely and find the REAL last
-			// user message (the one that triggered auto-compaction). Replay that
-			// on the fallback model via `promptAsync` — the fallback model may
-			// have a larger context window and handle the full history directly.
-			//
-			// This falls through to the normal replay path below, which already
-			// handles message fetch, degradation tiers, and dispatch.  We just
-			// need to make sure the message fetch skips `type: "compaction"` parts
-			// and finds a real user message with replayable content.
+			// If the command dispatch succeeds, mark compaction-in-flight so
+			// stale errors from the old model are suppressed, and return.
+			// If it fails, fall through to the normal replay path as a last resort.
 			if (resolvedAgent === "compaction") {
-				logInfo(`Compaction fallback: replaying last user message via promptAsync (${source})`, {
+				logInfo(`Compaction fallback: re-issuing compact command on fallback model (${source})`, {
 					sessionID,
 					model: newModel,
 				})
 
-				// Show toast notification for compaction fallback trigger
 				if (config.notify_on_fallback) {
 					const modelName = newModel.split("/").pop() || newModel
 					await ctx.client.tui
@@ -332,10 +326,72 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						.catch(() => {})
 				}
 
-				// Clear the compaction agent so the normal replay path doesn't
-				// pass agent="compaction" to promptAsync (which would confuse
-				// OpenCode into treating this as a compaction request).
-				resolvedAgent = undefined
+				try {
+					// Claim the dispatch slot before the async command call
+					if (sessionAwaitingFallbackResult.has(sessionID)) {
+						logInfo(`Skipping duplicate compaction dispatch — another handler already dispatched (${source})`, {
+							sessionID,
+							model: newModel,
+						})
+						deferredToOtherHandler = true
+						return false
+					}
+					sessionAwaitingFallbackResult.add(sessionID)
+					deps.sessionCompactionInFlight.add(sessionID)
+
+					await ctx.client.session.command({
+						sessionID,
+						directory: ctx.directory,
+						command: "compact",
+						model: newModel,
+					})
+
+					// Commit the fallback plan after successful dispatch
+					if (plan) {
+						const stateToCommit = sessionStates.get(sessionID)
+						if (stateToCommit) {
+							const committed = commitFallback(stateToCommit, plan)
+							if (committed) {
+								logInfo(`Committed fallback state after compaction dispatch (${source})`, {
+									sessionID,
+									newModel: plan.newModel,
+									failedModel: plan.failedModel,
+									attemptCount: stateToCommit.attemptCount,
+								})
+							} else {
+								logInfo(`Compaction fallback state already committed by another handler (${source})`, {
+									sessionID,
+									newModel: plan.newModel,
+								})
+								deferredToOtherHandler = true
+								return false
+							}
+						}
+					}
+
+					scheduleSessionFallbackTimeout(sessionID, undefined)
+					retryDispatched = true
+
+					logInfo(`Compaction fallback command dispatched (${source})`, {
+						sessionID,
+						model: newModel,
+					})
+					return true
+				} catch (cmdError) {
+					logError(`Compaction command dispatch failed, falling through to replay path (${source})`, {
+						sessionID,
+						model: newModel,
+						error: String(cmdError),
+					})
+					// Clear all compaction state since the command failed —
+					// sessionAwaitingFallbackResult must be cleared so the
+					// normal replay path below doesn't skip the dispatch as
+					// a "duplicate".
+					deps.sessionCompactionInFlight.delete(sessionID)
+					sessionAwaitingFallbackResult.delete(sessionID)
+					// Fall through to normal replay path as last resort
+					resolvedAgent = undefined
+				}
 			}
 
 			// ── NORMAL REPLAY DISPATCH PATH ──

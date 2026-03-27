@@ -22,6 +22,7 @@ function createMockDeps(configOverrides?: Partial<FallbackPluginConfig>): HookDe
 						],
 					})),
 					promptAsync: mock(async () => {}),
+					command: mock(async () => {}),
 					get: mock(async () => ({ data: {} })),
 				},
 				tui: {
@@ -742,6 +743,83 @@ describe("message-update-handler", () => {
 				})
 
 				expect(helpers.autoRetryWithFallback).not.toHaveBeenCalled()
+			})
+		})
+	})
+
+	describe("#given stale error from already-failed model (resync loop prevention)", () => {
+		describe("#when error model is in failedModels", () => {
+			test("#then ignores the stale error instead of resyncing state", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_resync_loop"
+
+				// State: primary k2p5 failed, currently on gemini-flash
+				const state = createFallbackState("kimi-for-coding/k2p5")
+				state.currentModel = "google/gemini-flash"
+				state.fallbackIndex = 1
+				state.attemptCount = 1
+				state.failedModels.set("kimi-for-coding/k2p5", Date.now())
+				deps.sessionStates.set(sessionID, state)
+				deps.globalFallbackModels = [
+					"kimi-for-coding/k2p5",
+					"google/gemini-flash",
+					"anthropic/claude-haiku-4-5",
+				]
+
+				const handler = createMessageUpdateHandler(deps, helpers)
+
+				// Stale error arrives from k2p5 (already in failedModels)
+				await handler({
+					info: {
+						sessionID,
+						role: "assistant",
+						model: "kimi-for-coding/k2p5",
+						error: { statusCode: 402, name: "APIError", message: "Payment required" },
+					},
+				})
+
+				// Should NOT resync state back to k2p5
+				expect(state.currentModel).toBe("google/gemini-flash")
+				// Should NOT trigger another fallback
+				expect(helpers.autoRetryWithFallback).not.toHaveBeenCalled()
+			})
+		})
+
+		describe("#when error model is NOT in failedModels", () => {
+			test("#then resyncs to error model and plans fallback", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_resync_legit"
+
+				// State: thinks current model is gemini-flash, but actual error is from k2p5
+				// k2p5 is NOT in failedModels — this is a genuine state desync
+				const state = createFallbackState("kimi-for-coding/k2p5")
+				state.currentModel = "google/gemini-flash"
+				state.fallbackIndex = 1
+				state.attemptCount = 1
+				// k2p5 NOT in failedModels
+				deps.sessionStates.set(sessionID, state)
+				deps.globalFallbackModels = [
+					"kimi-for-coding/k2p5",
+					"google/gemini-flash",
+					"anthropic/claude-haiku-4-5",
+				]
+
+				const handler = createMessageUpdateHandler(deps, helpers)
+
+				// Error from k2p5 — not in failedModels, legitimate resync
+				await handler({
+					info: {
+						sessionID,
+						role: "assistant",
+						model: "kimi-for-coding/k2p5",
+						error: { statusCode: 429, name: "RateLimitError", message: "rate limited" },
+					},
+				})
+
+				// Should resync to k2p5 and trigger fallback
+				expect(helpers.autoRetryWithFallback).toHaveBeenCalled()
 			})
 		})
 	})
