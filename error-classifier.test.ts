@@ -118,6 +118,28 @@ describe("error-classifier", () => {
 	})
 
 	describe("#given extractStatusCode", () => {
+		describe("#when explicit status and message codes disagree", () => {
+			test("#then prefers the explicit numeric status", () => {
+				const error = {
+					statusCode: 401,
+					message: "OpenAI API error: 429 Too Many Requests",
+				}
+
+				expect(extractStatusCode(error)).toBe(401)
+			})
+		})
+
+		describe("#when provider messages include unrelated numbers", () => {
+			test("#then extracts the retry status code instead of unrelated counters", () => {
+				const error = {
+					message:
+						"Attempt 2 of 5 failed with status 503 while contacting the provider",
+				}
+
+				expect(extractStatusCode(error)).toBe(503)
+			})
+		})
+
 		describe("#when error has direct statusCode", () => {
 			test("#then extracts the status code", () => {
 				expect(extractStatusCode({ statusCode: 429 })).toBe(429)
@@ -156,6 +178,47 @@ describe("error-classifier", () => {
 	})
 
 	describe("#given classifyErrorType", () => {
+		describe("#when provider payloads use real-world API-key failures", () => {
+			test("#then classifies OpenAI incorrect key responses as invalid_api_key", () => {
+				const error = {
+					error: {
+						message:
+							"Incorrect API key provided: sk-bad. You can find your API key at https://platform.openai.com/account/api-keys.",
+					},
+				}
+
+				expect(classifyErrorType(error)).toBe("invalid_api_key")
+			})
+
+			test("#then classifies Anthropic missing key responses as missing_api_key", () => {
+				const error = {
+					data: {
+						error: {
+							message: "x-api-key header is required",
+						},
+					},
+				}
+
+				expect(classifyErrorType(error)).toBe("missing_api_key")
+			})
+
+			test("#then classifies Google invalid key responses as invalid_api_key", () => {
+				const error = {
+					message: "API key not valid. Please pass a valid API key.",
+				}
+
+				expect(classifyErrorType(error)).toBe("invalid_api_key")
+			})
+
+			test("#then classifies wrapped provider model-not-found responses", () => {
+				const error = {
+					message: "OpenAI API error: The model `gpt-does-not-exist` does not exist",
+				}
+
+				expect(classifyErrorType(error)).toBe("model_not_found")
+			})
+		})
+
 		describe("#when error indicates missing API key", () => {
 			test("#then returns missing_api_key", () => {
 				const error = {
@@ -193,6 +256,33 @@ describe("error-classifier", () => {
 	})
 
 	describe("#given getErrorMessage", () => {
+		describe("#when nested provider errors disagree with wrapper messages", () => {
+			test("#then prefers the nested provider error message", () => {
+				const error = {
+					message: "wrapper error",
+					data: {
+						message: "generic transport error",
+						error: { message: "Incorrect API key provided" },
+					},
+				}
+
+				expect(getErrorMessage(error)).toBe("incorrect api key provided")
+			})
+		})
+
+		describe("#when message fields are malformed", () => {
+			test("#then falls back safely for numeric message values", () => {
+				expect(getErrorMessage({ message: 429 })).toContain("429")
+			})
+
+			test("#then returns empty string for circular objects instead of throwing", () => {
+				const circular: Record<string, unknown> = {}
+				circular.self = circular
+
+				expect(getErrorMessage(circular)).toBe("")
+			})
+		})
+
 		describe("#when error is a string", () => {
 			test("#then returns lowercase string", () => {
 				expect(getErrorMessage("Rate Limit Exceeded")).toBe("rate limit exceeded")
