@@ -130,6 +130,10 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 
 			helpers.clearSessionFallbackTimeout(sessionID)
 			sessionAwaitingFallbackResult.delete(sessionID)
+			// Reset first-token tracking so the new model gets a fresh TTFT window.
+			// Without this, the new model inherits firstTokenReceived=true from the
+			// old model and TTFT is never scheduled.
+			deps.sessionFirstTokenReceived.delete(sessionID)
 
 			if (sessionRetryInFlight.has(sessionID)) {
 				await helpers.abortSessionRequest(sessionID, "manual-model-change")

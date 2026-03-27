@@ -47,14 +47,19 @@ export function hasVisibleAssistantResponse(
 			const parts =
 				lastAssistant.parts ??
 				(lastAssistant.info?.parts as
-					| Array<{ type?: string; text?: string }>
+					| Array<{ type?: string; text?: string; name?: string }>
 					| undefined)
 
+			const hasToolCall = (parts ?? []).some((p) => p.type === "tool_call")
+			
 			const textFromParts = (parts ?? [])
 				.filter((p) => p.type === "text" && typeof p.text === "string")
 				.map((p) => p.text!.trim())
 				.filter((text) => text.length > 0)
 				.join("\n")
+
+			// If the model made a tool call, it's an active valid response regardless of text
+			if (hasToolCall) return true
 
 			if (!textFromParts) return false
 			if (extractAutoRetrySignalFn({ message: textFromParts })) return false
@@ -170,21 +175,28 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 		if (sessionID && role === "assistant" && !error) {
 			if (!sessionAwaitingFallbackResult.has(sessionID)) {
 				// ── PRIMARY MODEL TTFT TIMEOUT ──
-				// When the primary model sends its first message.updated (no error,
-				// no awaiting flag), schedule a TTFT timeout so that a hung primary
-				// model triggers the fallback chain.  Subsequent message.updated
-				// events mark firstTokenReceived=true, which causes the timeout
-				// handler to skip the abort (model is streaming fine).
-				if (
+				// Schedule a TTFT timeout when we see the first message.updated for
+				// a session that hasn't received a first token yet and doesn't
+				// already have a timeout running.  This covers two scenarios:
+				//   (a) Brand new session (no state yet) — create state and schedule
+				//   (b) Manual model change — chat-message-handler created fresh
+				//       state but didn't schedule a timeout.
+				//
+				// The key invariant: if timeout is enabled, first token not received,
+				// and no timeout is running, we must schedule one.
+				const needsTimeout =
 					model &&
 					config.timeout_seconds > 0 &&
 					!deps.sessionFirstTokenReceived.get(sessionID) &&
-					!sessionStates.has(sessionID)
-				) {
-					// Create state eagerly so the timeout handler can find it
-					const state = createFallbackState(model)
-					sessionStates.set(sessionID, state)
-					sessionLastAccess.set(sessionID, Date.now())
+					!deps.sessionFallbackTimeouts.has(sessionID)
+
+				if (needsTimeout) {
+					// Create state if this is a brand new session
+					if (!sessionStates.has(sessionID)) {
+						const state = createFallbackState(model)
+						sessionStates.set(sessionID, state)
+						sessionLastAccess.set(sessionID, Date.now())
+					}
 
 					// Resolve agent asynchronously for timeout handler
 					const agent = info?.agent as string | undefined
@@ -238,13 +250,15 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 			// skips the abort and the session gets stuck forever.
 			const hasVisible = await checkVisibleResponse(ctx, sessionID, info)
 			if (!hasVisible) {
-				// Also check the event's own parts for any text content.
-				// If the event parts have text, the model is streaming even
+				// Also check the event's own parts for any text content or tool calls.
+				// If the event parts have text/tools, the model is streaming even
 				// though the full-message fetch didn't find a complete response.
-				const eventHasText = parts?.some(
-					(p) => p.type === "text" && typeof p.text === "string" && p.text.trim().length > 0
+				const eventHasActivity = parts?.some(
+					(p) => 
+						(p.type === "text" && typeof p.text === "string" && p.text.trim().length > 0) ||
+						p.type === "tool_call"
 				)
-				if (eventHasText) {
+				if (eventHasActivity) {
 					deps.sessionFirstTokenReceived.set(sessionID, true)
 				}
 				logError(

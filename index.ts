@@ -33,8 +33,17 @@ function loadPluginConfig(directory: string): Partial<FallbackPluginConfig> {
 		if (existsSync(configPath)) {
 			try {
 				const content = readFileSync(configPath, "utf-8")
-				// Strip JSONC comments
-				const jsonContent = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "")
+				// Strip JSONC comments and trailing commas safely
+				const jsonContent = content
+					// Remove block comments /* ... */
+					.replace(/\/\*[\s\S]*?\*\//g, "")
+					// Remove single line comments // ... but avoid removing // inside strings (like http://)
+					.replace(/(".*?(?<!\\)"|'.*?(?<!\\)')|\/\/.*$/gm, (match, stringLiteral) => 
+						stringLiteral ? stringLiteral : ""
+					)
+					// Remove trailing commas
+					.replace(/,(\s*[\]}])/g, "$1")
+					
 				return JSON.parse(jsonContent) as Partial<FallbackPluginConfig>
 			} catch {
 				logInfo(`[${PLUGIN_NAME}] Failed to parse config: ${configPath}`)
