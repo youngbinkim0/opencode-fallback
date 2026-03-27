@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: Logic Review
-status: in-progress
+status: complete
 last_updated: "2026-03-27"
-last_activity: 2026-03-27 — Completed Phase 11 Plan 01 (compaction fallback dispatch)
+last_activity: 2026-03-27 — Completed Phase 11 Plan 02 (compaction lifecycle event handling)
 progress:
   total_phases: 7
-  completed_phases: 6
+  completed_phases: 7
   total_plans: 13
-  completed_plans: 12
-  percent: 92
+  completed_plans: 13
+  percent: 100
 ---
 
 # Project State
@@ -20,16 +20,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-26)
 
 **Core value:** Uninterrupted AI coding sessions — when one model fails, work continues automatically on another without manual intervention.
-**Current focus:** Phase 11 Compaction-Specific Fallback — Plan 01 complete, Plan 02 pending
+**Current focus:** Phase 11 complete — all compaction fallback plans implemented
 
 ## Current Position
 
 Phase: 11 of 11 (Compaction-Specific Fallback)
-Plan: 2 of 2 in current phase
-Status: In progress
-Last activity: 2026-03-27 — Implemented compaction-aware fallback dispatch via session.command
+Plan: 2 of 2 in current phase (complete)
+Status: Complete
+Last activity: 2026-03-27 — Implemented session.compacted event handling for compaction lifecycle
 
-Progress: [█████████░] 92%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -88,6 +88,8 @@ Progress: [█████████░] 92%
 - [Phase 11-01]: Compaction branch inserted before normal replay path — early return avoids message fetch overhead
 - [Phase 11-01]: session.command passes model as string (providerID/modelID) — matches SDK command signature
 - [Phase 11-01]: Toast notification fires inside compaction branch, not in callers — simpler, no caller changes needed
+- [Phase 11-02]: handleSessionCompacted is synchronous — cleanup is all in-memory map/set operations
+- [Phase 11-02]: Cleanup only logs when session had active awaiting state — avoids noisy logs for sessions without active fallback
 
 ### Roadmap Evolution
 
@@ -96,7 +98,7 @@ Progress: [█████████░] 92%
 
 ### Pending Todos
 
-- Phase 11 Plan 02: Wire compaction lifecycle hooks/events for success detection
+None — all plans complete.
 
 ### Blockers/Concerns
 
@@ -104,4 +106,4 @@ None.
 
 ## Session Continuity
 
-Phase 11 Plan 01 complete. Compaction-aware fallback dispatch implemented with 6 new regression tests (47 total auto-retry tests). Ready for Plan 02 (lifecycle hooks).
+Phase 11 complete. Both compaction fallback plans implemented: dispatch (Plan 01) and lifecycle event handling (Plan 02). 376 total tests across 13 files.

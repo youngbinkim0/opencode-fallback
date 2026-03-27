@@ -44,7 +44,7 @@ Added after the v1.1 audit milestone to cover compaction-specific fallback behav
 ### Compaction Fallback
 
 - [x] **COMP-01**: Compaction-origin fallback uses the OpenCode compaction command path with the fallback model — `type: "compaction"` parts are never replayed through `promptAsync`
-- [ ] **COMP-02**: Successful compaction fallback is recognized through compaction lifecycle signals (`experimental.session.compacting`, `session.compacted`) — the plugin does not wait for assistant text or a fixed timeout to mark success
+- [x] **COMP-02**: Successful compaction fallback is recognized through compaction lifecycle signals (`experimental.session.compacting`, `session.compacted`) — the plugin does not wait for assistant text or a fixed timeout to mark success
 - [x] **TEST-06**: Regression tests cover compaction-origin fallback dispatch, lifecycle cleanup, and silent-failure prevention
 
 ### Observability
