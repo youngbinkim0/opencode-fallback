@@ -89,6 +89,14 @@ describe("fallback-state", () => {
 	})
 
 	describe("#given findNextAvailableFallback", () => {
+		describe("#when the fallback chain is empty", () => {
+			test("#then returns undefined", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+
+				expect(findNextAvailableFallback(state, [], 60)).toBeUndefined()
+			})
+		})
+
 		describe("#when there are available fallback models", () => {
 			test("#then returns the next model after current index", () => {
 				const state = createFallbackState("anthropic/claude-opus-4-6")
@@ -176,6 +184,17 @@ describe("fallback-state", () => {
 
 				expect(result).toBeUndefined()
 			})
+
+			test("#then skips duplicate entries matching currentModel until a different model is found", () => {
+				const state = createFallbackState("google/model-a")
+				state.currentModel = "google/model-a"
+				state.fallbackIndex = -1
+
+				const fallbackModels = ["google/model-a", "google/model-a", "openai/model-b"]
+				const result = findNextAvailableFallback(state, fallbackModels, 60)
+
+				expect(result).toBe("openai/model-b")
+			})
 		})
 	})
 
@@ -210,6 +229,19 @@ describe("fallback-state", () => {
 			})
 		})
 
+		describe("#when attemptCount is one below the limit", () => {
+			test("#then allows the final fallback attempt and lands exactly on the max", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.attemptCount = DEFAULT_CONFIG.max_fallback_attempts - 1
+				const fallbackModels = ["google/model-a"]
+
+				const result = prepareFallback("session-1", state, fallbackModels, DEFAULT_CONFIG)
+
+				expect(result.success).toBe(true)
+				expect(state.attemptCount).toBe(DEFAULT_CONFIG.max_fallback_attempts)
+			})
+		})
+
 		describe("#when no available fallback models exist", () => {
 			test("#then returns failure", () => {
 				const state = createFallbackState("anthropic/claude-opus-4-6")
@@ -222,6 +254,21 @@ describe("fallback-state", () => {
 
 				expect(result.success).toBe(false)
 				expect(result.error).toContain("No available fallback models")
+			})
+
+			test("#then leaves state unchanged on the failure path", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.fallbackIndex = 0
+				state.attemptCount = 1
+				state.pendingFallbackModel = "google/model-a"
+				state.failedModels.set("google/model-a", Date.now())
+				const snapshot = snapshotFallbackState(state)
+
+				const fallbackModels = ["google/model-a"]
+				const result = prepareFallback("session-1", state, fallbackModels, DEFAULT_CONFIG)
+
+				expect(result.success).toBe(false)
+				expect(snapshotFallbackState(state)).toEqual(snapshot)
 			})
 		})
 
@@ -419,10 +466,35 @@ describe("fallback-state", () => {
 			})
 		})
 
+		describe("#when the fallback chain is a single entry equal to currentModel", () => {
+			test("#then returns failure without mutating state", () => {
+				const state = createFallbackState("google/model-a")
+				state.currentModel = "google/model-a"
+				const snapshot = snapshotFallbackState(state)
+
+				const plan = planFallback("ses_1", state, ["google/model-a"], DEFAULT_CONFIG)
+
+				expect(plan.success).toBe(false)
+				expect(snapshotFallbackState(state)).toEqual(snapshot)
+			})
+		})
+
 		describe("#when max attempts have been reached", () => {
 			test("#then returns failure with maxAttemptsReached", () => {
 				const state = createFallbackState("anthropic/claude-opus-4-6")
 				state.attemptCount = DEFAULT_CONFIG.max_fallback_attempts
+
+				const plan = planFallback("ses_1", state, ["google/model-a"], DEFAULT_CONFIG)
+
+				expect(plan.success).toBe(false)
+				if (!plan.success) {
+					expect(plan.maxAttemptsReached).toBe(true)
+				}
+			})
+
+			test("#then also fails when attemptCount is already above the limit", () => {
+				const state = createFallbackState("anthropic/claude-opus-4-6")
+				state.attemptCount = DEFAULT_CONFIG.max_fallback_attempts + 1
 
 				const plan = planFallback("ses_1", state, ["google/model-a"], DEFAULT_CONFIG)
 
@@ -460,6 +532,8 @@ describe("fallback-state", () => {
 					expect(plan1.newModel).toBe(plan2.newModel)
 					expect(plan1.failedModel).toBe(plan2.failedModel)
 				}
+				expect(state.pendingFallbackModel).toBeUndefined()
+				expect(state.attemptCount).toBe(0)
 			})
 		})
 	})
