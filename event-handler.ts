@@ -14,7 +14,7 @@ import {
 	snapshotFallbackState,
 	restoreFallbackState,
 } from "./fallback-state"
-import { getFallbackModelsForSession } from "./config-reader"
+import { getFallbackModelsForSession, resolveAgentForSession } from "./config-reader"
 
 export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 	const {
@@ -26,10 +26,43 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		sessionFallbackTimeouts,
 	} = deps
 
+	const handleActivity = async (sessionID: string) => {
+		if (sessionAwaitingFallbackResult.has(sessionID)) {
+			const resolvedAgent = resolveAgentForSession(sessionID, undefined)
+			helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
+			logInfo("Resetting fallback timeout due to activity", { sessionID })
+			return
+		}
+
+		if (sessionAwaitingFallbackResult.size === 0) {
+			return
+		}
+
+		const cachedParentID = deps.sessionParentID.get(sessionID)
+		const parentID =
+			cachedParentID !== undefined
+				? cachedParentID
+				: await helpers.getParentSessionID(sessionID)
+
+		if (parentID && sessionAwaitingFallbackResult.has(parentID)) {
+			const resolvedAgent = resolveAgentForSession(parentID, undefined)
+			helpers.scheduleSessionFallbackTimeout(parentID, resolvedAgent)
+			logInfo("Resetting parent fallback timeout due to child activity", {
+				sessionID,
+				parentID,
+			})
+		}
+	}
+
 	const handleSessionCreated = (props: Record<string, unknown> | undefined) => {
 		const sessionInfo = props?.info as { id?: string } | undefined
 		const sessionID = sessionInfo?.id
 		if (!sessionID) return
+
+		const parentID = (sessionInfo as Record<string, unknown> | undefined)?.parentID
+		if (typeof parentID === "string" && parentID.length > 0) {
+			deps.sessionParentID.set(sessionID, parentID)
+		}
 
 		logInfo("Session created, state will be created on-demand", { sessionID })
 	}
@@ -582,6 +615,23 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		}
 	}
 
+	const handleSessionCompacted = (props: Record<string, unknown> | undefined) => {
+		const sessionID = props?.sessionID as string | undefined
+		if (!sessionID) return
+
+		const hadAwaiting = sessionAwaitingFallbackResult.has(sessionID)
+
+		// Clear all fallback tracking state — compaction completed successfully
+		sessionAwaitingFallbackResult.delete(sessionID)
+		sessionRetryInFlight.delete(sessionID)
+		deps.sessionFirstTokenReceived.delete(sessionID)
+		helpers.clearSessionFallbackTimeout(sessionID)
+
+		if (hadAwaiting) {
+			logInfo("Compaction completed, clearing fallback state", { sessionID })
+		}
+	}
+
 	function findFirstAgentModel(): string | undefined {
 		if (!deps.agentConfigs) return undefined
 		for (const agentName of Object.keys(deps.agentConfigs)) {
@@ -668,34 +718,41 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		}
 	}
 
-	return async ({ event }: { event: { type: string; properties?: unknown } }) => {
-		if (!config.enabled) return
+	return {
+		handleEvent: async ({ event }: { event: { type: string; properties?: unknown } }) => {
+			if (!config.enabled) return
 
-		const props = event.properties as Record<string, unknown> | undefined
+			const props = event.properties as Record<string, unknown> | undefined
 
-		if (event.type === "session.created") {
-			handleSessionCreated(props)
-			return
-		}
-		if (event.type === "session.deleted") {
-			handleSessionDeleted(props)
-			return
-		}
-		if (event.type === "session.stop") {
-			await handleSessionStop(props)
-			return
-		}
-		if (event.type === "session.idle") {
-			await handleSessionIdle(props)
-			return
-		}
-		if (event.type === "session.error") {
-			await handleSessionError(props)
-			return
-		}
-		if (event.type === "session.status") {
-			await handleSessionStatus(props)
-			return
-		}
+			if (event.type === "session.created") {
+				handleSessionCreated(props)
+				return
+			}
+			if (event.type === "session.deleted") {
+				handleSessionDeleted(props)
+				return
+			}
+			if (event.type === "session.stop") {
+				await handleSessionStop(props)
+				return
+			}
+			if (event.type === "session.idle") {
+				await handleSessionIdle(props)
+				return
+			}
+			if (event.type === "session.error") {
+				await handleSessionError(props)
+				return
+			}
+			if (event.type === "session.status") {
+				await handleSessionStatus(props)
+				return
+			}
+			if (event.type === "session.compacted") {
+				handleSessionCompacted(props)
+				return
+			}
+		},
+		handleActivity,
 	}
 }

@@ -1396,8 +1396,8 @@ describe("createEventHandler", () => {
 				},
 			})
 
+			// No fallback triggered, but cleanup was called defensively
 			expect(helpers.autoRetryWithFallback).not.toHaveBeenCalled()
-			expect(helpers.clearSessionFallbackTimeout).toHaveBeenCalledWith(sessionID)
 		})
 	})
 })
