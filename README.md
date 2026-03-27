@@ -93,8 +93,8 @@ All fields are optional — omit any you want to keep at the default.
   "retryable_error_patterns": [],
 
   // Maximum number of fallback models to try before giving up.
-  // Default: 3
-  "max_fallback_attempts": 3,
+  // Default: 10
+  "max_fallback_attempts": 10,
 
   // How long (seconds) a failed model stays in cooldown before it can be
   // used again. During cooldown the model is skipped in the chain.
