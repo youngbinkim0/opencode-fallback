@@ -14,12 +14,13 @@ function createMockContext(): PluginContext {
 					})
 				),
 				promptAsync: mock(() => Promise.resolve()),
-				get: mock(() =>
-					Promise.resolve({
-						data: {},
-					})
-				),
-			},
+			get: mock(() =>
+				Promise.resolve({
+					data: {},
+				})
+			),
+			command: mock(() => Promise.resolve()),
+		},
 			tui: {
 				showToast: mock(() => Promise.resolve()),
 			},
@@ -480,6 +481,26 @@ describe("OpenCodeFallbackPlugin", () => {
 				await plugin["tool.execute.after"](input, output)
 
 				expect(output.output).toBe(originalOutput)
+			})
+		})
+
+		describe("#when session.compacted event is received", () => {
+			it("#then event handler processes compacted event without errors", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+
+				// session.compacted should be routed to the base event handler
+				// without throwing — even with no active fallback state
+				await plugin.event({
+					event: {
+						type: "session.compacted",
+						properties: {
+							sessionID: "ses-compacted-test",
+						},
+					},
+				})
+
+				// No crash — the event was dispatched and handled as a no-op
+				expect(true).toBe(true)
 			})
 		})
 	})

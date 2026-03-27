@@ -22,8 +22,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: {
 							showToast: mock(async () => {}),
 						},
@@ -61,11 +62,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext,
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.error",
 					properties: {
@@ -103,8 +105,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: {
 							showToast: mock(async () => {}),
 						},
@@ -141,11 +144,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.idle",
 					properties: { sessionID },
@@ -177,8 +181,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: {
 							showToast: mock(async () => {}),
 						},
@@ -209,11 +214,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.idle",
 					properties: { sessionID },
@@ -244,8 +250,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -272,11 +279,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.error",
 					properties: {
@@ -307,8 +315,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -335,11 +344,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.error",
 					properties: {
@@ -367,8 +377,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -403,11 +414,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: resolveAgentMock,
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.error",
 					properties: {
@@ -435,8 +447,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -464,11 +477,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.error",
 					properties: {
@@ -495,8 +509,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -524,11 +539,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.error",
 					properties: {
@@ -558,8 +574,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -587,11 +604,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.error",
 					properties: {
@@ -620,8 +638,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -647,11 +666,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback: mock(async () => true),
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.idle",
 					properties: { sessionID },
@@ -675,8 +695,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -703,11 +724,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback: mock(async () => true),
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.deleted",
 					properties: { info: { id: sessionID } },
@@ -741,8 +763,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -770,11 +793,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback: mock(async () => true),
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.stop",
 					properties: { sessionID },
@@ -800,8 +824,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -828,12 +853,13 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
 			// Fire a session.error — should be completely ignored
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.error",
 					properties: {
@@ -858,8 +884,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -886,11 +913,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.status",
 					properties: {
@@ -914,8 +942,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -941,12 +970,13 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback: mock(async () => true),
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
 			// Should not throw
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.error",
 					properties: {
@@ -972,8 +1002,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -1001,11 +1032,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: { type: "session.idle", properties: { sessionID } },
 			})
 
@@ -1031,8 +1063,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -1068,11 +1101,12 @@ describe("createEventHandler", () => {
 				autoRetryWithFallback,
 				resolveAgentForSessionFromContext: mock(async () => "fast"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: {
 					type: "session.status",
 					properties: {
@@ -1113,8 +1147,9 @@ describe("createEventHandler", () => {
 							abort: mock(async () => {}),
 							messages: mock(async () => ({ data: [] })),
 							promptAsync: mock(async () => {}),
-							get: mock(async () => ({ data: {} })),
-						},
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+					},
 						tui: { showToast: mock(async () => {}) },
 					},
 				},
@@ -1150,11 +1185,12 @@ describe("createEventHandler", () => {
 				}),
 				resolveAgentForSessionFromContext: mock(async () => "test"),
 				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
 			}
 
-			const handler = createEventHandler(deps, helpers)
+			const { handleEvent } = createEventHandler(deps, helpers)
 
-			await handler({
+			await handleEvent({
 				event: { type: "session.idle", properties: { sessionID } },
 			})
 
@@ -1164,6 +1200,204 @@ describe("createEventHandler", () => {
 			// The key assertion: retryInFlight was set WHEN clearTimeout was called
 			// (verified inside the mock above)
 			expect(clearSessionFallbackTimeout).toHaveBeenCalledWith(sessionID)
+		})
+	})
+
+	describe("#when session.compacted fires for a session with active fallback state", () => {
+		test("#then it clears awaiting state, retry lock, timeout, and first-token bookkeeping", async () => {
+			const sessionID = "ses_compacted_cleanup"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			state.currentModel = "openai/gpt-4o"
+			state.attemptCount = 1
+			state.fallbackIndex = 0
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {},
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set([sessionID]),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map([[sessionID, true]]),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const clearSessionFallbackTimeout = mock(() => {})
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout,
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleEvent } = createEventHandler(deps, helpers)
+
+			await handleEvent({
+				event: {
+					type: "session.compacted",
+					properties: { sessionID },
+				},
+			})
+
+			// All fallback tracking state should be cleared
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+			expect(deps.sessionRetryInFlight.has(sessionID)).toBe(false)
+			expect(deps.sessionFirstTokenReceived.has(sessionID)).toBe(false)
+			expect(clearSessionFallbackTimeout).toHaveBeenCalledWith(sessionID)
+			// Should NOT trigger another fallback
+			expect(helpers.autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+	})
+
+	describe("#when session.compacted fires then session.idle follows", () => {
+		test("#then session.idle does NOT trigger silent-failure branch", async () => {
+			const sessionID = "ses_compacted_then_idle"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			state.currentModel = "openai/gpt-4o"
+			state.attemptCount = 1
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: { compaction: { model: "anthropic/claude-opus-4-6", fallback_models: ["openai/gpt-4o"] } },
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map([[sessionID, true]]),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "compaction"),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleEvent } = createEventHandler(deps, helpers)
+
+			// First: session.compacted clears awaiting state
+			await handleEvent({
+				event: {
+					type: "session.compacted",
+					properties: { sessionID },
+				},
+			})
+
+			// Awaiting should be cleared now
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+
+			// Second: session.idle arrives — should NOT trigger silent-failure
+			await handleEvent({
+				event: {
+					type: "session.idle",
+					properties: { sessionID },
+				},
+			})
+
+			// No fallback dispatched — compaction already completed successfully
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+	})
+
+	describe("#when session.compacted fires for a session with no active fallback", () => {
+		test("#then it is a no-op and does not crash", async () => {
+			const sessionID = "ses_compacted_noop"
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {},
+				globalFallbackModels: [],
+				sessionStates: new Map(),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+			}
+
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleEvent } = createEventHandler(deps, helpers)
+
+			// Should not throw — no active state for this session
+			await handleEvent({
+				event: {
+					type: "session.compacted",
+					properties: { sessionID },
+				},
+			})
+
+			expect(helpers.autoRetryWithFallback).not.toHaveBeenCalled()
+			expect(helpers.clearSessionFallbackTimeout).toHaveBeenCalledWith(sessionID)
 		})
 	})
 })
