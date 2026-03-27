@@ -275,6 +275,10 @@ describe("error-classifier", () => {
 				expect(getErrorMessage({ message: 429 })).toContain("429")
 			})
 
+			test("#then normalizes whitespace-only messages to empty strings", () => {
+				expect(getErrorMessage({ message: "   \n\t  " })).toBe("")
+			})
+
 			test("#then returns empty string for circular objects instead of throwing", () => {
 				const circular: Record<string, unknown> = {}
 				circular.self = circular
@@ -308,6 +312,17 @@ describe("error-classifier", () => {
 				expect(getErrorMessage(null)).toBe("")
 			})
 		})
+
+		describe("#when error input is adversarial", () => {
+			test("#then handles undefined safely", () => {
+				expect(getErrorMessage(undefined)).toBe("")
+			})
+
+			test("#then handles giant strings without truncation or throws", () => {
+				const giant = "RATE LIMIT ".repeat(500)
+				expect(getErrorMessage(giant)).toBe(giant.toLowerCase())
+			})
+		})
 	})
 
 	describe("#given extractAutoRetrySignal", () => {
@@ -330,6 +345,29 @@ describe("error-classifier", () => {
 					message: "Normal operation",
 				}
 				expect(extractAutoRetrySignal(info)).toBeUndefined()
+			})
+		})
+
+		describe("#when info has rate-limit language without retrying language", () => {
+			test("#then returns undefined because every pattern is intentional", () => {
+				const info = {
+					status: "Rate limit encountered",
+					message: "Too many requests - quota exceeded",
+				}
+
+				expect(extractAutoRetrySignal(info)).toBeUndefined()
+			})
+		})
+
+		describe("#when info fields are present but non-string", () => {
+			test("#then ignores them safely", () => {
+				const info = {
+					status: 429,
+					message: { text: "Retrying in 5 seconds" },
+					details: false,
+				}
+
+				expect(extractAutoRetrySignal(info as Record<string, unknown>)).toBeUndefined()
 			})
 		})
 
@@ -363,6 +401,13 @@ describe("error-classifier", () => {
 		describe("#when parts is undefined", () => {
 			test("#then returns hasError false", () => {
 				expect(containsErrorContent(undefined).hasError).toBe(false)
+			})
+		})
+
+		describe("#when error parts exist without text payloads", () => {
+			test("#then still reports structural error presence", () => {
+				const result = containsErrorContent([{ type: "error" }])
+				expect(result).toEqual({ hasError: true, errorMessage: undefined })
 			})
 		})
 	})
@@ -411,6 +456,13 @@ describe("error-classifier", () => {
 				expect(extractErrorContentFromParts(parts).hasError).toBe(false)
 			})
 		})
+
+		describe("#when error parts have no text payloads", () => {
+			test("#then ignores them because this helper only extracts textual content", () => {
+				const result = extractErrorContentFromParts([{ type: "error" }])
+				expect(result).toEqual({ hasError: false })
+			})
+		})
 	})
 
 	describe("#given user-provided retryable_error_patterns", () => {
@@ -452,12 +504,39 @@ describe("error-classifier", () => {
 			})
 		})
 
-		describe("#when user pattern matches case-insensitively", () => {
+			describe("#when user pattern matches case-insensitively", () => {
 			test("#then returns true", () => {
 				const error = { message: "CUSTOM_PROVIDER_LIMIT_REACHED" }
 				const userPatterns = ["custom_provider_limit"]
 				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors, userPatterns)).toBe(true)
 			})
+		})
+	})
+
+	describe("#given isRetryableError priority ordering", () => {
+		test("#then missing_api_key classification wins even with non-retryable status", () => {
+			const error = {
+				statusCode: 401,
+				data: { error: { message: "x-api-key header is required" } },
+			}
+
+			expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors)).toBe(true)
+		})
+
+		test("#then retryable status beats a non-matching message", () => {
+			const error = { statusCode: 503, message: "Unexpected upstream failure" }
+			expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors)).toBe(true)
+		})
+
+		test("#then built-in retry patterns beat user patterns", () => {
+			const error = { message: "Service temporarily unavailable, try again" }
+			expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors, ["never-match-this"])).toBe(true)
+		})
+
+		test("#then user patterns are the final fallback", () => {
+			const error = { message: "Vendor circuit breaker opened for tenant 42" }
+			const userPatterns = ["circuit breaker opened"]
+			expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors, userPatterns)).toBe(true)
 		})
 	})
 })
