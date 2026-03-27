@@ -115,15 +115,14 @@ export interface PluginContext {
 			}) => Promise<void>
 			/** Re-dispatch a command (e.g. compaction) on a specific model.
 			 *  Used for compaction fallback because `promptAsync` cannot accept
-			 *  `type: "compaction"` parts — only text/file/agent/subtask. */
+			 *  `type: "compaction"` parts — only text/file/agent/subtask.
+			 *  Uses flat SDK parameter format (not nested path/body/query). */
 			command: (args: {
-				path: { id: string }
-				body: {
-					command: string
-					model?: string
-					agent?: string
-				}
-				query: { directory: string }
+				sessionID: string
+				directory?: string
+				command: string
+				model?: string
+				agent?: string
 			}) => Promise<void>
 			get: (args: {
 				path: { id: string }
@@ -165,4 +164,10 @@ export interface HookDeps {
 	/** Timestamp of the last message.updated event per session.
 	 *  Used by subagent-sync to detect child activity and reset timeouts. */
 	sessionLastMessageTime: Map<string, number>
+	/** Sessions with an in-flight compaction fallback via session.command.
+	 *  Compaction commands produce no message.updated events, only a final
+	 *  session.compacted signal.  While this flag is set, stale errors from
+	 *  the pre-compaction model are suppressed and session.idle does not
+	 *  treat the silence as a "silent model failure". */
+	sessionCompactionInFlight: Set<string>
 }

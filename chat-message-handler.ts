@@ -1,7 +1,6 @@
 import type { HookDeps, ChatMessageInput, ChatMessageOutput } from "./types"
 import type { AutoRetryHelpers } from "./auto-retry"
 import { createFallbackState, recoverToOriginal } from "./fallback-state"
-import { getFallbackModelsForSession, resolveAgentForSession } from "./config-reader"
 import { logInfo, logError } from "./logger"
 
 export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
@@ -40,10 +39,22 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 		// IMPORTANT: This check must happen BEFORE the recovery check below.
 		// Otherwise recovery fires first, resetting to originalModel, and the
 		// adoption check never sees the mismatch.
+		//
+		// SKIP when the plugin is actively managing a fallback: when
+		// sessionRetryInFlight, sessionAwaitingFallbackResult, or
+		// sessionCompactionInFlight is set, the chat.message event is from
+		// the plugin's own promptAsync replay — NOT a deliberate user
+		// adoption.  Without this guard, the replay's chat.message resets
+		// the fallback state (clears failedModels, resets fallbackIndex)
+		// which breaks the fallback chain and can cause an "interrupted"
+		// loop when the fallback model itself errors.
 		if (
 			requestedModel &&
 			requestedModel === state.currentModel &&
-			state.currentModel !== state.originalModel
+			state.currentModel !== state.originalModel &&
+			!deps.sessionCompactionInFlight.has(sessionID) &&
+			!sessionRetryInFlight.has(sessionID) &&
+			!sessionAwaitingFallbackResult.has(sessionID)
 		) {
 			logInfo("Adopting current model as new primary (user confirmed manual selection)", {
 				sessionID,
@@ -95,31 +106,26 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 				return
 			}
 
-			// Check if this "mismatch" is just a stale retry from the race
-			// between message.updated / session.error / session.status.
-			// If the requestedModel is in the fallback chain and we're actively
-			// retrying, this is NOT a manual change — it's a stale handler
-			// sending its model while another handler already advanced the state.
+			// If the plugin is actively managing a fallback (retry in flight
+			// or awaiting result), any model mismatch is from the plugin's own
+			// promptAsync replay — NOT a manual user change.  Skip entirely and
+			// let commitFallback handle the state transition atomically.
+			//
+			// Previously this guard additionally required the requestedModel to
+			// be in the fallback_models list, but that check is fragile: agent
+			// resolution in the chat.message context can differ from the agent
+			// used during fallback planning (e.g. compaction clears the agent),
+			// causing getFallbackModelsForSession to return a different list.
+			// The retry-in-flight / awaiting-result flags are authoritative.
 			if (sessionRetryInFlight.has(sessionID) || sessionAwaitingFallbackResult.has(sessionID)) {
-				const resolvedAgent = resolveAgentForSession(sessionID, input.agent)
-				const fallbackModels = getFallbackModelsForSession(
+				logInfo("Ignoring model mismatch during active fallback management", {
 					sessionID,
-					resolvedAgent,
-					deps.agentConfigs,
-					deps.globalFallbackModels
-				)
-				if (fallbackModels.includes(requestedModel)) {
-					logInfo("Ignoring stale fallback model mismatch during active retry", {
-						sessionID,
-						requestedModel,
-						currentModel: state.currentModel,
-					})
-					// Do NOT update state.currentModel here — let commitFallback
-					// handle the state transition atomically.  Setting currentModel
-					// during an active retry confuses commitFallback's idempotency
-					// check and can cause it to abort a live replay.
-					return
-				}
+					requestedModel,
+					currentModel: state.currentModel,
+					retryInFlight: sessionRetryInFlight.has(sessionID),
+					awaitingResult: sessionAwaitingFallbackResult.has(sessionID),
+				})
+				return
 			}
 
 			logError("Detected manual model change, resetting fallback state", {

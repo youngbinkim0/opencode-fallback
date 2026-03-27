@@ -54,6 +54,7 @@ function createMockDeps(overrides?: Partial<{
 		sessionParentID: new Map(),
 		sessionIdleResolvers: new Map(),
 		sessionLastMessageTime: new Map(),
+		sessionCompactionInFlight: new Set(),
 	}
 }
 

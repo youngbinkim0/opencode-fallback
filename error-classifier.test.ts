@@ -105,9 +105,14 @@ describe("error-classifier", () => {
 				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors)).toBe(false)
 			})
 
-			test("#then returns false for 401", () => {
+			test("#then returns true for 401 (retryable by default for API key fallback)", () => {
 				const error = { statusCode: 401, message: "Unauthorized" }
-				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors)).toBe(false)
+				expect(isRetryableError(error, DEFAULT_CONFIG.retry_on_errors)).toBe(true)
+			})
+
+			test("#then returns false for 401 when excluded from retry_on_errors", () => {
+				const error = { statusCode: 401, message: "Unauthorized" }
+				expect(isRetryableError(error, [429, 500, 502, 503, 504])).toBe(false)
 			})
 
 			test("#then returns false for 404", () => {

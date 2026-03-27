@@ -113,10 +113,11 @@ export default async function OpenCodeFallbackPlugin(
 		sessionParentID: new Map(),
 		sessionIdleResolvers: new Map(),
 		sessionLastMessageTime: new Map(),
+		sessionCompactionInFlight: new Set(),
 	}
 
 	const helpers = createAutoRetryHelpers(deps)
-	const baseEventHandler = createEventHandler(deps, helpers)
+	const { handleEvent: baseEventHandler, handleActivity } = createEventHandler(deps, helpers)
 	const messageUpdateHandler = createMessageUpdateHandler(deps, helpers)
 	const chatMessageHandler = createChatMessageHandler(deps, helpers)
 
@@ -160,7 +161,25 @@ export default async function OpenCodeFallbackPlugin(
 				await messageUpdateHandler(props)
 				return
 			}
+			
+			if (
+				event.type === "message.part.delta" ||
+				event.type === "session.diff" ||
+				event.type === "message.part.updated"
+			) {
+				const props = event.properties as Record<string, unknown> | undefined
+				const info = props?.info as Record<string, unknown> | undefined
+				const sessionID =
+					(props?.sessionID as string | undefined) ??
+					(info?.sessionID as string | undefined) ??
+					(info?.id as string | undefined)
+				if (sessionID) {
+					await handleActivity(sessionID)
+				}
+			}
+			
 			await baseEventHandler({ event })
+
 		},
 
 		"tool.execute.after": async (

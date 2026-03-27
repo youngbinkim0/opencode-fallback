@@ -51,6 +51,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const resolveAgentForSessionFromContext = mock(async () => "planner")
@@ -134,6 +135,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -203,6 +205,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -269,6 +272,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -334,6 +338,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -396,6 +401,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -467,6 +473,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -529,6 +536,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -594,6 +602,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -657,6 +666,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map([[sessionID, [() => { waiterResolved = true }]]]),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const helpers = {
@@ -714,6 +724,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map([[sessionID, "parent-1"]]),
 				sessionIdleResolvers: new Map([[sessionID, [() => {}]]]),
 				sessionLastMessageTime: new Map([[sessionID, Date.now()]]),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const clearSessionFallbackTimeout = mock(() => {})
@@ -782,6 +793,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const abortSessionRequest = mock(async () => {})
@@ -843,6 +855,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -903,6 +916,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -961,6 +975,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const helpers = {
@@ -1022,6 +1037,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -1091,6 +1107,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -1166,6 +1183,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const clearSessionFallbackTimeout = mock(() => {
@@ -1238,6 +1256,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const clearSessionFallbackTimeout = mock(() => {})
@@ -1304,6 +1323,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const autoRetryWithFallback = mock(async () => true)
@@ -1374,6 +1394,7 @@ describe("createEventHandler", () => {
 				sessionParentID: new Map(),
 				sessionIdleResolvers: new Map(),
 				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
 			}
 
 			const helpers = {
@@ -1398,6 +1419,123 @@ describe("createEventHandler", () => {
 
 			// No fallback triggered, but cleanup was called defensively
 			expect(helpers.autoRetryWithFallback).not.toHaveBeenCalled()
+		})
+	})
+
+	describe("#handleActivity sets firstTokenReceived", () => {
+		test("#activity event marks firstTokenReceived true so TTFT timeout skips abort", async () => {
+			const sessionID = "ses_tool_call_activity"
+			const state = createFallbackState("anthropic/claude-haiku-4-5")
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+						},
+						tui: {
+							showToast: mock(async () => {}),
+						},
+					},
+				},
+				config: { ...DEFAULT_CONFIG, timeout_seconds: 30 },
+				agentConfigs: undefined,
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
+			}
+
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => undefined),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleActivity } = createEventHandler(deps, helpers)
+
+			// firstTokenReceived should be false initially
+			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBeUndefined()
+
+			// Simulate a tool call activity event (message.part.delta)
+			await handleActivity(sessionID)
+
+			// After activity, firstTokenReceived must be true
+			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBe(true)
+
+			// Timeout should also be rescheduled (since awaiting fallback result)
+			expect(helpers.scheduleSessionFallbackTimeout).toHaveBeenCalled()
+		})
+
+		test("#activity for non-awaiting session still sets firstTokenReceived", async () => {
+			const sessionID = "ses_primary_tool_call"
+			const state = createFallbackState("anthropic/claude-haiku-4-5")
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+						},
+						tui: {
+							showToast: mock(async () => {}),
+						},
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: undefined,
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(), // NOT awaiting
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
+			}
+
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => undefined),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleActivity } = createEventHandler(deps, helpers)
+
+			await handleActivity(sessionID)
+
+			// Even for non-awaiting sessions, activity should set firstTokenReceived
+			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBe(true)
 		})
 	})
 })

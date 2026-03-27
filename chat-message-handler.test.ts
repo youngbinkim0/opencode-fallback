@@ -14,6 +14,7 @@ function createMockDeps(configOverrides?: Partial<FallbackPluginConfig>): HookDe
 					abort: mock(async () => {}),
 					messages: mock(async () => ({ data: [] })),
 					promptAsync: mock(async () => {}),
+					command: mock(async () => {}),
 					get: mock(async () => ({ data: {} })),
 				},
 				tui: {
@@ -34,6 +35,7 @@ function createMockDeps(configOverrides?: Partial<FallbackPluginConfig>): HookDe
 		sessionParentID: new Map(),
 		sessionIdleResolvers: new Map(),
 		sessionLastMessageTime: new Map(),
+		sessionCompactionInFlight: new Set(),
 	}
 }
 
@@ -312,6 +314,114 @@ describe("chat-message-handler", () => {
 		})
 	})
 
+	describe("#given adoption guard during active fallback (race condition fix)", () => {
+		describe("#when requestedModel equals currentModel and sessionAwaitingFallbackResult is set", () => {
+			test("#then adoption is SKIPPED (replay's chat.message, not user action)", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_race_adoption"
+
+				// State: fallback committed — currentModel is now the fallback model
+				const state = createFallbackedState("anthropic/claude-opus-4-6", "google/gemini-pro", false)
+				deps.sessionStates.set(sessionID, state)
+				// Plugin dispatched a replay and is awaiting the result
+				deps.sessionAwaitingFallbackResult.add(sessionID)
+
+				const handler = createChatMessageHandler(deps, helpers)
+				// promptAsync triggers chat.message with the fallback model
+				const input: ChatMessageInput = {
+					sessionID,
+					model: {
+						providerID: "google",
+						modelID: "gemini-pro",
+					},
+				}
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "google", modelID: "gemini-pro" },
+					},
+				}
+
+				await handler(input, output)
+
+				// originalModel should NOT have changed — adoption must be skipped
+				expect(state.originalModel).toBe("anthropic/claude-opus-4-6")
+				// failedModels should NOT have been cleared
+				expect(state.failedModels.size).toBe(1)
+				// attemptCount should NOT have been reset
+				expect(state.attemptCount).toBe(1)
+				// fallbackIndex should NOT have been reset
+				expect(state.fallbackIndex).toBe(0)
+			})
+		})
+
+		describe("#when requestedModel equals currentModel and sessionRetryInFlight is set", () => {
+			test("#then adoption is SKIPPED", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_race_retry"
+
+				const state = createFallbackedState("anthropic/claude-opus-4-6", "google/gemini-pro", false)
+				deps.sessionStates.set(sessionID, state)
+				deps.sessionRetryInFlight.add(sessionID)
+
+				const handler = createChatMessageHandler(deps, helpers)
+				const input: ChatMessageInput = {
+					sessionID,
+					model: {
+						providerID: "google",
+						modelID: "gemini-pro",
+					},
+				}
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "google", modelID: "gemini-pro" },
+					},
+				}
+
+				await handler(input, output)
+
+				// originalModel should NOT have changed
+				expect(state.originalModel).toBe("anthropic/claude-opus-4-6")
+				expect(state.failedModels.size).toBe(1)
+				expect(state.attemptCount).toBe(1)
+			})
+		})
+
+		describe("#when requestedModel equals currentModel and no fallback flags are set", () => {
+			test("#then adoption proceeds normally (genuine user action)", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_genuine_adopt"
+
+				const state = createFallbackedState("anthropic/claude-opus-4-6", "google/gemini-pro", false)
+				deps.sessionStates.set(sessionID, state)
+				// No retry in flight, no awaiting result — this is a real user action
+
+				const handler = createChatMessageHandler(deps, helpers)
+				const input: ChatMessageInput = {
+					sessionID,
+					model: {
+						providerID: "google",
+						modelID: "gemini-pro",
+					},
+				}
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "google", modelID: "gemini-pro" },
+					},
+				}
+
+				await handler(input, output)
+
+				// Adoption should proceed
+				expect(state.originalModel).toBe("google/gemini-pro")
+				expect(state.failedModels.size).toBe(0)
+				expect(state.attemptCount).toBe(0)
+			})
+		})
+	})
+
 	describe("#given config.enabled is false", () => {
 		describe("#when any chat.message arrives", () => {
 			test("#then handler returns immediately without processing", async () => {
@@ -362,15 +472,15 @@ describe("chat-message-handler", () => {
 	})
 
 	describe("#given manual model change detection", () => {
-		describe("#when requested model differs from state and is NOT in fallback chain", () => {
-			test("#then state is reset to new model and old retry is aborted", async () => {
+		describe("#when requested model differs from state and no fallback is in flight", () => {
+			test("#then state is reset to new model", async () => {
 				const deps = createMockDeps()
 				const helpers = createMockHelpers()
 				const sessionID = "ses_manual"
 
 				const state = createFallbackedState("anthropic/claude-opus-4-6", "google/gemini-pro", false)
 				deps.sessionStates.set(sessionID, state)
-				deps.sessionRetryInFlight.add(sessionID)
+				// No retry in flight — this is a genuine manual model change
 
 				const handler = createChatMessageHandler(deps, helpers)
 				const input: ChatMessageInput = {
@@ -393,9 +503,76 @@ describe("chat-message-handler", () => {
 				expect(newState.originalModel).toBe("openai/gpt-4o")
 				expect(newState.currentModel).toBe("openai/gpt-4o")
 				expect(newState.attemptCount).toBe(0)
-				// Should have aborted the in-flight retry
-				expect(helpers.abortSessionRequest).toHaveBeenCalledWith(sessionID, "manual-model-change")
-				expect(deps.sessionRetryInFlight.has(sessionID)).toBe(false)
+			})
+		})
+
+		describe("#when requested model differs from state but retry IS in flight", () => {
+			test("#then model mismatch is ignored (not treated as manual change)", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_manual_during_retry"
+
+				const state = createFallbackedState("anthropic/claude-opus-4-6", "google/gemini-pro", false)
+				deps.sessionStates.set(sessionID, state)
+				deps.sessionRetryInFlight.add(sessionID)
+
+				const handler = createChatMessageHandler(deps, helpers)
+				const input: ChatMessageInput = {
+					sessionID,
+					model: {
+						providerID: "openai",
+						modelID: "gpt-4o",
+					},
+				}
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "openai", modelID: "gpt-4o" },
+					},
+				}
+
+				await handler(input, output)
+
+				// State should NOT be reset — the plugin is managing the fallback
+				expect(state.currentModel).toBe("google/gemini-pro")
+				expect(state.originalModel).toBe("anthropic/claude-opus-4-6")
+				// No abort should have been called
+				expect(helpers.abortSessionRequest).not.toHaveBeenCalled()
+				// Retry lock should still be held by the original caller
+				expect(deps.sessionRetryInFlight.has(sessionID)).toBe(true)
+			})
+		})
+
+		describe("#when requested model differs from state but awaiting fallback result", () => {
+			test("#then model mismatch is ignored (not treated as manual change)", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_manual_during_await"
+
+				const state = createFallbackedState("anthropic/claude-opus-4-6", "google/gemini-pro", false)
+				deps.sessionStates.set(sessionID, state)
+				deps.sessionAwaitingFallbackResult.add(sessionID)
+
+				const handler = createChatMessageHandler(deps, helpers)
+				const input: ChatMessageInput = {
+					sessionID,
+					model: {
+						providerID: "openai",
+						modelID: "gpt-4o",
+					},
+				}
+				const output: ChatMessageOutput = {
+					message: {
+						model: { providerID: "openai", modelID: "gpt-4o" },
+					},
+				}
+
+				await handler(input, output)
+
+				// State should NOT be reset — the plugin is managing the fallback
+				expect(state.currentModel).toBe("google/gemini-pro")
+				expect(state.originalModel).toBe("anthropic/claude-opus-4-6")
+				// No abort should have been called
+				expect(helpers.abortSessionRequest).not.toHaveBeenCalled()
 			})
 		})
 	})

@@ -27,6 +27,13 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 	} = deps
 
 	const handleActivity = async (sessionID: string) => {
+		// Any model activity (text deltas, tool calls, diffs) proves the model
+		// is alive and producing output.  Mark first token received so the TTFT
+		// timeout handler skips the abort when it eventually fires.
+		if (!deps.sessionFirstTokenReceived.get(sessionID)) {
+			deps.sessionFirstTokenReceived.set(sessionID, true)
+		}
+
 		if (sessionAwaitingFallbackResult.has(sessionID)) {
 			const resolvedAgent = resolveAgentForSession(sessionID, undefined)
 			helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
@@ -80,6 +87,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			deps.sessionFirstTokenReceived.delete(sessionID)
 			deps.sessionSelfAbortTimestamp.delete(sessionID)
 			deps.sessionParentID.delete(sessionID)
+			deps.sessionCompactionInFlight.delete(sessionID)
 			deps.sessionIdleResolvers.delete(sessionID)
 			deps.sessionLastMessageTime.delete(sessionID)
 			helpers.clearSessionFallbackTimeout(sessionID)
@@ -101,6 +109,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 
 		sessionRetryInFlight.delete(sessionID)
 		sessionAwaitingFallbackResult.delete(sessionID)
+		deps.sessionCompactionInFlight.delete(sessionID)
 		deps.sessionSelfAbortTimestamp.delete(sessionID)
 
 		const state = sessionStates.get(sessionID)
@@ -130,6 +139,19 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		}
 
 		if (sessionAwaitingFallbackResult.has(sessionID)) {
+			// ── COMPACTION IN-FLIGHT: SKIP SILENT-FAILURE DETECTION ──
+			// Compaction via session.command produces no message.updated events.
+			// session.idle firing during compaction does NOT mean the model
+			// failed — it means the session went idle between the original
+			// error and the compaction starting on the new model.  Wait for
+			// session.compacted (success) or TTFT timeout (failure).
+			if (deps.sessionCompactionInFlight.has(sessionID)) {
+				logInfo("session.idle during compaction in-flight — not a silent failure, waiting for session.compacted", {
+					sessionID,
+				})
+				return
+			}
+
 			// ── SILENT MODEL FAILURE DETECTION ──
 			// If we dispatched a fallback model (sessionAwaitingFallbackResult is
 			// set) but no first token was ever received, the model silently failed
@@ -383,6 +405,18 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			return
 		}
 
+		// ── COMPACTION IN-FLIGHT GUARD ──
+		// Compaction via session.command produces no standard events.  Any
+		// session.error arriving while compaction is running is from the
+		// pre-compaction model — suppress entirely.
+		if (deps.sessionCompactionInFlight.has(sessionID)) {
+			logInfo("Ignoring session.error during compaction in-flight", {
+				sessionID,
+				errorName: extractErrorName(error),
+			})
+			return
+		}
+
 		// ── SELF-ABORT GUARD ──
 		// If this is a MessageAbortedError from a plugin-initiated abort
 		// (TTFT timeout, pre-fallback abort, etc.), suppress it.  The handler
@@ -620,14 +654,16 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		if (!sessionID) return
 
 		const hadAwaiting = sessionAwaitingFallbackResult.has(sessionID)
+		const hadCompaction = deps.sessionCompactionInFlight.has(sessionID)
 
 		// Clear all fallback tracking state — compaction completed successfully
 		sessionAwaitingFallbackResult.delete(sessionID)
 		sessionRetryInFlight.delete(sessionID)
 		deps.sessionFirstTokenReceived.delete(sessionID)
+		deps.sessionCompactionInFlight.delete(sessionID)
 		helpers.clearSessionFallbackTimeout(sessionID)
 
-		if (hadAwaiting) {
+		if (hadAwaiting || hadCompaction) {
 			logInfo("Compaction completed, clearing fallback state", { sessionID })
 		}
 	}

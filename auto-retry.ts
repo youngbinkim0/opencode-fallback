@@ -138,6 +138,11 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			// replay until it is stopped.  The downstream autoRetryWithFallback
 			// will handle the child-session concern (skipping its own abort
 			// since we already did it here).
+			//
+			// Clear compaction-in-flight: the compaction timed out, so the
+			// next attempt needs a clean slate (the new autoRetryWithFallback
+			// call will re-set the flag if it dispatches compaction again).
+			deps.sessionCompactionInFlight.delete(sessionID)
 			await abortSessionRequest(sessionID, "session.timeout")
 
 			if (state.pendingFallbackModel) {
@@ -291,38 +296,23 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		deps.sessionFirstTokenReceived.set(sessionID, false)
 		let retryDispatched = false
 		try {
-			// ── COMPACTION-SPECIFIC DISPATCH PATH ──
+			// ── COMPACTION FALLBACK PATH ──
 			// Compaction user messages contain `type: "compaction"` parts which
 			// `promptAsync` cannot accept (SDK only allows text/file/agent/subtask).
-			// When agent is "compaction", bypass message fetch + replayWithDegradation
-			// and use `session.command` to re-dispatch compaction on the fallback model.
+			// The `session.command` API also cannot override the compaction agent's
+			// model — OpenCode resolves the model internally via Agent.get("compaction").
+			//
+			// Strategy: skip the compaction parts entirely and find the REAL last
+			// user message (the one that triggered auto-compaction). Replay that
+			// on the fallback model via `promptAsync` — the fallback model may
+			// have a larger context window and handle the full history directly.
+			//
+			// This falls through to the normal replay path below, which already
+			// handles message fetch, degradation tiers, and dispatch.  We just
+			// need to make sure the message fetch skips `type: "compaction"` parts
+			// and finds a real user message with replayable content.
 			if (resolvedAgent === "compaction") {
-				// Second stale check after abort/delay
-				const postCheckState = sessionStates.get(sessionID)
-				const expectedCurrentModel = plan ? plan.failedModel : newModel
-				if (postCheckState && postCheckState.currentModel !== expectedCurrentModel) {
-					logInfo(`Skipping stale compaction fallback (${source}): state already at ${postCheckState.currentModel}, expected ${expectedCurrentModel}`, {
-						sessionID,
-						staleModel: newModel,
-						currentModel: postCheckState.currentModel,
-					})
-					deferredToOtherHandler = true
-					return false
-				}
-
-				// Duplicate dispatch guard
-				if (sessionAwaitingFallbackResult.has(sessionID)) {
-					logInfo(`Skipping duplicate compaction fallback dispatch (${source})`, {
-						sessionID,
-						model: newModel,
-					})
-					deferredToOtherHandler = true
-					return false
-				}
-
-				sessionAwaitingFallbackResult.add(sessionID)
-
-				logInfo(`Compaction fallback: dispatching via session.command (${source})`, {
+				logInfo(`Compaction fallback: replaying last user message via promptAsync (${source})`, {
 					sessionID,
 					model: newModel,
 				})
@@ -334,7 +324,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						.showToast({
 							body: {
 								title: "Compaction Fallback",
-								message: `Compaction switching to ${modelName}`,
+								message: `Compaction failed — retrying on ${modelName}`,
 								variant: "warning",
 								duration: 5000,
 							},
@@ -342,59 +332,10 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						.catch(() => {})
 				}
 
-				await ctx.client.session.command({
-					path: { id: sessionID },
-					body: {
-						command: "compact",
-						model: newModel,
-						agent: "compaction",
-					},
-					query: { directory: ctx.directory },
-				})
-
-				logInfo(`Compaction command accepted by host (${source})`, {
-					sessionID,
-					model: newModel,
-				})
-
-				// Commit fallback plan after successful dispatch
-				let commitSucceeded = true
-				if (plan) {
-					const stateToCommit = sessionStates.get(sessionID)
-					if (stateToCommit) {
-						const committed = commitFallback(stateToCommit, plan)
-						if (committed) {
-							logInfo(`Committed compaction fallback state (${source})`, {
-								sessionID,
-								newModel: plan.newModel,
-								failedModel: plan.failedModel,
-								attemptCount: stateToCommit.attemptCount,
-							})
-						} else {
-							logInfo(`Compaction fallback state already committed — aborting duplicate (${source})`, {
-								sessionID,
-								newModel: plan.newModel,
-							})
-							commitSucceeded = false
-							await abortSessionRequest(sessionID, `duplicate-compaction.${source}`)
-						}
-					}
-				}
-
-				if (!commitSucceeded) {
-					deferredToOtherHandler = true
-					return false
-				}
-
-				scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
-				retryDispatched = true
-
-				logInfo(`Compaction fallback dispatched successfully (${source})`, {
-					sessionID,
-					model: newModel,
-				})
-
-				return retryDispatched
+				// Clear the compaction agent so the normal replay path doesn't
+				// pass agent="compaction" to promptAsync (which would confuse
+				// OpenCode into treating this as a compaction request).
+				resolvedAgent = undefined
 			}
 
 			// ── NORMAL REPLAY DISPATCH PATH ──
@@ -410,6 +351,10 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			// Prefer replaying the last user message.  In child subagent sessions,
 			// the latest replayable prompt can be non-user (e.g. system/tool), so
 			// fall back to the last non-assistant message with parts.
+			//
+			// Skip messages that ONLY contain "compaction" type parts — these are
+			// compaction-internal messages that promptAsync cannot replay.  We need
+			// the real user message that preceded the compaction attempt.
 			let lastUserPartsRaw: any[] | undefined
 			let lastNonAssistantPartsRaw: any[] | undefined
 
@@ -418,6 +363,13 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				const role = ((m?.info?.role ?? (m as any)?.role ?? "") as string).toLowerCase()
 				const parts = m?.parts ?? (m?.info?.parts as any[] | undefined)
 				if (!parts || parts.length === 0) continue
+
+				// Skip compaction-only messages: parts where every part is
+				// type "compaction" (not replayable via promptAsync).
+				const hasOnlyCompactionParts = parts.every(
+					(p: any) => p.type === "compaction"
+				)
+				if (hasOnlyCompactionParts) continue
 
 				if (!lastNonAssistantPartsRaw && role !== "assistant") {
 					lastNonAssistantPartsRaw = parts
@@ -472,9 +424,12 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					replaySource,
 				})
 
-				// Cast raw parts to MessagePart (runtime parts may have any shape)
+				// Cast raw parts to MessagePart (runtime parts may have any shape).
+				// Filter out "compaction" type parts — these are internal to
+				// OpenCode's compaction and not replayable via promptAsync.
 				const allParts: MessagePart[] = replayPartsRaw.filter(
-					(p): p is MessagePart => typeof p.type === "string"
+					(p): p is MessagePart =>
+						typeof p.type === "string" && p.type !== "compaction"
 				)
 
 				logInfo(`Prepared replay payload (${source})`, {
@@ -598,6 +553,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				error: String(retryError),
 			})
 			sessionAwaitingFallbackResult.delete(sessionID)
+			deps.sessionCompactionInFlight.delete(sessionID)
 			clearSessionFallbackTimeout(sessionID)
 		} finally {
 			// Note: sessionRetryInFlight is managed by the caller, not here.
@@ -605,6 +561,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			// IS dispatching — they own the flag now.
 			if (!retryDispatched && !deferredToOtherHandler) {
 				sessionAwaitingFallbackResult.delete(sessionID)
+				deps.sessionCompactionInFlight.delete(sessionID)
 				clearSessionFallbackTimeout(sessionID)
 				const state = sessionStates.get(sessionID)
 				if (state?.pendingFallbackModel) {
@@ -673,6 +630,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				deps.sessionParentID.delete(sessionID)
 				deps.sessionIdleResolvers.delete(sessionID)
 				deps.sessionLastMessageTime.delete(sessionID)
+				deps.sessionCompactionInFlight.delete(sessionID)
 				clearSessionFallbackTimeout(sessionID)
 				cleanedCount++
 			}

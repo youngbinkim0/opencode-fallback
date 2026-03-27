@@ -43,6 +43,7 @@ function createMockDeps(configOverrides?: Partial<FallbackPluginConfig>): HookDe
 		sessionParentID: new Map(),
 		sessionIdleResolvers: new Map(),
 		sessionLastMessageTime: new Map(),
+		sessionCompactionInFlight: new Set(),
 	}
 }
 

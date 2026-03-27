@@ -285,9 +285,42 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 		}
 
 		if (sessionID && role === "assistant" && error) {
+			// ── COMPACTION IN-FLIGHT GUARD ──
+			// Compaction via session.command produces no message.updated events.
+			// Any error arriving while compaction is running is from the
+			// pre-compaction model (stale) — suppress it entirely.
+			if (deps.sessionCompactionInFlight.has(sessionID)) {
+				logInfo("Ignoring message.updated error during compaction in-flight", {
+					sessionID,
+					model,
+					errorName: extractErrorName(error),
+				})
+				return
+			}
+
 			// Ignore stale errors from models we already moved past
 			const currentState = sessionStates.get(sessionID)
 			if (currentState && model && model !== currentState.currentModel) {
+				const retryableStaleError = isRetryableError(
+					error,
+					config.retry_on_errors,
+					config.retryable_error_patterns
+				)
+				const canResyncToErrorModel =
+					retryableStaleError &&
+					!currentState.pendingFallbackModel &&
+					!sessionAwaitingFallbackResult.has(sessionID)
+
+				if (canResyncToErrorModel) {
+					logInfo("Resyncing state to error model before fallback planning", {
+						sessionID,
+						previousModel: currentState.currentModel,
+						errorModel: model,
+						errorName: extractErrorName(error),
+					})
+					currentState.currentModel = model
+					sessionLastAccess.set(sessionID, Date.now())
+				} else {
 				logInfo("Ignoring stale error from previous model", {
 					sessionID,
 					staleModel: model,
@@ -295,6 +328,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 					errorName: extractErrorName(error),
 				})
 				return
+				}
 			}
 
 			// Safety net: if this is a MessageAbortedError and we recently

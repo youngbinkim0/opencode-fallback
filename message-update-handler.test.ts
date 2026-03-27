@@ -42,6 +42,7 @@ function createMockDeps(configOverrides?: Partial<FallbackPluginConfig>): HookDe
 		sessionParentID: new Map(),
 		sessionIdleResolvers: new Map(),
 		sessionLastMessageTime: new Map(),
+		sessionCompactionInFlight: new Set(),
 	}
 }
 
@@ -252,7 +253,7 @@ describe("message-update-handler", () => {
 		})
 
 		describe("#when error is from stale model", () => {
-			test("#then ignores the error", async () => {
+			test("#then ignores non-retryable stale error", async () => {
 				const deps = createMockDeps()
 				const helpers = createMockHelpers()
 				const sessionID = "ses_stale_msg"
@@ -266,6 +267,35 @@ describe("message-update-handler", () => {
 
 				const handler = createMessageUpdateHandler(deps, helpers)
 
+				// Non-retryable error (403) from stale model — should be ignored
+				await handler({
+					info: {
+						sessionID,
+						role: "assistant",
+						model: "google/antigravity",
+						error: { statusCode: 403, message: "forbidden" },
+					},
+				})
+
+				// Error from google/antigravity but current model is anthropic — stale and non-retryable
+				expect(helpers.autoRetryWithFallback).not.toHaveBeenCalled()
+			})
+
+			test("#then resyncs retryable stale error to error model and plans fallback", async () => {
+				const deps = createMockDeps()
+				const helpers = createMockHelpers()
+				const sessionID = "ses_stale_resync"
+
+				const state = createFallbackState("google/antigravity")
+				state.currentModel = "anthropic/claude-opus-4-6"
+				state.attemptCount = 1
+				deps.sessionStates.set(sessionID, state)
+
+				deps.globalFallbackModels = ["openai/gpt-4o"]
+
+				const handler = createMessageUpdateHandler(deps, helpers)
+
+				// Retryable error (500) from stale model — resyncs state and retries
 				await handler({
 					info: {
 						sessionID,
@@ -275,8 +305,8 @@ describe("message-update-handler", () => {
 					},
 				})
 
-				// Error from google/antigravity but current model is anthropic — stale
-				expect(helpers.autoRetryWithFallback).not.toHaveBeenCalled()
+				// Retryable stale error triggers resync → fallback planning
+				expect(helpers.autoRetryWithFallback).toHaveBeenCalled()
 			})
 		})
 

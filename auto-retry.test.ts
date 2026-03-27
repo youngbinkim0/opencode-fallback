@@ -46,6 +46,7 @@ function createMockDeps(overrides?: Partial<{
 		sessionParentID: new Map(),
 		sessionIdleResolvers: new Map(),
 		sessionLastMessageTime: new Map(),
+		sessionCompactionInFlight: new Set(),
 	}
 }
 
@@ -1135,15 +1136,13 @@ describe("auto-retry integration", () => {
 
 	describe("#given compaction-origin fallback dispatch", () => {
 		describe("#when agent is 'compaction'", () => {
-			test("#then calls session.command with command:'compact' and fallback model, NOT promptAsync", async () => {
-				const commandCalls: any[] = []
+			test("#then skips compaction parts and replays real user message via promptAsync", async () => {
 				const deps = createMockDeps({
 					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "explain quantum computing" }] },
+						{ info: { role: "assistant" }, parts: [{ type: "text", text: "Quantum computing..." }] },
 						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
 					],
-					commandFn: async (args: any) => {
-						commandCalls.push(args)
-					},
 				})
 
 				const { createFallbackState } = await import("./fallback-state")
@@ -1166,37 +1165,29 @@ describe("auto-retry integration", () => {
 				)
 
 				expect(result).toBe(true)
-				// Must use session.command, NOT promptAsync
-				expect(commandCalls.length).toBe(1)
-				expect(commandCalls[0].body.command).toBe("compact")
-				expect(commandCalls[0].body.model).toBe("anthropic/claude-sonnet-4-20250514")
-				expect(commandCalls[0].body.agent).toBe("compaction")
-				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+				// Must use promptAsync (compaction parts are non-replayable via session.command)
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
+				// session.command should NOT be called
+				expect((deps.ctx.client.session as any).command).not.toHaveBeenCalled()
 			})
 		})
 
-		describe("#when agent is 'compaction' and resolving fallback models", () => {
-			test("#then resolves models via getFallbackModelsForSession with agent='compaction'", async () => {
+		describe("#when only compaction parts exist and no prior user message", () => {
+			test("#then returns false (no replayable content)", async () => {
 				const deps = createMockDeps({
 					messagesData: [
 						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
 					],
 				})
-				// Set up per-agent compaction config with specific fallback models
-				deps.agentConfigs = {
-					compaction: {
-						model: "openai/gpt-4o",
-						fallback_models: ["anthropic/claude-sonnet-4-20250514", "google/gemini-2.0-pro"],
-					},
-				}
 
 				const { createFallbackState } = await import("./fallback-state")
 				const state = createFallbackState("openai/gpt-4o")
-				deps.sessionStates.set("ses_compact_cfg", state)
+				deps.sessionStates.set("ses_compact_only", state)
+				deps.globalFallbackModels = ["anthropic/claude-sonnet-4-20250514"]
 
 				const helpers = createAutoRetryHelpers(deps)
 				const result = await helpers.autoRetryWithFallback(
-					"ses_compact_cfg",
+					"ses_compact_only",
 					"anthropic/claude-sonnet-4-20250514",
 					"compaction",
 					"session.error",
@@ -1208,17 +1199,17 @@ describe("auto-retry integration", () => {
 					}
 				)
 
-				expect(result).toBe(true)
-				// Should use session.command since agent is "compaction"
-				expect((deps.ctx.client.session as any).command).toHaveBeenCalled()
+				// No replayable user message found after filtering compaction parts
+				expect(result).toBe(false)
 				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
 			})
 		})
 
-		describe("#when compaction dispatch succeeds", () => {
+		describe("#when compaction dispatch succeeds via promptAsync", () => {
 			test("#then commits fallback state, marks session awaiting, and schedules timeout", async () => {
 				const deps = createMockDeps({
 					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello world" }] },
 						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
 					],
 				})
@@ -1243,9 +1234,8 @@ describe("auto-retry integration", () => {
 				)
 
 				expect(result).toBe(true)
-				// Must use session.command for compaction, NOT promptAsync
-				expect((deps.ctx.client.session as any).command).toHaveBeenCalled()
-				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+				// Uses promptAsync (not session.command)
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
 				// State should be committed (currentModel advanced)
 				expect(state.currentModel).toBe("anthropic/claude-sonnet-4-20250514")
 				expect(state.attemptCount).toBe(1)
@@ -1256,14 +1246,15 @@ describe("auto-retry integration", () => {
 			})
 		})
 
-		describe("#when compaction dispatch fails", () => {
+		describe("#when compaction replay dispatch fails", () => {
 			test("#then clears awaiting/retry-in-flight state so session does not stall", async () => {
 				const deps = createMockDeps({
 					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
 						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
 					],
-					commandFn: async () => {
-						throw new Error("Command dispatch failed")
+					promptAsyncFn: async () => {
+						throw new Error("promptAsync dispatch failed")
 					},
 				})
 
@@ -1295,10 +1286,11 @@ describe("auto-retry integration", () => {
 		})
 
 		describe("#when compaction fallback triggers with notify_on_fallback enabled", () => {
-			test("#then fires toast notification about compaction switching models", async () => {
+			test("#then fires toast notification about compaction failing", async () => {
 				const toastCalls: any[] = []
 				const deps = createMockDeps({
 					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "help me" }] },
 						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
 					],
 					showToastFn: async (args: any) => {
@@ -1326,7 +1318,7 @@ describe("auto-retry integration", () => {
 					}
 				)
 
-				// Toast should mention compaction switching
+				// Toast should mention compaction
 				expect(toastCalls.length).toBeGreaterThanOrEqual(1)
 				const compactionToast = toastCalls.find((t: any) =>
 					t.body.message.toLowerCase().includes("compaction")
@@ -1337,10 +1329,11 @@ describe("auto-retry integration", () => {
 		})
 
 		describe("#when compaction fallback exhausts all models", () => {
-			test("#then fires exhaustion toast notification", async () => {
+			test("#then fires exhaustion toast via normal fallback path", async () => {
 				const toastCalls: any[] = []
 				const deps = createMockDeps({
 					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
 						{ info: { role: "user" }, parts: [{ type: "compaction" }] },
 					],
 					showToastFn: async (args: any) => {
@@ -1357,13 +1350,6 @@ describe("auto-retry integration", () => {
 				deps.globalFallbackModels = ["anthropic/claude-sonnet-4-20250514"]
 
 				const helpers = createAutoRetryHelpers(deps)
-
-				// The autoRetryWithFallback itself doesn't handle exhaustion toast —
-				// it's the caller (message-update-handler / event-handler) that plans
-				// and dispatches. But when agent=compaction and no more models remain,
-				// the dispatch should indicate exhaustion and a toast should fire.
-				// For this test, we call autoRetryWithFallback directly to verify the
-				// compaction path signals exhaustion correctly.
 				const result = await helpers.autoRetryWithFallback(
 					"ses_compact_exhaust",
 					"anthropic/claude-sonnet-4-20250514",
@@ -1377,10 +1363,8 @@ describe("auto-retry integration", () => {
 					}
 				)
 
-				// Should dispatch since a plan was provided (exhaustion is checked
-				// at the planning level, not dispatch level). The toast fires on
-				// the compaction dispatch path.
-				expect((deps.ctx.client.session as any).command).toHaveBeenCalled()
+				// Dispatch proceeds via promptAsync (compaction falls through to normal path)
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
 				expect(toastCalls.length).toBeGreaterThanOrEqual(1)
 				const compactionToast = toastCalls.find((t: any) =>
 					t.body.message.toLowerCase().includes("compaction")
