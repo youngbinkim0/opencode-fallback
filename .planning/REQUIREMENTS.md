@@ -37,6 +37,16 @@ Requirements for milestone v1.1 Logic Review. Each maps to roadmap phases.
 
 Deferred to future milestone. Tracked but not in current roadmap.
 
+## Post-v1.1 Active Requirements
+
+Added after the v1.1 audit milestone to cover compaction-specific fallback behavior discovered in production use.
+
+### Compaction Fallback
+
+- [x] **COMP-01**: Compaction-origin fallback uses the OpenCode compaction command path with the fallback model — `type: "compaction"` parts are never replayed through `promptAsync`
+- [ ] **COMP-02**: Successful compaction fallback is recognized through compaction lifecycle signals (`experimental.session.compacting`, `session.compacted`) — the plugin does not wait for assistant text or a fixed timeout to mark success
+- [x] **TEST-06**: Regression tests cover compaction-origin fallback dispatch, lifecycle cleanup, and silent-failure prevention
+
 ### Observability
 
 - **OBSV-01**: Fallback event metrics (count, duration, which models failed/succeeded)
@@ -83,6 +93,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | TEST-03 | Phase 7 + Phase 8 (race condition tests) | Complete |
 | TEST-04 | Phase 5 + Phase 8 (boundary condition tests) | Complete |
 | TEST-05 | Phase 9: Plugin Init & Consolidation | Complete |
+| COMP-01 | Phase 11: Compaction-Specific Fallback | Planned |
+| COMP-02 | Phase 11: Compaction-Specific Fallback | Planned |
+| TEST-06 | Phase 11: Compaction-Specific Fallback | Planned |
 
 **Coverage:**
 - v1.1 requirements: 17 total

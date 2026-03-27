@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: Logic Review
-status: complete
+status: in-progress
 last_updated: "2026-03-27"
-last_activity: 2026-03-27 — Completed Phase 10 TTFT & Race Fix (production log audit)
+last_activity: 2026-03-27 — Completed Phase 11 Plan 01 (compaction fallback dispatch)
 progress:
-  total_phases: 6
+  total_phases: 7
   completed_phases: 6
-  total_plans: 11
-  completed_plans: 11
-  percent: 100
+  total_plans: 13
+  completed_plans: 12
+  percent: 92
 ---
 
 # Project State
@@ -20,16 +20,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-26)
 
 **Core value:** Uninterrupted AI coding sessions — when one model fails, work continues automatically on another without manual intervention.
-**Current focus:** Milestone v1.1 Logic Review — COMPLETE
+**Current focus:** Phase 11 Compaction-Specific Fallback — Plan 01 complete, Plan 02 pending
 
 ## Current Position
 
-Phase: 10 of 10 (TTFT & Race Fix)
-Plan: 1 of 1 in current phase
-Status: Milestone complete
-Last activity: 2026-03-27 — Fixed P0 TTFT false-abort and P1 dual-handler race condition
+Phase: 11 of 11 (Compaction-Specific Fallback)
+Plan: 2 of 2 in current phase
+Status: In progress
+Last activity: 2026-03-27 — Implemented compaction-aware fallback dispatch via session.command
 
-Progress: [██████████] 100%
+Progress: [█████████░] 92%
 
 ## Performance Metrics
 
@@ -84,14 +84,19 @@ Progress: [██████████] 100%
 - [Phase 09]: logger.ts now has dedicated test file with 8 tests covering INFO/ERROR levels, context serialization, timestamps, multi-line appending
 - [Phase 09]: getLogFilePath in logger.ts is exported but unused — kept as debugging utility
 - [Phase 09]: All 4 bugs from phases 5-8 have regression tests. Every source module has a test file. 354 tests pass.
+- [Phase 11-01]: Compaction detection uses resolvedAgent === "compaction" — no part-type inspection needed
+- [Phase 11-01]: Compaction branch inserted before normal replay path — early return avoids message fetch overhead
+- [Phase 11-01]: session.command passes model as string (providerID/modelID) — matches SDK command signature
+- [Phase 11-01]: Toast notification fires inside compaction branch, not in callers — simpler, no caller changes needed
 
 ### Roadmap Evolution
 
 - Phase 10 added and completed: Fix TTFT timeout false-abort and dual-handler race condition (discovered via production log audit)
+- Phase 11 added: Compaction-specific fallback — investigate how compaction works, why `type: "compaction"` parts fail during replay, and implement compaction-aware fallback path
 
 ### Pending Todos
 
-None — milestone complete.
+- Phase 11 Plan 02: Wire compaction lifecycle hooks/events for success detection
 
 ### Blockers/Concerns
 
@@ -99,4 +104,4 @@ None.
 
 ## Session Continuity
 
-Milestone v1.1 Logic Review is complete. All 6 phases (5-10) finished with 358 passing tests. Phase 10 fixed two critical production bugs found during log audit.
+Phase 11 Plan 01 complete. Compaction-aware fallback dispatch implemented with 6 new regression tests (47 total auto-retry tests). Ready for Plan 02 (lifecycle hooks).

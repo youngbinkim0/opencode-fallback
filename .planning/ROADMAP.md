@@ -114,9 +114,10 @@ Phases 5 → 6 → 7 → 8 → 9 (dependency chain: foundational → dependent �
 | 8. Chat Handler & Subagent Sync | 2/2 | Complete | 2026-03-27 |
 | 9. Plugin Init & Consolidation | 2/2 | Complete | 2026-03-27 |
 | 10. TTFT & Race Fix | 1/1 | Complete | 2026-03-27 |
+| 11. Compaction-Specific Fallback | 1/2 | In Progress|  |
 
 **Totals:**
-- Phases: 6
+- Phases: 7
 - Plans: 11
 - Requirements: 17 mapped + 2 production bugs fixed
 
@@ -133,3 +134,14 @@ Phases 5 → 6 → 7 → 8 → 9 (dependency chain: foundational → dependent �
 
 Plans:
 - [x] 10-01 — Fix P0 TTFT false-abort + P1 dual-handler race + regression tests (completed 2026-03-27)
+
+### Phase 11: Compaction-Specific Fallback
+
+**Goal:** Investigate how OpenCode's `/compact` command works internally, identify why `type: "compaction"` parts cannot be replayed through `promptAsync`, and implement a compaction-aware fallback path that correctly handles compaction failures without silent 30s timeouts
+**Requirements**: COMP-01, COMP-02, TEST-06
+**Depends on:** Phase 10
+**Plans:** 1/2 plans executed
+
+Plans:
+- [ ] 11-01-PLAN.md — Add compaction-safe fallback dispatch using `session.command` instead of replaying `compaction` parts through `promptAsync`
+- [ ] 11-02-PLAN.md — Wire compaction lifecycle hooks/events so successful compaction fallback clears timeout/awaiting state without silent stalls
