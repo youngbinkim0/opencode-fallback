@@ -424,18 +424,6 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				const resolvedAgent =
 					await helpers.resolveAgentForSessionFromContext(sessionID, agent)
 
-				// Compaction sessions have a fixed model binding — neither
-				// session.command nor promptAsync can override the model.
-				// Skip fallback entirely and let OpenCode handle the failure.
-				if (resolvedAgent === "compaction") {
-					logInfo("Skipping fallback for compaction session (model override not supported)", {
-						sessionID,
-						model,
-						errorName: extractErrorName(error),
-					})
-					return
-				}
-
 				const fallbackModels = getFallbackModelsForSession(
 					sessionID,
 					resolvedAgent,

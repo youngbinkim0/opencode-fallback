@@ -529,15 +529,6 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 				agent
 			)
 
-			// Compaction sessions have a fixed model binding — skip fallback.
-			if (resolvedAgent === "compaction") {
-				logInfo("Skipping fallback for compaction session (model override not supported)", {
-					sessionID,
-					errorName: extractErrorName(error),
-				})
-				return
-			}
-
 			helpers.clearSessionFallbackTimeout(sessionID)
 
 			// Re-check pendingFallbackModel after the await — message.updated may
