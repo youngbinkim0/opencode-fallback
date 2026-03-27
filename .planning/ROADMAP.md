@@ -2,108 +2,119 @@
 
 ## Overview
 
-Four targeted enhancements to an existing, working OpenCode fallback plugin. Each phase delivers one complete feature with its tests, ordered by ascending complexity: fix the data-loss bug (full replay), add config infrastructure (global fallback), add the most-requested community feature (auto-recovery), then tackle the most complex change (TTFT timeout). Each feature is independently valuable and the codebase is stable between phases.
+**Milestone v1.1: Logic Review** — Proactive audit of the entire fallback plugin. Each phase audits a related group of modules, fixes bugs found, removes dead code, simplifies where safe, and adds comprehensive tests. Ordered by dependency: foundational modules first (error classification, state, config), then the logic that depends on them (retry, replay, timeout/events, chat handler, subagent sync), then plugin integration, and finally a consolidation pass for cross-cutting concerns.
 
-## Phases
+## v1.0 History (Complete)
 
-**Phase Numbering:**
-- Integer phases (1, 2, 3, 4): Planned milestone work
-- Decimal phases (e.g., 2.1): Urgent insertions (marked with INSERTED)
+- [x] Phase 1: Full Message Replay (completed 2026-03-19)
+- [x] Phase 2: Global Fallback Config (completed 2026-03-19)
+- [x] Phase 3: Auto-Recovery (completed 2026-03-19)
+- [x] Phase 4: TTFT-Based Timeout (completed 2026-03-19)
+- [x] Phase 4.1: Subagent Fallback Fix (completed 2026-03-23)
 
-- [x] **Phase 1: Full Message Replay** - Replay all user message parts on fallback retry, not just text (completed 2026-03-19)
-- [x] **Phase 2: Global Fallback Config** - Default fallback chain for agents without per-agent config (completed 2026-03-19)
-- [x] **Phase 3: Auto-Recovery** - Automatic switch back to primary model when cooldown expires (completed 2026-03-19)
-- [x] **Phase 4: TTFT-Based Timeout** - Time-to-first-token timeout replaces fixed timer for smarter fallback (completed 2026-03-19)
-- [~] **Phase 4.1: Subagent Fallback Fix** - INSERTED — Fix empty task results when child session fallback triggers (parent receives actual fallback response)
+## v1.1 Phases
+
+- [ ] **Phase 5: Error Classification & State Audit** — Audit error-classifier.ts and fallback-state.ts for correctness bugs, dead code, and test gaps
+- [ ] **Phase 6: Config & Retry Logic Audit** — Audit config-reader.ts and auto-retry.ts for precedence bugs, missed retry conditions, dead code
+- [ ] **Phase 7: Replay & Timeout/Event Audit** — Audit message-replay.ts, event-handler.ts, message-update-handler.ts for timer leaks, race conditions, dropped parts
+- [ ] **Phase 8: Chat Handler & Subagent Sync Audit** — Audit chat-message-handler.ts and subagent-result-sync.ts for recovery races, polling bugs, boundary conditions
+- [ ] **Phase 9: Plugin Init & Consolidation** — Audit index.ts hook registration, add logger.ts tests, cross-module regression tests, final coverage sweep
 
 ## Phase Details
 
-### Phase 1: Full Message Replay
-**Goal**: Users' multi-modal messages (images, files, tool results) survive fallback retries intact instead of being silently reduced to text-only
-**Depends on**: Nothing (first phase)
-**Requirements**: RTRY-01, RTRY-02, TEST-04
+### Phase 5: Error Classification & State Audit
+**Goal**: Every error classification path and every state transition is verified correct — no misclassified errors, no inconsistent states, no dead code
+**Depends on**: Nothing (foundational modules, no dependencies)
+**Requirements**: AUDT-01, AUDT-02, QUAL-01, QUAL-02, TEST-01, TEST-02, TEST-04
 **Success Criteria** (what must be TRUE):
-  1. When a fallback retry fires, all parts of the user's last message (text, images, files, tool results) are sent to the fallback model
-  2. If the fallback model rejects non-text parts, the plugin falls back to text-only replay and logs a warning — the retry does not fail entirely
-  3. Unit tests verify full replay with mixed part types and graceful degradation to text-only
+  1. Every error string/status code path in error-classifier.ts maps to the correct classification — verified by tests with real-world error messages from each provider
+  2. Every state transition in fallback-state.ts is exercised by tests — including edge cases (stale cooldowns, concurrent session access, orphaned entries after TTL expiry)
+  3. Dead code in both modules identified and removed (or documented why it must stay)
+  4. Adversarial inputs tested: undefined error objects, empty strings, non-standard status codes, null properties
+  5. Boundary conditions tested: cooldown at exact expiry time, max attempts at boundary, empty/single-model fallback chains
+**Plans:** 2/2 plans complete
+
+Plans:
+- [x] 05-01-PLAN.md — Audit error-classifier.ts: logic review, dead code removal, comprehensive test coverage
+- [x] 05-02-PLAN.md — Audit fallback-state.ts: state transition review, dead code removal, adversarial/boundary tests
+
+### Phase 6: Config & Retry Logic Audit
+**Goal**: Config resolution has no precedence bugs and retry logic fires correctly in every condition — no silent config misreads, no missed retries, no false retries
+**Depends on**: Phase 5 (state module may be simplified)
+**Requirements**: AUDT-03, AUDT-04, QUAL-01, QUAL-02, TEST-01, TEST-02
+**Success Criteria** (what must be TRUE):
+  1. Every config resolution path (global-only, per-agent-only, both, neither, malformed) produces correct results — verified by tests
+  2. Every retry decision condition in auto-retry.ts is exercised — including edge cases where retry should NOT fire
+  3. Dead code in both modules identified and removed
+  4. Adversarial inputs tested: malformed config files, missing fields, wrong types, empty arrays
 **Plans:** 0/2 plans complete
 
 Plans:
-- [ ] 01-01-PLAN.md — TDD: Message replay module with tiered degradation (types + pure functions + unit tests)
-- [ ] 01-02-PLAN.md — Integrate tiered replay into auto-retry.ts + integration tests
+- [ ] 06-01-PLAN.md — Audit config-reader.ts: precedence logic, edge cases, dead code, comprehensive tests
+- [ ] 06-02-PLAN.md — Audit auto-retry.ts: retry decision paths, false positive/negative conditions, dead code, tests
 
-### Phase 2: Global Fallback Config
-**Goal**: Users configure one default fallback chain instead of duplicating it across every agent
-**Depends on**: Phase 1
-**Requirements**: CONF-01, CONF-02, TEST-03
+### Phase 7: Replay & Timeout/Event Audit
+**Goal**: Message replay preserves all part types and TTFT timeout logic has no timer leaks or race conditions — no silently dropped content, no mid-stream aborts
+**Depends on**: Phase 6 (retry module may be simplified)
+**Requirements**: AUDT-05, AUDT-06, QUAL-01, QUAL-02, QUAL-03, TEST-01, TEST-03
 **Success Criteria** (what must be TRUE):
-  1. A `global_fallback_models` array in the plugin config file provides a default fallback chain for any agent without its own `fallback_models`
-  2. An agent's per-agent `fallback_models` completely overrides the global chain when both exist — no merging, no confusion
-  3. Unit tests verify config resolution with global-only, per-agent-only, both present, and neither present scenarios
+  1. Every message part type survives replay — verified by tests with all known part types including edge cases (empty parts, huge parts, mixed arrays)
+  2. TTFT timeout timer is correctly armed, cleared on first token, and never fires mid-stream — verified by timing-sensitive tests
+  3. message-update-handler.ts has a dedicated test file with full coverage
+  4. No timer leaks: every armed timer is cleared in all exit paths (success, error, fallback)
+  5. Race conditions tested: token arrival simultaneous with timeout, multiple rapid message updates
 **Plans:** 0/2 plans complete
 
 Plans:
-- [ ] 02-01-PLAN.md — TDD: Config resolution with global fallback (types + pure functions + unit tests)
-- [ ] 02-02-PLAN.md — Wire global config through plugin lifecycle + README docs
+- [ ] 07-01-PLAN.md — Audit message-replay.ts: part type handling, degradation logic, dead code, edge case tests
+- [ ] 07-02-PLAN.md — Audit event-handler.ts + message-update-handler.ts: timer lifecycle, race conditions, create test file for message-update-handler
 
-### Phase 3: Auto-Recovery
-**Goal**: Sessions automatically return to the primary model once it recovers, ending the permanent-degradation problem
-**Depends on**: Phase 2
-**Requirements**: RCVR-01, RCVR-02, RCVR-03, TEST-02
+### Phase 8: Chat Handler & Subagent Sync Audit
+**Goal**: Recovery logic and subagent sync have no prompt-boundary races or polling bugs — recovery fires exactly when it should, subagent wait always terminates correctly
+**Depends on**: Phase 7 (timeout/event modules may be simplified)
+**Requirements**: AUDT-07, AUDT-08, QUAL-01, QUAL-02, TEST-01, TEST-03, TEST-04
 **Success Criteria** (what must be TRUE):
-  1. Before each new user prompt, the plugin checks if the primary model's cooldown has expired and switches back to it if available
-  2. On recovery, fallback state resets cleanly (fallbackIndex and attemptCount reset) but the cooldown map of previously-failed models is preserved
-  3. A toast notification appears when recovering to primary (when `notify_on_fallback` is enabled)
-  4. Recovery does not trigger during an active fallback chain (guarded by retry-in-flight flags)
-  5. Unit tests cover recovery at prompt boundary, state reset with cooldown preservation, and the active-chain guard
+  1. Recovery fires exactly at prompt boundary and never during an active fallback chain — verified by concurrent scenario tests
+  2. Model override logic in chat-message-handler.ts produces correct model for every state combination
+  3. Subagent polling always terminates within bounded time — including when fallback itself fails
+  4. Empty result detection catches all variants (whitespace, malformed XML, partial tags)
+  5. Race conditions tested: recovery trigger during active retry, concurrent subagent completions, overlapping tool.execute.after calls
 **Plans:** 0/2 plans complete
 
 Plans:
-- [ ] 03-01-PLAN.md — TDD: recoverToOriginal() pure function with unit tests
-- [ ] 03-02-PLAN.md — Wire recovery into chat-message-handler + integration tests
+- [ ] 08-01-PLAN.md — Audit chat-message-handler.ts: recovery logic, model override, prompt-boundary races, tests
+- [ ] 08-02-PLAN.md — Audit subagent-result-sync.ts: polling logic, empty detection variants, bounded wait, race tests
 
-### Phase 4: TTFT-Based Timeout
-**Goal**: Timeout only fires when a model produces no tokens at all — streaming models are never aborted mid-response
-**Depends on**: Phase 3
-**Requirements**: RTRY-03, RTRY-04, RTRY-05, CONF-03, CONF-04, TEST-01
+### Phase 9: Plugin Init & Consolidation
+**Goal**: Plugin initialization is correct, logger is tested, and cross-module integration has regression coverage for every bug found in phases 5-8
+**Depends on**: Phase 8 (all module audits complete)
+**Requirements**: AUDT-09, QUAL-01, QUAL-02, QUAL-03, TEST-01, TEST-05
 **Success Criteria** (what must be TRUE):
-  1. When `ttft_timeout_seconds` is configured, the timeout fires only if no first assistant token arrives within the period — a model that starts streaming is never aborted by this timer
-  2. The TTFT timeout timer is cleared when the first assistant token is detected via `message.updated`
-  3. The existing `timeout_seconds` config continues to work unchanged for backward compatibility
-  4. A model actively streaming tokens (mid-stream) is never aborted by the fallback timeout
-  5. Unit tests cover TTFT timer arming, cancellation on first token, backward-compatible fixed timeout, and mid-stream protection
-**Plans:** 2 plans
+  1. Hook registration order in index.ts is verified — no ordering dependencies that could cause missed events
+  2. logger.ts has a dedicated test file with coverage of all log paths
+  3. Regression tests exist for every bug fixed in phases 5-8
+  4. Final coverage sweep: every branch in every source module has at least one test
+  5. All tests pass (existing 178+ new tests)
+**Plans:** 0/2 plans complete
 
 Plans:
-- [ ] 04-01: TBD
-- [ ] 04-02: TBD
-- [ ] 04-03: TBD
-
-### Phase 4.1: Subagent Fallback Fix
-**Goal**: When a child (subagent/Task) session's model fails and the fallback plugin triggers, the parent agent receives the actual fallback model's response instead of an empty `<task_result>`
-**Depends on**: Phase 4
-**Requirements**: None (inserted phase — bug fix)
-**Success Criteria** (what must be TRUE):
-  1. When a child session's model fails and fallback triggers, the `tool.execute.after` hook intercepts the empty `<task_result>` and blocks until the fallback completes
-  2. The parent agent receives the actual fallback response content instead of an empty result
-  3. Polling/waiting has a configurable maximum wait time with graceful degradation if all fallbacks fail
-  4. All existing fallback triggers (error, timeout, status) are covered
-  5. Unit tests verify: empty result detection, session ID extraction, polling/waiting, response replacement, and timeout/graceful degradation
-**Plans**: 2 plans
-
-Plans:
-- [x] 04.1-01-PLAN.md — TDD: subagent empty task-result synchronization helpers (detection, session ID extraction, bounded polling)
-- [x] 04.1-02-PLAN.md — Wire tool.execute.after replacement flow + remove deferred proactive redirection + regression coverage
+- [ ] 09-01-PLAN.md — Audit index.ts: hook registration, initialization order, logger.ts tests
+- [ ] 09-02-PLAN.md — Consolidation: regression tests for all bugs found, final coverage sweep, test run
 
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4
+Phases 5 → 6 → 7 → 8 → 9 (dependency chain: foundational → dependent → integration)
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Full Message Replay | 2/2 | Complete    | 2026-03-19 |
-| 2. Global Fallback Config | 2/2 | Complete    | 2026-03-19 |
-| 3. Auto-Recovery | 2/2 | Complete | 2026-03-19 |
-| 4. TTFT-Based Timeout | 2/2 | Complete | 2026-03-19 |
-| 4.1. Subagent Fallback Fix | 2/2 | Complete | 2026-03-23 |
+| 5. Error Classification & State | 2/2 | Complete | 2026-03-27 |
+| 6. Config & Retry Logic | 0/2 | Pending | — |
+| 7. Replay & Timeout/Event | 0/2 | Pending | — |
+| 8. Chat Handler & Subagent Sync | 0/2 | Pending | — |
+| 9. Plugin Init & Consolidation | 0/2 | Pending | — |
+
+**Totals:**
+- Phases: 5
+- Plans: 10
+- Requirements: 17 mapped

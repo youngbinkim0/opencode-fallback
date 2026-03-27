@@ -1,83 +1,75 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: milestone
-status: verifying
-last_updated: "2026-03-23T22:19:47.020Z"
-last_activity: 2026-03-23 — Both plans complete, 178 tests passing
+milestone: v1.1
+milestone_name: Logic Review
+status: ready_to_plan
+last_updated: "2026-03-27"
+last_activity: 2026-03-27 — Completed Phase 5 Error Classification & State Audit
 progress:
   total_phases: 5
-  completed_phases: 2
-  total_plans: 8
-  completed_plans: 5
-  percent: 100
+  completed_phases: 1
+  total_plans: 10
+  completed_plans: 2
+  percent: 20
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-03-18)
+See: .planning/PROJECT.md (updated 2026-03-26)
 
 **Core value:** Uninterrupted AI coding sessions — when one model fails, work continues automatically on another without manual intervention.
-**Current focus:** Phase 4.1 — Fix empty subagent task results when fallback succeeds
+**Current focus:** Milestone v1.1 Logic Review — Phase 5: Error Classification & State Audit
 
 ## Current Position
 
-Phase: 4.1 of 4.1 (all plans complete, pending verification)
-Plan: 04.1-02 complete (2/2)
-Status: Verifying
-Last activity: 2026-03-23 — Both plans complete, 178 tests passing
+Phase: 5 of 9 (Error Classification & State Audit)
+Plan: 2 of 2 in current phase
+Status: Phase complete
+Last activity: 2026-03-27 — Completed 05-01 and 05-02 audits for error classification and fallback state
 
-Progress: [██████████] 100%
+Progress: [██░░░░░░░░] 20%
 
 ## Performance Metrics
 
-**Velocity:**
+**v1.0 Final:**
 - Total plans completed: 10
-- Total execution time: ~2.5 hours
 - Tests: 178 pass, 0 fail, 10 test files
+- Phases: 5 (1, 2, 3, 4, 4.1) all complete
 
-**By Phase:**
-
-| Phase | Plans | Status | Tests Added |
-|-------|-------|--------|-------------|
-| 1: Full Message Replay | 2 | ✅ Complete | 22 |
-| 2: Global Fallback Config | 2 | ✅ Complete | 9 |
-| 3: Auto-Recovery | 2 | ✅ Complete | 16 |
-| 4: TTFT-Based Timeout | 2 | ✅ Complete | 8 |
-| 4.1: Subagent Fallback Fix | 2 | ✅ Complete | 18 |
+**v1.1 Progress:**
+- Phases remaining: 4 (6, 7, 8, 9)
+- Plans remaining: 8
+- Requirements to verify: 10
 
 ## Accumulated Context
 
 ### Decisions
 
-- [Roadmap]: Build order Full Replay → Global Config → Recovery → TTFT (ascending complexity)
+- [Roadmap v1.1]: Audit ordered by dependency — error/state first, then config/retry, then timeout/events, then chat/subagent, then init/consolidation
+- [Roadmap v1.1]: QUAL requirements (dead code, simplification) spread across audit phases 5-9 instead of standalone phase
+- [Roadmap v1.1]: TEST-05 (regression tests) mapped to Phase 9 — consolidates all bugs found in phases 5-8
+- [Roadmap v1.1]: QUAL-03 (logger.ts tests) mapped to Phase 7 alongside message-update-handler.ts
 - [Phase 2]: Global fallback config lives in opencode-fallback.json (not opencode.json)
-- [Phase 2]: Fixed iterate-all-agents bug in config-reader.ts
 - [Phase 3]: Recovery uses time-delta check via existing isModelInCooldown()
-- [Phase 3]: Toast on recovery uses "info" variant (positive event)
-- [Phase 3]: failedModels preserved on recovery (not cleared)
 - [Phase 4]: TTFT defaults to 0 (disabled) for backward compatibility
-- [Phase 4]: firstTokenReceived tracked in HookDeps, not FallbackState (transient signal)
+- [Phase 4.1]: Replaced diagnostic hook with real interception in tool.execute.after
+- [Phase 05]: commitFallback now rejects stale plans unless state.currentModel still matches the plan's failedModel
+- [Phase 05]: prepareFallback remains a supported eager helper but now reuses planned transition data instead of duplicating mutation logic
+- [Phase 05]: Required plugin config now includes fallback_models explicitly so audit verification passes typecheck
+- [Phase 05]: Prefer nested provider error messages before wrapper messages.
+- [Phase 05]: Keep containsErrorContent and extractErrorContentFromParts separate because they serve structural-detection vs text-extraction contracts.
+- [Phase 05]: Keep extractAutoRetrySignal on every() semantics so retry timing and throttling signals must both appear.
 
-### Requirements Coverage
+### Pending Todos
 
-All 16 v1 requirements addressed:
-- RTRY-01 ✓, RTRY-02 ✓, RTRY-03 ✓, RTRY-04 ✓, RTRY-05 ✓
-- RCVR-01 ✓, RCVR-02 ✓, RCVR-03 ✓
-- CONF-01 ✓, CONF-02 ✓, CONF-03 ✓, CONF-04 ✓
-- TEST-01 ✓, TEST-02 ✓, TEST-03 ✓, TEST-04 ✓
+None yet.
 
-### Phase 4.1 Decisions
+### Blockers/Concerns
 
-- [Plan 01]: Flexible regex for empty tag detection (`/<task_result>\s*<\/task_result>/`)
-- [Plan 01]: Fixed 500ms polling interval, no exponential backoff
-- [Plan 01]: Helper module pure — no hook registration, clean separation
-- [Plan 02]: Replaced diagnostic hook with real interception in tool.execute.after
-- [Plan 02]: Removed globalModelCooldown — proactive redirect unnecessary with post-tool fix
-- [Plan 02]: Max wait bounded by config timeout_seconds (capped at 120s)
+None yet.
 
 ## Session Continuity
 
-Phase 4.1 all plans complete. Pending verification.
+Phase 5 is complete and summarized. Ready to plan or execute Phase 6.
