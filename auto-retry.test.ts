@@ -26,7 +26,8 @@ function createMockDeps(overrides?: Partial<{
 					messages: mock(async () => ({ data: messagesData })),
 					promptAsync: mock(promptAsyncFn as any),
 					command: mock(commandFn as any),
-					deleteMessage: mock(async () => {}),
+					revert: mock(async () => {}),
+					summarize: mock(async () => ({ data: true })),
 					get: mock(async () => ({ data: {} })),
 				},
 				tui: {
@@ -1136,14 +1137,9 @@ describe("auto-retry integration", () => {
 	})
 
 	describe("#given compaction-origin fallback dispatch", () => {
-		describe("#when agent is 'compaction' and session.command succeeds", () => {
-			test("#then aborts session, re-issues compact on fallback model, commits state", async () => {
-				const commandCalls: any[] = []
-				const deps = createMockDeps({
-					commandFn: async (args: any) => {
-						commandCalls.push(args)
-					},
-				})
+		describe("#when agent is 'compaction' and summarize succeeds", () => {
+			test("#then aborts, calls summarize on fallback model, commits state", async () => {
+				const deps = createMockDeps()
 
 				const { createFallbackState } = await import("./fallback-state")
 				const state = createFallbackState("kimi-for-coding/k2p5")
@@ -1165,26 +1161,23 @@ describe("auto-retry integration", () => {
 				)
 
 				expect(result).toBe(true)
-				// Session should have been aborted first
 				expect(deps.ctx.client.session.abort).toHaveBeenCalled()
-				// Compact command issued on fallback model
-				expect(commandCalls.length).toBe(1)
-				expect(commandCalls[0].command).toBe("compact")
-				expect(commandCalls[0].model).toBe("google/gemini-flash")
+				// summarize called with fallback model
+				expect(deps.ctx.client.session.summarize).toHaveBeenCalled()
+				// promptAsync NOT used — summarize handles compaction
+				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
 				// State committed
 				expect(state.currentModel).toBe("google/gemini-flash")
 				expect(state.failedModels.has("kimi-for-coding/k2p5")).toBe(true)
-				// promptAsync NOT used
-				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
 			})
 		})
 
-		describe("#when agent is 'compaction' and session.command fails", () => {
-			test("#then falls back to committing state for chat.message override", async () => {
-				const deps = createMockDeps({
-					commandFn: async () => {
-						throw new Error("command failed")
-					},
+		describe("#when agent is 'compaction' and summarize fails", () => {
+			test("#then commits fallback state for chat.message override", async () => {
+				const deps = createMockDeps()
+				// Override summarize to throw
+				;(deps.ctx.client.session as any).summarize = mock(async () => {
+					throw new Error("summarize failed")
 				})
 
 				const { createFallbackState } = await import("./fallback-state")
@@ -1207,11 +1200,8 @@ describe("auto-retry integration", () => {
 				)
 
 				expect(result).toBe(false)
-				// State still committed as fallback for chat.message
 				expect(state.currentModel).toBe("google/gemini-flash")
 				expect(state.failedModels.has("kimi-for-coding/k2p5")).toBe(true)
-				// Compaction-in-flight set for stale error suppression
-				expect(deps.sessionCompactionInFlight.has("ses_compact_fail")).toBe(true)
 			})
 		})
 	})

@@ -114,24 +114,34 @@ export interface PluginContext {
 				query: { directory: string }
 			}) => Promise<void>
 			/** Re-dispatch a command (e.g. compaction) on a specific model.
-			 *  Used for compaction fallback because `promptAsync` cannot accept
-			 *  `type: "compaction"` parts — only text/file/agent/subtask.
-			 *  Uses flat SDK parameter format (not nested path/body/query). */
+			 *  Uses the SDK's path/body/query format. */
 			command: (args: {
-				sessionID: string
-				directory?: string
-				command: string
-				model?: string
-				agent?: string
+				path: { id: string }
+				body: {
+					command: string
+					arguments: string
+					model?: string
+					agent?: string
+					messageID?: string
+				}
+				query?: { directory?: string }
 			}) => Promise<void>
-			/** Delete a specific message from the session history.
-			 *  Used to remove failed compaction messages so OpenCode doesn't
-			 *  re-queue them on every subsequent prompt. */
-			deleteMessage: (args: {
-				sessionID: string
-				messageID: string
-				directory?: string
+			/** Revert a specific message, undoing its effects and restoring
+			 *  the previous session state.  Used to remove failed compaction
+			 *  messages so OpenCode doesn't re-queue them. */
+			revert: (args: {
+				path: { id: string }
+				body: { messageID: string; partID?: string }
+				query?: { directory?: string }
 			}) => Promise<void>
+			/** Re-run compaction/summarization with a specific model.
+			 *  This is the actual compaction API — "compact" is not a
+			 *  user-facing command. */
+			summarize: (args: {
+				path: { id: string }
+				body: { providerID: string; modelID: string }
+				query?: { directory?: string }
+			}) => Promise<unknown>
 			get: (args: {
 				path: { id: string }
 			}) => Promise<{ data?: Record<string, unknown> }>

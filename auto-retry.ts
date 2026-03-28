@@ -296,23 +296,20 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		deps.sessionFirstTokenReceived.set(sessionID, false)
 		let retryDispatched = false
 		try {
-			// ── COMPACTION FALLBACK: ABORT + RE-ISSUE ON FALLBACK MODEL ──
-			// OpenCode queues compaction as a prerequisite before processing
-			// user prompts.  When the primary model (k2p5) fails compaction,
-			// the session is stuck — every new prompt retriggers compaction
-			// on k2p5.  The chat.message model override doesn't affect the
-			// internal compaction routing.
+			// ── COMPACTION FALLBACK: ABORT + SUMMARIZE ON FALLBACK MODEL ──
+			// OpenCode's session.summarize endpoint:
+			//  1. Calls SessionRevert.cleanup (undoes any revert state)
+			//  2. Creates a NEW compaction via SessionCompaction.create with
+			//     the model we specify (providerID + modelID)
+			//  3. Runs SessionPrompt.loop to process it
 			//
-			// Strategy: abort the stuck session to clear the compaction queue,
-			// wait for the abort to propagate, then re-issue the compact
-			// command via session.command with the fallback model.  If the
-			// model parameter IS honored after an abort (clearing the internal
-			// state), compaction succeeds on the fallback model and the session
-			// is unblocked.  If it still uses k2p5, we fall back to committing
-			// state for the chat.message override as a last resort.
+			// Key insight: summarize handles cleanup internally, so we don't
+			// need to revert or delete messages ourselves.  We just need to
+			// abort the stuck session and wait for it to settle, then call
+			// summarize with the fallback model.
 			if (resolvedAgent === "compaction") {
 				const failedModel = plan?.failedModel
-				logInfo(`Compaction fallback: abort + re-issue on fallback model (${source})`, {
+				logInfo(`Compaction fallback: abort + summarize on fallback (${source})`, {
 					sessionID,
 					failedModel,
 					newModel,
@@ -330,70 +327,126 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					}
 				}
 
-				// Step 1: Abort the stuck session to stop the failed compaction
+				// Step 1: Abort the stuck session
 				try {
 					await abortSessionRequest(sessionID, "compaction-fallback")
 				} catch {
 					logError(`Failed to abort session for compaction fallback (${source})`, { sessionID })
 				}
 
-				// Step 2: Wait for abort to propagate
-				await new Promise<void>((resolve) => setTimeout(resolve, 200))
+				// Step 2: Wait for abort to fully propagate.
+				await new Promise<void>((resolve) => setTimeout(resolve, 500))
 
-				// Step 3: Find and delete the failed compaction message so OpenCode
-				// doesn't re-queue it on every subsequent prompt/command.
+				// Step 3: Delete the failed compaction messages from the session.
+				// session.summarize calls SessionPrompt.loop which processes
+				// messages in order — if the old failed compaction messages remain,
+				// the loop retries them on k2p5 instead of using our new model.
+				// The DELETE /session/{id}/message/{messageID} endpoint removes
+				// them permanently (not available as a typed SDK method, so we
+				// use the SDK's internal HTTP client directly).
 				try {
 					const messagesResp = await ctx.client.session.messages({
 						path: { id: sessionID },
 						query: { directory: ctx.directory },
 					})
-					const msgs = messagesResp.data
-					if (msgs && msgs.length > 0) {
-						// Walk backwards to find the failed assistant message from the compaction model
-						for (let i = msgs.length - 1; i >= 0; i--) {
-							const msg = msgs[i]
-							const msgRole = msg.info?.role as string | undefined
-							const msgModel = msg.info?.model as string | undefined
-							const msgError = msg.info?.error
-							const msgID = msg.info?.id as string | undefined
+					const msgs = messagesResp.data ?? []
 
-							if (msgRole === "assistant" && msgError && msgID) {
-								logInfo(`Deleting failed compaction message (${source})`, {
-									sessionID,
-									messageID: msgID,
-									model: msgModel,
-								})
-								await ctx.client.session.deleteMessage({
-									sessionID,
-									messageID: msgID,
-									directory: ctx.directory,
-								})
-								break
-							}
+					// Collect message IDs to delete: failed assistant + compaction user
+					// Delete in reverse order (newest first) to avoid index shifts
+					const deleteIDs: string[] = []
+					for (let i = msgs.length - 1; i >= 0; i--) {
+						const msg = msgs[i]
+						const msgRole = msg.info?.role as string | undefined
+						const msgError = msg.info?.error
+						const msgID = msg.info?.id as string | undefined
+						const parts = msg.parts ?? []
+						const isCompactionMsg = parts.length > 0 &&
+							parts.every((p: any) => p.type === "compaction")
+
+						if (!msgID) continue
+
+						// Failed assistant message
+						if (msgRole === "assistant" && msgError) {
+							deleteIDs.push(msgID)
+							continue
+						}
+
+						// Compaction user message
+						if (isCompactionMsg) {
+							deleteIDs.push(msgID)
+							break // stop after finding both
 						}
 					}
-				} catch (deleteErr) {
-					logError(`Failed to delete compaction message (${source})`, {
+
+					// Use the SDK's internal client to make raw DELETE calls
+					const rawClient = (ctx.client.session as any)?._client
+					if (rawClient && deleteIDs.length > 0) {
+						for (const msgID of deleteIDs) {
+							logInfo(`Deleting compaction message (${source})`, {
+								sessionID,
+								messageID: msgID,
+							})
+							try {
+								await rawClient.delete({
+									url: "/session/{id}/message/{messageID}",
+									path: { id: sessionID, messageID: msgID },
+								})
+								logInfo(`Deleted compaction message (${source})`, {
+									sessionID,
+									messageID: msgID,
+								})
+							} catch (delErr) {
+								logError(`Failed to delete compaction message (${source})`, {
+									sessionID,
+									messageID: msgID,
+									error: String(delErr),
+								})
+							}
+						}
+					} else if (deleteIDs.length > 0) {
+						logError(`Cannot access raw SDK client for message deletion (${source})`, {
+							sessionID,
+							messageCount: deleteIDs.length,
+						})
+					}
+				} catch (msgErr) {
+					logError(`Failed during compaction message cleanup (${source})`, {
 						sessionID,
-						error: String(deleteErr),
+						error: String(msgErr),
 					})
 				}
 
-				// Step 4: Re-issue compact on the fallback model
+				// Small delay to let deletions settle
+				await new Promise<void>((resolve) => setTimeout(resolve, 200))
+
+				// Step 4: Call session.summarize with the fallback model
 				try {
-					// Claim the dispatch slot
 					if (sessionAwaitingFallbackResult.has(sessionID)) {
-						logInfo(`Skipping duplicate compaction dispatch (${source})`, { sessionID })
+						logInfo(`Skipping duplicate compaction summarize (${source})`, { sessionID })
 						deferredToOtherHandler = true
 						return false
 					}
 					sessionAwaitingFallbackResult.add(sessionID)
 
-					await ctx.client.session.command({
+					logInfo(`Dispatching session.summarize on fallback model (${source})`, {
 						sessionID,
-						directory: ctx.directory,
-						command: "compact",
+						providerID: fallbackModelObj.providerID,
+						modelID: fallbackModelObj.modelID,
+					})
+
+					const summarizeResult = await ctx.client.session.summarize({
+						path: { id: sessionID },
+						body: {
+							providerID: fallbackModelObj.providerID,
+							modelID: fallbackModelObj.modelID,
+						},
+						query: { directory: ctx.directory },
+					})
+
+					logInfo(`session.summarize response (${source})`, {
+						sessionID,
 						model: newModel,
+						response: (JSON.stringify(summarizeResult) ?? "undefined").slice(0, 500),
 					})
 
 					// Commit fallback state after successful dispatch
@@ -402,7 +455,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						if (stateToCommit) {
 							const committed = commitFallback(stateToCommit, plan)
 							if (committed) {
-								logInfo(`Committed fallback after compaction re-dispatch (${source})`, {
+								logInfo(`Committed fallback after compaction summarize (${source})`, {
 									sessionID,
 									from: plan.failedModel,
 									to: plan.newModel,
@@ -430,28 +483,26 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 							.catch(() => {})
 					}
 
-					logInfo(`Compaction re-dispatched on fallback model (${source})`, {
+					logInfo(`Compaction re-dispatched via summarize (${source})`, {
 						sessionID,
 						model: newModel,
 					})
 					return true
-				} catch (cmdError) {
-					logError(`Compaction re-dispatch failed (${source})`, {
+				} catch (summarizeErr) {
+					logError(`session.summarize failed (${source})`, {
 						sessionID,
 						model: newModel,
-						error: String(cmdError),
+						error: String(summarizeErr),
 					})
-					// Command failed — fall back to committing state for chat.message
-					deps.sessionCompactionInFlight.delete(sessionID)
 					sessionAwaitingFallbackResult.delete(sessionID)
 
-					// Commit the fallback state so chat.message override works
+					// Summarize failed — commit fallback state so chat.message
+					// override works for regular prompts
 					if (plan) {
 						const currentState = sessionStates.get(sessionID)
 						if (currentState) {
 							commitFallback(currentState, plan)
-							deps.sessionCompactionInFlight.add(sessionID)
-							logInfo(`Committed fallback state as last resort (${source})`, {
+							logInfo(`Committed compaction fallback state as last resort (${source})`, {
 								sessionID,
 								from: plan.failedModel,
 								to: plan.newModel,
@@ -459,14 +510,20 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						}
 					}
 
+					deps.sessionCompactionInFlight.delete(sessionID)
+					clearSessionFallbackTimeout(sessionID)
+					sessionAwaitingFallbackResult.delete(sessionID)
+
 					if (config.notify_on_fallback) {
+						const fromName = (failedModel || "primary").split("/").pop()!
+						const toName = newModel.split("/").pop() || newModel
 						await ctx.client.tui
 							.showToast({
 								body: {
 									title: "Compaction Failed",
-									message: `Compaction retry failed — next prompt will attempt fallback model`,
+									message: `${fromName} can't compact — try /compact after switching to ${toName}`,
 									variant: "warning",
-									duration: 5000,
+									duration: 10000,
 								},
 							})
 							.catch(() => {})
