@@ -25,12 +25,6 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 
 		sessionLastAccess.set(sessionID, Date.now())
 
-		// Clear compaction-in-flight on new user prompt — the compaction
-		// phase is over and this is a fresh user interaction.
-		if (deps.sessionCompactionInFlight.has(sessionID)) {
-			deps.sessionCompactionInFlight.delete(sessionID)
-		}
-
 		const requestedModel = input.model
 			? `${input.model.providerID}/${input.model.modelID}`
 			: undefined
@@ -176,5 +170,11 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 				}
 			}
 		}
+
+		// Clear compaction-in-flight at the very end, AFTER all guards
+		// and the model override have been applied.  Clearing it earlier
+		// would let the adoption guard (which checks !compactionInFlight)
+		// reset the fallback state before the override takes effect.
+		deps.sessionCompactionInFlight.delete(sessionID)
 	}
 }
