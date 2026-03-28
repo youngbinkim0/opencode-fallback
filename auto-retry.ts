@@ -333,6 +333,16 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 								to: plan.newModel,
 								attemptCount: currentState.attemptCount,
 							})
+
+							// Set compaction-in-flight to suppress stale errors
+							// from session.error (which fires ~4ms later with the
+							// same k2p5 error).  Without this, session.error sees
+							// currentModel=gemini-flash and treats it as gemini-flash
+							// failing, double-advancing the fallback chain.
+							//
+							// The flag is cleared on session.idle, session.compacted,
+							// or session.stop — whichever comes first.
+							deps.sessionCompactionInFlight.add(sessionID)
 						}
 
 						if (config.notify_on_fallback) {
@@ -352,6 +362,9 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					}
 				}
 
+				// Mark as deferred so the finally block doesn't clear the
+				// compaction-in-flight flag we just set.
+				deferredToOtherHandler = true
 				return false
 			}
 

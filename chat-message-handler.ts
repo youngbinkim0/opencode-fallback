@@ -25,6 +25,12 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 
 		sessionLastAccess.set(sessionID, Date.now())
 
+		// Clear compaction-in-flight on new user prompt — the compaction
+		// phase is over and this is a fresh user interaction.
+		if (deps.sessionCompactionInFlight.has(sessionID)) {
+			deps.sessionCompactionInFlight.delete(sessionID)
+		}
+
 		const requestedModel = input.model
 			? `${input.model.providerID}/${input.model.modelID}`
 			: undefined
