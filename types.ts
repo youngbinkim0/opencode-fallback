@@ -124,6 +124,14 @@ export interface PluginContext {
 				model?: string
 				agent?: string
 			}) => Promise<void>
+			/** Delete a specific message from the session history.
+			 *  Used to remove failed compaction messages so OpenCode doesn't
+			 *  re-queue them on every subsequent prompt. */
+			deleteMessage: (args: {
+				sessionID: string
+				messageID: string
+				directory?: string
+			}) => Promise<void>
 			get: (args: {
 				path: { id: string }
 			}) => Promise<{ data?: Record<string, unknown> }>

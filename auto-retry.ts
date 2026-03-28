@@ -330,7 +330,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					}
 				}
 
-				// Step 1: Abort the stuck session
+				// Step 1: Abort the stuck session to stop the failed compaction
 				try {
 					await abortSessionRequest(sessionID, "compaction-fallback")
 				} catch {
@@ -340,7 +340,46 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				// Step 2: Wait for abort to propagate
 				await new Promise<void>((resolve) => setTimeout(resolve, 200))
 
-				// Step 3: Re-issue compact on the fallback model
+				// Step 3: Find and delete the failed compaction message so OpenCode
+				// doesn't re-queue it on every subsequent prompt/command.
+				try {
+					const messagesResp = await ctx.client.session.messages({
+						path: { id: sessionID },
+						query: { directory: ctx.directory },
+					})
+					const msgs = messagesResp.data
+					if (msgs && msgs.length > 0) {
+						// Walk backwards to find the failed assistant message from the compaction model
+						for (let i = msgs.length - 1; i >= 0; i--) {
+							const msg = msgs[i]
+							const msgRole = msg.info?.role as string | undefined
+							const msgModel = msg.info?.model as string | undefined
+							const msgError = msg.info?.error
+							const msgID = msg.info?.id as string | undefined
+
+							if (msgRole === "assistant" && msgError && msgID) {
+								logInfo(`Deleting failed compaction message (${source})`, {
+									sessionID,
+									messageID: msgID,
+									model: msgModel,
+								})
+								await ctx.client.session.deleteMessage({
+									sessionID,
+									messageID: msgID,
+									directory: ctx.directory,
+								})
+								break
+							}
+						}
+					}
+				} catch (deleteErr) {
+					logError(`Failed to delete compaction message (${source})`, {
+						sessionID,
+						error: String(deleteErr),
+					})
+				}
+
+				// Step 4: Re-issue compact on the fallback model
 				try {
 					// Claim the dispatch slot
 					if (sessionAwaitingFallbackResult.has(sessionID)) {

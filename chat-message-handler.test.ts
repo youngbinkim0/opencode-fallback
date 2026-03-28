@@ -15,6 +15,7 @@ function createMockDeps(configOverrides?: Partial<FallbackPluginConfig>): HookDe
 					messages: mock(async () => ({ data: [] })),
 					promptAsync: mock(async () => {}),
 					command: mock(async () => {}),
+					deleteMessage: mock(async () => {}),
 					get: mock(async () => ({ data: {} })),
 				},
 				tui: {

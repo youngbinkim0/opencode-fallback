@@ -26,6 +26,7 @@ function createMockDeps(overrides?: Partial<{
 					messages: mock(async () => ({ data: messagesData })),
 					promptAsync: mock(promptAsyncFn as any),
 					command: mock(commandFn as any),
+					deleteMessage: mock(async () => {}),
 					get: mock(async () => ({ data: {} })),
 				},
 				tui: {
