@@ -532,14 +532,12 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			// ── POST-AWAIT COMPACTION GUARD ──
 			// The pre-await guard at line 431 may miss the flag if
 			// message.updated's handler set it during our await.  Re-check
-			// here.  Also bail if we resolved to "compaction" ourselves —
-			// compaction sessions can't override the model, so the
-			// message.updated handler's compaction path handles everything.
-			if (resolvedAgent === "compaction" || deps.sessionCompactionInFlight.has(sessionID)) {
-				logInfo("session.error skipping — compaction session (post-await check)", {
+			// here.  Only bail if message.updated is already handling the
+			// compaction fallback (compactionInFlight flag is set).
+			if (deps.sessionCompactionInFlight.has(sessionID)) {
+				logInfo("session.error skipping — compaction already being handled by message.updated", {
 					sessionID,
 					resolvedAgent,
-					compactionInFlight: deps.sessionCompactionInFlight.has(sessionID),
 					errorName: extractErrorName(error),
 				})
 				return

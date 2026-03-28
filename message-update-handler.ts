@@ -218,28 +218,37 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 							}
 						})
 						.catch(() => {})
-				} else if (sessionStates.has(sessionID)) {
-					// Subsequent successful message.updated — model is active.
-					// Mark first token received and reschedule the timeout.
-					// The timeout's purpose is to detect models that go completely
-					// silent (hung/dead). Any non-error message.updated proves the
-					// model is alive, so we push the timeout forward. Only when
-					// the model produces no updates for the full timeout_seconds
-					// interval does the timeout fire.
+			} else if (sessionStates.has(sessionID)) {
+				// Subsequent successful message.updated — model *may* be active.
+				// The timeout's purpose is to detect models that go completely
+				// silent (hung/dead).  We only mark first token received when
+				// actual content is present — OpenCode sends an initial
+				// message.updated when it *creates* the assistant message slot
+				// (before any tokens arrive) and we must not treat that empty
+				// frame as proof the model is streaming.
+				const eventHasContent = parts?.some(
+					(p) =>
+						(p.type === "text" && typeof p.text === "string" && p.text.trim().length > 0) ||
+						p.type === "tool_call" ||
+						p.type === "tool"
+				)
+				if (eventHasContent) {
 					deps.sessionFirstTokenReceived.set(sessionID, true)
-					// Reschedule the timeout — resets the clock on every activity.
-					// If a timeout was scheduled but model is streaming, this
-					// prevents the false-abort that occurred when the model was
-					// actively producing tokens but firstTokenReceived was never set.
-					if (deps.sessionFallbackTimeouts.has(sessionID)) {
-						const agent = info?.agent as string | undefined
-						helpers.resolveAgentForSessionFromContext(sessionID, agent)
-							.then((resolvedAgent) => {
-								helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
-							})
-							.catch(() => {})
-					}
 				}
+				// Reschedule the timeout — resets the clock on every activity
+				// (even empty frames, since the server is still processing).
+				// If a timeout was scheduled but model is streaming, this
+				// prevents the false-abort that occurred when the model was
+				// actively producing tokens but firstTokenReceived was never set.
+				if (deps.sessionFallbackTimeouts.has(sessionID)) {
+					const agent = info?.agent as string | undefined
+					helpers.resolveAgentForSessionFromContext(sessionID, agent)
+						.then((resolvedAgent) => {
+							helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
+						})
+						.catch(() => {})
+				}
+			}
 				return
 			}
 
@@ -298,45 +307,66 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				return
 			}
 
-			// Ignore stale errors from models we already moved past
+			// Ignore stale errors from models we already moved past.
+			// Exception: compaction errors are NOT stale — they represent a
+			// new compaction attempt that OpenCode dispatched on the session's
+			// bound model (which may already be in failedModels).  These must
+			// be handled so we can re-dispatch compaction on the current
+			// fallback model.
 			const currentState = sessionStates.get(sessionID)
+			const eventAgent = (info?.agent as string | undefined)?.trim().toLowerCase()
+			const isCompactionError = eventAgent === "compaction"
+
 			if (currentState && model && model !== currentState.currentModel) {
-				// If the error model is already in failedModels, this is a stale
-				// echo from a model that already failed and was replaced.  Never
-				// resync back to a model we already moved away from — that creates
-				// an infinite loop: stale error → resync → plan fallback → replay
-				// → stale error from the same model → resync again.
-				const isAlreadyFailed = currentState.failedModels.has(model)
-
-				const retryableStaleError = isRetryableError(
-					error,
-					config.retry_on_errors,
-					config.retryable_error_patterns
-				)
-				const canResyncToErrorModel =
-					retryableStaleError &&
-					!isAlreadyFailed &&
-					!currentState.pendingFallbackModel &&
-					!sessionAwaitingFallbackResult.has(sessionID)
-
-				if (canResyncToErrorModel) {
-					logInfo("Resyncing state to error model before fallback planning", {
+				if (isCompactionError) {
+					// Compaction error from a model we already moved past.
+					// Don't resync state — instead let it fall through so
+					// autoRetryWithFallback dispatches compaction on the
+					// current fallback model.
+					logInfo("Compaction error on failed model — will retry on current fallback", {
 						sessionID,
-						previousModel: currentState.currentModel,
-						errorModel: model,
-						errorName: extractErrorName(error),
-					})
-					currentState.currentModel = model
-					sessionLastAccess.set(sessionID, Date.now())
-				} else {
-					logInfo("Ignoring stale error from previous model", {
-						sessionID,
-						staleModel: model,
+						failedModel: model,
 						currentModel: currentState.currentModel,
 						errorName: extractErrorName(error),
-						isAlreadyFailed,
 					})
-					return
+				} else {
+					// If the error model is already in failedModels, this is a stale
+					// echo from a model that already failed and was replaced.  Never
+					// resync back to a model we already moved away from — that creates
+					// an infinite loop: stale error → resync → plan fallback → replay
+					// → stale error from the same model → resync again.
+					const isAlreadyFailed = currentState.failedModels.has(model)
+
+					const retryableStaleError = isRetryableError(
+						error,
+						config.retry_on_errors,
+						config.retryable_error_patterns
+					)
+					const canResyncToErrorModel =
+						retryableStaleError &&
+						!isAlreadyFailed &&
+						!currentState.pendingFallbackModel &&
+						!sessionAwaitingFallbackResult.has(sessionID)
+
+					if (canResyncToErrorModel) {
+						logInfo("Resyncing state to error model before fallback planning", {
+							sessionID,
+							previousModel: currentState.currentModel,
+							errorModel: model,
+							errorName: extractErrorName(error),
+						})
+						currentState.currentModel = model
+						sessionLastAccess.set(sessionID, Date.now())
+					} else {
+						logInfo("Ignoring stale error from previous model", {
+							sessionID,
+							staleModel: model,
+							currentModel: currentState.currentModel,
+							errorName: extractErrorName(error),
+							isAlreadyFailed,
+						})
+						return
+					}
 				}
 			}
 
@@ -431,6 +461,53 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				// slips past the guard and double-advances the fallback chain.
 				if (resolvedAgent === "compaction") {
 					deps.sessionCompactionInFlight.add(sessionID)
+				}
+
+				// ── COMPACTION ON ALREADY-FAILED MODEL ──
+				// When a compaction error arrives from a model we already moved
+				// past (e.g. OpenCode's processCompaction used the session's
+				// bound model which is in failedModels), don't plan a new
+				// fallback step — just re-dispatch compaction on the current
+				// fallback model.  This must run BEFORE the fallback-models
+				// lookup because the user may not have configured fallback_models
+				// for the "compaction" agent specifically.
+				if (
+					isCompactionError &&
+					state &&
+					state.currentModel !== model &&
+					state.currentModel !== state.originalModel
+				) {
+					logInfo("Compaction failed on stale model — re-dispatching on current fallback", {
+						sessionID,
+						failedModel: model,
+						currentFallbackModel: state.currentModel,
+					})
+
+					deps.sessionCompactionInFlight.add(sessionID)
+
+					if (config.notify_on_fallback) {
+						const fromName = (model || "primary").split("/").pop()!
+						const toName = state.currentModel.split("/").pop() || state.currentModel
+						deps.ctx.client.tui
+							.showToast({
+								body: {
+									title: "Compaction Fallback",
+									message: `${fromName} failed — retrying compaction on ${toName}`,
+									variant: "warning",
+									duration: 5000,
+								},
+							})
+							.catch(() => {})
+					}
+
+					await helpers.autoRetryWithFallback(
+						sessionID,
+						state.currentModel,
+						"compaction",
+						"message.updated.compaction-stale",
+						undefined
+					)
+					return
 				}
 
 				const fallbackModels = getFallbackModelsForSession(

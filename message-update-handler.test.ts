@@ -398,11 +398,10 @@ describe("message-update-handler", () => {
 		})
 
 		describe("#when assistant message has empty parts, state exists, and timeout active", () => {
-			test("#then marks firstTokenReceived true (model is active, even without text parts)", async () => {
-				// Any subsequent message.updated for an existing session with an
-				// active timeout marks firstTokenReceived=true. The model is
-				// demonstrably active (sending events), so the TTFT timeout should
-				// not abort it.
+			test("#then does NOT mark firstTokenReceived (empty frame has no real content)", async () => {
+				// An empty parts array means OpenCode created the assistant
+				// message slot but no tokens have arrived.  firstTokenReceived
+				// must remain unset so the TTFT timeout can still fire.
 				const deps = createMockDeps({ timeout_seconds: 30 })
 				const helpers = createMockHelpers()
 				const sessionID = "ses_ttft_empty"
@@ -419,6 +418,29 @@ describe("message-update-handler", () => {
 						model: "anthropic/claude-opus-4-6",
 					},
 					parts: [],
+				})
+
+				expect(deps.sessionFirstTokenReceived.get(sessionID)).toBeUndefined()
+				clearTimeout(deps.sessionFallbackTimeouts.get(sessionID)!)
+			})
+
+			test("#then marks firstTokenReceived when parts contain real text", async () => {
+				const deps = createMockDeps({ timeout_seconds: 30 })
+				const helpers = createMockHelpers()
+				const sessionID = "ses_ttft_text"
+
+				deps.sessionStates.set(sessionID, createFallbackState("anthropic/claude-opus-4-6"))
+				deps.sessionFallbackTimeouts.set(sessionID, setTimeout(() => {}, 30000) as any)
+
+				const handler = createMessageUpdateHandler(deps, helpers)
+
+				await handler({
+					info: {
+						sessionID,
+						role: "assistant",
+						model: "anthropic/claude-opus-4-6",
+					},
+					parts: [{ type: "text", text: "Hello world" }],
 				})
 
 				expect(deps.sessionFirstTokenReceived.get(sessionID)).toBe(true)
@@ -599,14 +621,22 @@ describe("message-update-handler", () => {
 				// Simulate active timeout
 				deps.sessionFallbackTimeouts.set(sessionID, setTimeout(() => {}, 30000) as any)
 
-				// Second message.updated — no text parts, but model IS active
-				// (this is the exact scenario from the production log)
+				// Second message.updated — empty parts (assistant slot created, no tokens yet)
 				await handler({
 					info: { sessionID, role: "assistant", model: "anthropic/claude-opus-4-6" },
 					parts: [],
 				})
 
-				// firstTokenReceived must be true — model is sending updates
+				// Empty parts frame must NOT mark firstTokenReceived — no real content yet
+				expect(deps.sessionFirstTokenReceived.get(sessionID)).toBeUndefined()
+
+				// Third message.updated — with actual text content
+				await handler({
+					info: { sessionID, role: "assistant", model: "anthropic/claude-opus-4-6" },
+					parts: [{ type: "text", text: "Streaming response..." }],
+				})
+
+				// Now firstTokenReceived should be true
 				expect(deps.sessionFirstTokenReceived.get(sessionID)).toBe(true)
 				clearTimeout(deps.sessionFallbackTimeouts.get(sessionID)!)
 			})
@@ -822,6 +852,115 @@ describe("message-update-handler", () => {
 
 				// Should resync to k2p5 and trigger fallback
 				expect(helpers.autoRetryWithFallback).toHaveBeenCalled()
+			})
+		})
+	})
+
+	describe("#given compaction error on already-failed model", () => {
+		describe("#when compaction uses session's original model which is already in failedModels", () => {
+			test("#then re-dispatches compaction on current fallback model instead of ignoring as stale", async () => {
+				// Scenario: regular chat failed on antigravity → fell back to sonnet.
+				// Later, /compact triggers compaction on antigravity (OpenCode's
+				// processCompaction used the session's bound model). The compaction
+				// error should NOT be dismissed as stale — it should re-dispatch
+				// compaction via summarize on the current fallback model (sonnet).
+				const deps = createMockDeps({
+					retry_on_errors: [500],
+					max_fallback_attempts: 5,
+				})
+				const helpers = createMockHelpers()
+				;(helpers.resolveAgentForSessionFromContext as any).mockImplementation(
+					async () => "compaction"
+				)
+
+				const sessionID = "ses_compact_stale"
+				const state = createFallbackState("google/antigravity-claude-sonnet-4-6-thinking")
+				// Simulate: regular chat already fell back to sonnet
+				state.currentModel = "anthropic/claude-sonnet-4-6"
+				state.fallbackIndex = 1
+				state.attemptCount = 1
+				state.failedModels.set("google/antigravity-claude-sonnet-4-6-thinking", Date.now())
+
+				deps.sessionStates.set(sessionID, state)
+				deps.agentConfigs = {
+					sonnet: {
+						model: "google/antigravity-claude-sonnet-4-6-thinking",
+						fallback_models: [
+							"google/antigravity-claude-sonnet-4-6-thinking",
+							"anthropic/claude-sonnet-4-6",
+						],
+					},
+				}
+
+				const handler = createMessageUpdateHandler(deps, helpers)
+
+				// Compaction error from antigravity (already failed model)
+				await handler({
+					info: {
+						sessionID,
+						role: "assistant",
+						agent: "compaction",
+						model: "google/antigravity-claude-sonnet-4-6-thinking",
+						error: { name: "UnknownError", message: "auth failed" },
+					},
+				})
+
+				// Should call autoRetryWithFallback with current model and compaction agent
+				expect(helpers.autoRetryWithFallback).toHaveBeenCalledWith(
+					sessionID,
+					"anthropic/claude-sonnet-4-6",     // current fallback model
+					"compaction",                        // agent
+					"message.updated.compaction-stale",  // source
+					undefined                            // no plan (not advancing chain)
+				)
+			})
+		})
+
+		describe("#when compaction error arrives but state has NOT advanced (no prior fallback)", () => {
+			test("#then follows normal fallback planning (not the stale-model shortcut)", async () => {
+				// If the compaction error model matches currentModel (no prior fallback),
+				// the stale-model shortcut should NOT fire — normal planFallback runs.
+				const deps = createMockDeps({
+					retry_on_errors: [500],
+					max_fallback_attempts: 5,
+				})
+				const helpers = createMockHelpers()
+				;(helpers.resolveAgentForSessionFromContext as any).mockImplementation(
+					async () => "compaction"
+				)
+
+				const sessionID = "ses_compact_first_fail"
+				const state = createFallbackState("google/antigravity-claude-sonnet-4-6-thinking")
+				deps.sessionStates.set(sessionID, state)
+				deps.agentConfigs = {
+					compaction: {
+						model: "google/antigravity-claude-sonnet-4-6-thinking",
+						fallback_models: [
+							"google/antigravity-claude-sonnet-4-6-thinking",
+							"anthropic/claude-sonnet-4-6",
+						],
+					},
+				}
+
+				const handler = createMessageUpdateHandler(deps, helpers)
+
+				// Compaction error with retryable status — model matches currentModel,
+				// so the stale-model shortcut doesn't fire; normal planFallback runs.
+				await handler({
+					info: {
+						sessionID,
+						role: "assistant",
+						agent: "compaction",
+						model: "google/antigravity-claude-sonnet-4-6-thinking",
+						error: { statusCode: 500, name: "APIError", message: "internal server error" },
+					},
+				})
+
+				// Should still call autoRetryWithFallback via normal plan path
+				expect(helpers.autoRetryWithFallback).toHaveBeenCalled()
+				// But NOT with the compaction-stale source
+				const call = (helpers.autoRetryWithFallback as any).mock.calls[0]
+				expect(call[3]).toBe("message.updated")  // normal source, not compaction-stale
 			})
 		})
 	})
