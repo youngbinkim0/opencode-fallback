@@ -1135,9 +1135,14 @@ describe("auto-retry integration", () => {
 	})
 
 	describe("#given compaction-origin fallback dispatch", () => {
-		describe("#when agent is 'compaction'", () => {
-			test("#then skips replay but commits fallback state on the same session", async () => {
-				const deps = createMockDeps()
+		describe("#when agent is 'compaction' and session.command succeeds", () => {
+			test("#then aborts session, re-issues compact on fallback model, commits state", async () => {
+				const commandCalls: any[] = []
+				const deps = createMockDeps({
+					commandFn: async (args: any) => {
+						commandCalls.push(args)
+					},
+				})
 
 				const { createFallbackState } = await import("./fallback-state")
 				const state = createFallbackState("kimi-for-coding/k2p5")
@@ -1158,35 +1163,37 @@ describe("auto-retry integration", () => {
 					}
 				)
 
-				expect(result).toBe(false)
-				// No replay dispatched — compaction can't override model
-				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
-				expect(deps.ctx.client.session.command).not.toHaveBeenCalled()
-				// But the fallback state IS committed on the session itself
+				expect(result).toBe(true)
+				// Session should have been aborted first
+				expect(deps.ctx.client.session.abort).toHaveBeenCalled()
+				// Compact command issued on fallback model
+				expect(commandCalls.length).toBe(1)
+				expect(commandCalls[0].command).toBe("compact")
+				expect(commandCalls[0].model).toBe("google/gemini-flash")
+				// State committed
 				expect(state.currentModel).toBe("google/gemini-flash")
 				expect(state.failedModels.has("kimi-for-coding/k2p5")).toBe(true)
-				expect(state.attemptCount).toBe(1)
+				// promptAsync NOT used
+				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
 			})
 		})
 
-		describe("#when compaction failure with notify_on_fallback enabled", () => {
-			test("#then shows toast about model switch for next prompt", async () => {
-				const toastCalls: any[] = []
+		describe("#when agent is 'compaction' and session.command fails", () => {
+			test("#then falls back to committing state for chat.message override", async () => {
 				const deps = createMockDeps({
-					showToastFn: async (args: any) => {
-						toastCalls.push(args)
+					commandFn: async () => {
+						throw new Error("command failed")
 					},
 				})
-				deps.config.notify_on_fallback = true
 
 				const { createFallbackState } = await import("./fallback-state")
 				const state = createFallbackState("kimi-for-coding/k2p5")
-				deps.sessionStates.set("ses_compact_toast", state)
+				deps.sessionStates.set("ses_compact_fail", state)
 				deps.globalFallbackModels = ["kimi-for-coding/k2p5", "google/gemini-flash"]
 
 				const helpers = createAutoRetryHelpers(deps)
-				await helpers.autoRetryWithFallback(
-					"ses_compact_toast",
+				const result = await helpers.autoRetryWithFallback(
+					"ses_compact_fail",
 					"google/gemini-flash",
 					"compaction",
 					"session.error",
@@ -1198,11 +1205,12 @@ describe("auto-retry integration", () => {
 					}
 				)
 
-				expect(toastCalls.length).toBeGreaterThanOrEqual(1)
-				const toast = toastCalls.find((t: any) =>
-					t.body.message.includes("next prompt")
-				)
-				expect(toast).toBeDefined()
+				expect(result).toBe(false)
+				// State still committed as fallback for chat.message
+				expect(state.currentModel).toBe("google/gemini-flash")
+				expect(state.failedModels.has("kimi-for-coding/k2p5")).toBe(true)
+				// Compaction-in-flight set for stale error suppression
+				expect(deps.sessionCompactionInFlight.has("ses_compact_fail")).toBe(true)
 			})
 		})
 	})

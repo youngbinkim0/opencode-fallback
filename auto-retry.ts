@@ -296,76 +296,146 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		deps.sessionFirstTokenReceived.set(sessionID, false)
 		let retryDispatched = false
 		try {
-			// ── COMPACTION SESSION: PROPAGATE FAILURE TO PARENT ──
-			// Compaction sessions are internal OpenCode operations with a fixed
-			// model binding.  Neither `session.command("compact")` nor
-			// `promptAsync` with a model override can change the model on a
-			// compaction session — OpenCode resolves the model from the session
-			// config, ignoring the API parameter.
+			// ── COMPACTION FALLBACK: ABORT + RE-ISSUE ON FALLBACK MODEL ──
+			// OpenCode queues compaction as a prerequisite before processing
+			// user prompts.  When the primary model (k2p5) fails compaction,
+			// the session is stuck — every new prompt retriggers compaction
+			// on k2p5.  The chat.message model override doesn't affect the
+			// internal compaction routing.
 			//
-			// Instead of retrying on this session, propagate the model failure
-			// to the parent session's fallback state.  This ensures the parent
-			// session switches to the fallback model for subsequent prompts.
+			// Strategy: abort the stuck session to clear the compaction queue,
+			// wait for the abort to propagate, then re-issue the compact
+			// command via session.command with the fallback model.  If the
+			// model parameter IS honored after an abort (clearing the internal
+			// state), compaction succeeds on the fallback model and the session
+			// is unblocked.  If it still uses k2p5, we fall back to committing
+			// state for the chat.message override as a last resort.
 			if (resolvedAgent === "compaction") {
-				// Look up the model that actually failed on this compaction session.
-				// Since we're inside autoRetryWithFallback, the plan's failedModel
-				// is the model that errored.
 				const failedModel = plan?.failedModel
-				logInfo(`Compaction session failed — propagating model failure to parent (${source})`, {
+				logInfo(`Compaction fallback: abort + re-issue on fallback model (${source})`, {
 					sessionID,
 					failedModel,
+					newModel,
 				})
 
-				// Compaction runs inline on the main session (not a child).
-				// Commit the fallback on THIS session so the chat.message
-				// hook applies the model override on the next user prompt.
+				// Suppress stale errors from the failed compaction
+				deps.sessionCompactionInFlight.add(sessionID)
+
 				if (failedModel && plan) {
 					const currentState = sessionStates.get(sessionID)
 					if (currentState) {
 						if (!currentState.failedModels.has(failedModel)) {
 							currentState.failedModels.set(failedModel, Date.now())
 						}
-						const committed = commitFallback(currentState, plan)
-						if (committed) {
-							logInfo(`Committed fallback on compaction session for next prompt (${source})`, {
-								sessionID,
-								from: failedModel,
-								to: plan.newModel,
-								attemptCount: currentState.attemptCount,
-							})
-
-							// Set compaction-in-flight to suppress stale errors
-							// from session.error (which fires ~4ms later with the
-							// same k2p5 error).  Without this, session.error sees
-							// currentModel=gemini-flash and treats it as gemini-flash
-							// failing, double-advancing the fallback chain.
-							//
-							// The flag is cleared on session.idle, session.compacted,
-							// or session.stop — whichever comes first.
-							deps.sessionCompactionInFlight.add(sessionID)
-						}
-
-						if (config.notify_on_fallback) {
-							const fromName = failedModel.split("/").pop() || failedModel
-							const toName = plan.newModel.split("/").pop() || plan.newModel
-							await ctx.client.tui
-								.showToast({
-									body: {
-										title: "Model Fallback",
-										message: `${fromName} failed during compaction — next prompt will use ${toName}`,
-										variant: "warning",
-										duration: 5000,
-									},
-								})
-								.catch(() => {})
-						}
 					}
 				}
 
-				// Mark as deferred so the finally block doesn't clear the
-				// compaction-in-flight flag we just set.
-				deferredToOtherHandler = true
-				return false
+				// Step 1: Abort the stuck session
+				try {
+					await abortSessionRequest(sessionID, "compaction-fallback")
+				} catch {
+					logError(`Failed to abort session for compaction fallback (${source})`, { sessionID })
+				}
+
+				// Step 2: Wait for abort to propagate
+				await new Promise<void>((resolve) => setTimeout(resolve, 200))
+
+				// Step 3: Re-issue compact on the fallback model
+				try {
+					// Claim the dispatch slot
+					if (sessionAwaitingFallbackResult.has(sessionID)) {
+						logInfo(`Skipping duplicate compaction dispatch (${source})`, { sessionID })
+						deferredToOtherHandler = true
+						return false
+					}
+					sessionAwaitingFallbackResult.add(sessionID)
+
+					await ctx.client.session.command({
+						sessionID,
+						directory: ctx.directory,
+						command: "compact",
+						model: newModel,
+					})
+
+					// Commit fallback state after successful dispatch
+					if (plan) {
+						const stateToCommit = sessionStates.get(sessionID)
+						if (stateToCommit) {
+							const committed = commitFallback(stateToCommit, plan)
+							if (committed) {
+								logInfo(`Committed fallback after compaction re-dispatch (${source})`, {
+									sessionID,
+									from: plan.failedModel,
+									to: plan.newModel,
+									attemptCount: stateToCommit.attemptCount,
+								})
+							}
+						}
+					}
+
+					scheduleSessionFallbackTimeout(sessionID, undefined)
+					retryDispatched = true
+
+					if (config.notify_on_fallback) {
+						const fromName = (failedModel || "primary").split("/").pop()!
+						const toName = newModel.split("/").pop() || newModel
+						await ctx.client.tui
+							.showToast({
+								body: {
+									title: "Compaction Fallback",
+									message: `${fromName} failed — retrying compaction on ${toName}`,
+									variant: "warning",
+									duration: 5000,
+								},
+							})
+							.catch(() => {})
+					}
+
+					logInfo(`Compaction re-dispatched on fallback model (${source})`, {
+						sessionID,
+						model: newModel,
+					})
+					return true
+				} catch (cmdError) {
+					logError(`Compaction re-dispatch failed (${source})`, {
+						sessionID,
+						model: newModel,
+						error: String(cmdError),
+					})
+					// Command failed — fall back to committing state for chat.message
+					deps.sessionCompactionInFlight.delete(sessionID)
+					sessionAwaitingFallbackResult.delete(sessionID)
+
+					// Commit the fallback state so chat.message override works
+					if (plan) {
+						const currentState = sessionStates.get(sessionID)
+						if (currentState) {
+							commitFallback(currentState, plan)
+							deps.sessionCompactionInFlight.add(sessionID)
+							logInfo(`Committed fallback state as last resort (${source})`, {
+								sessionID,
+								from: plan.failedModel,
+								to: plan.newModel,
+							})
+						}
+					}
+
+					if (config.notify_on_fallback) {
+						await ctx.client.tui
+							.showToast({
+								body: {
+									title: "Compaction Failed",
+									message: `Compaction retry failed — next prompt will attempt fallback model`,
+									variant: "warning",
+									duration: 5000,
+								},
+							})
+							.catch(() => {})
+					}
+
+					deferredToOtherHandler = true
+					return false
+				}
 			}
 
 			// ── NORMAL REPLAY DISPATCH PATH ──
