@@ -424,6 +424,15 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				const resolvedAgent =
 					await helpers.resolveAgentForSessionFromContext(sessionID, agent)
 
+				// Set compaction-in-flight IMMEDIATELY after detecting the agent,
+				// before any further async work.  session.error runs concurrently
+				// and checks this flag at its compaction guard — if we don't set
+				// it here (synchronously after the first await), session.error
+				// slips past the guard and double-advances the fallback chain.
+				if (resolvedAgent === "compaction") {
+					deps.sessionCompactionInFlight.add(sessionID)
+				}
+
 				const fallbackModels = getFallbackModelsForSession(
 					sessionID,
 					resolvedAgent,
