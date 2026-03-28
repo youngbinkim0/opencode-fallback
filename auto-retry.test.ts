@@ -1135,24 +1135,13 @@ describe("auto-retry integration", () => {
 	})
 
 	describe("#given compaction-origin fallback dispatch", () => {
-		describe("#when agent is 'compaction' and parent session exists", () => {
-			test("#then skips compaction retry and propagates failure to parent session", async () => {
+		describe("#when agent is 'compaction'", () => {
+			test("#then skips replay but commits fallback state on the same session", async () => {
 				const deps = createMockDeps()
 
 				const { createFallbackState } = await import("./fallback-state")
-
-				// Compaction session state
-				const compactState = createFallbackState("kimi-for-coding/k2p5")
-				deps.sessionStates.set("ses_compact", compactState)
-
-				// Parent session state — still on k2p5
-				const parentState = createFallbackState("kimi-for-coding/k2p5")
-				deps.sessionStates.set("ses_parent", parentState)
-
-				// Set up parent ID mapping
-				deps.sessionParentID.set("ses_compact", "ses_parent")
-
-				// Configure fallback models for the parent
+				const state = createFallbackState("kimi-for-coding/k2p5")
+				deps.sessionStates.set("ses_compact", state)
 				deps.globalFallbackModels = ["kimi-for-coding/k2p5", "google/gemini-flash"]
 
 				const helpers = createAutoRetryHelpers(deps)
@@ -1170,57 +1159,18 @@ describe("auto-retry integration", () => {
 				)
 
 				expect(result).toBe(false)
-				// No replay on the compaction session
+				// No replay dispatched — compaction can't override model
 				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
 				expect(deps.ctx.client.session.command).not.toHaveBeenCalled()
-				// Parent state should have k2p5 in failedModels
-				expect(parentState.failedModels.has("kimi-for-coding/k2p5")).toBe(true)
-				// Parent should have been switched to the fallback model
-				expect(parentState.currentModel).toBe("google/gemini-flash")
+				// But the fallback state IS committed on the session itself
+				expect(state.currentModel).toBe("google/gemini-flash")
+				expect(state.failedModels.has("kimi-for-coding/k2p5")).toBe(true)
+				expect(state.attemptCount).toBe(1)
 			})
 		})
 
-		describe("#when agent is 'compaction' and no parent session found", () => {
-			test("#then skips compaction retry and shows toast", async () => {
-				const toastCalls: any[] = []
-				const deps = createMockDeps({
-					showToastFn: async (args: any) => {
-						toastCalls.push(args)
-					},
-				})
-				deps.config.notify_on_fallback = true
-
-				// No parent ID mapping — getParentSessionID will return null
-				deps.sessionParentID.set("ses_compact_no_parent", null)
-
-				const { createFallbackState } = await import("./fallback-state")
-				const state = createFallbackState("openai/gpt-4o")
-				deps.sessionStates.set("ses_compact_no_parent", state)
-				deps.globalFallbackModels = ["anthropic/claude-sonnet-4-20250514"]
-
-				const helpers = createAutoRetryHelpers(deps)
-				const result = await helpers.autoRetryWithFallback(
-					"ses_compact_no_parent",
-					"anthropic/claude-sonnet-4-20250514",
-					"compaction",
-					"session.error",
-					{
-						success: true as const,
-						newModel: "anthropic/claude-sonnet-4-20250514",
-						failedModel: "openai/gpt-4o",
-						newFallbackIndex: 0,
-					}
-				)
-
-				expect(result).toBe(false)
-				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
-				// Toast should mention compaction failed
-				expect(toastCalls.length).toBeGreaterThanOrEqual(1)
-			})
-		})
-
-		describe("#when compaction failure propagates and parent gets toast notification", () => {
-			test("#then toast mentions switching model", async () => {
+		describe("#when compaction failure with notify_on_fallback enabled", () => {
+			test("#then shows toast about model switch for next prompt", async () => {
 				const toastCalls: any[] = []
 				const deps = createMockDeps({
 					showToastFn: async (args: any) => {
@@ -1230,13 +1180,8 @@ describe("auto-retry integration", () => {
 				deps.config.notify_on_fallback = true
 
 				const { createFallbackState } = await import("./fallback-state")
-				const compactState = createFallbackState("kimi-for-coding/k2p5")
-				deps.sessionStates.set("ses_compact_toast", compactState)
-
-				const parentState = createFallbackState("kimi-for-coding/k2p5")
-				deps.sessionStates.set("ses_parent_toast", parentState)
-
-				deps.sessionParentID.set("ses_compact_toast", "ses_parent_toast")
+				const state = createFallbackState("kimi-for-coding/k2p5")
+				deps.sessionStates.set("ses_compact_toast", state)
 				deps.globalFallbackModels = ["kimi-for-coding/k2p5", "google/gemini-flash"]
 
 				const helpers = createAutoRetryHelpers(deps)
@@ -1253,13 +1198,11 @@ describe("auto-retry integration", () => {
 					}
 				)
 
-				// Toast should mention model switch
 				expect(toastCalls.length).toBeGreaterThanOrEqual(1)
-				const fallbackToast = toastCalls.find((t: any) =>
-					t.body.message.toLowerCase().includes("compaction") ||
-					t.body.message.toLowerCase().includes("switching")
+				const toast = toastCalls.find((t: any) =>
+					t.body.message.includes("next prompt")
 				)
-				expect(fallbackToast).toBeDefined()
+				expect(toast).toBeDefined()
 			})
 		})
 	})

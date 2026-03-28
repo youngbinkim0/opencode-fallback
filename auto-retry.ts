@@ -316,80 +316,39 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					failedModel,
 				})
 
-				// Look up the parent session
-				const parentID = await getParentSessionID(sessionID)
-				if (parentID && failedModel) {
-					const existingParentState = sessionStates.get(parentID)
-					const parentState = existingParentState ?? createFallbackState(failedModel)
-					if (!existingParentState) {
-						sessionStates.set(parentID, parentState)
-					}
-
-					// Register the failed model in the parent's failedModels map
-					// so the next chat.message on the parent will trigger fallback.
-					if (!parentState.failedModels.has(failedModel)) {
-						parentState.failedModels.set(failedModel, Date.now())
-						logInfo("Registered compaction model failure on parent session", {
-							sessionID,
-							parentID,
-							failedModel,
-							parentCurrentModel: parentState.currentModel,
-						})
-					}
-
-					// If the parent is still on the failed model, plan the fallback
-					// so the chat.message hook can apply it immediately.
-					if (parentState.currentModel === failedModel) {
-						const parentAgent = resolveAgentForSession(parentID, undefined)
-						const parentFallbackModels = getFallbackModelsForSession(
-							parentID,
-							parentAgent,
-							deps.agentConfigs,
-							deps.globalFallbackModels
-						)
-
-						if (parentFallbackModels.length > 0) {
-							const parentPlan = planFallback(parentID, parentState, parentFallbackModels, config)
-							if (parentPlan.success) {
-								commitFallback(parentState, parentPlan)
-								logInfo("Pre-committed fallback on parent session due to compaction failure", {
-									parentID,
-									from: failedModel,
-									to: parentPlan.newModel,
-								})
-
-								if (config.notify_on_fallback) {
-									const modelName = parentPlan.newModel.split("/").pop() || parentPlan.newModel
-									await ctx.client.tui
-										.showToast({
-											body: {
-												title: "Model Fallback",
-												message: `${failedModel.split("/").pop()} failed during compaction — switching to ${modelName}`,
-												variant: "warning",
-												duration: 5000,
-											},
-										})
-										.catch(() => {})
-								}
-							}
+				// Compaction runs inline on the main session (not a child).
+				// Commit the fallback on THIS session so the chat.message
+				// hook applies the model override on the next user prompt.
+				if (failedModel && plan) {
+					const currentState = sessionStates.get(sessionID)
+					if (currentState) {
+						if (!currentState.failedModels.has(failedModel)) {
+							currentState.failedModels.set(failedModel, Date.now())
 						}
-					}
-				} else {
-					logInfo("No parent session found for compaction — cannot propagate failure", {
-						sessionID,
-					})
-
-					if (config.notify_on_fallback) {
-						await ctx.client.tui
-							.showToast({
-								body: {
-									title: "Compaction Failed",
-									message: "Compaction failed — model override not supported",
-									variant: "warning",
-									duration: 5000,
-								},
+						const committed = commitFallback(currentState, plan)
+						if (committed) {
+							logInfo(`Committed fallback on compaction session for next prompt (${source})`, {
+								sessionID,
+								from: failedModel,
+								to: plan.newModel,
+								attemptCount: currentState.attemptCount,
 							})
-							.catch(() => {})
+						}
+
+						if (config.notify_on_fallback) {
+							const fromName = failedModel.split("/").pop() || failedModel
+							const toName = plan.newModel.split("/").pop() || plan.newModel
+							await ctx.client.tui
+								.showToast({
+									body: {
+										title: "Model Fallback",
+										message: `${fromName} failed during compaction — next prompt will use ${toName}`,
+										variant: "warning",
+										duration: 5000,
+									},
+								})
+								.catch(() => {})
+						}
 					}
 				}
 
