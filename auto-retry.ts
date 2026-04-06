@@ -258,10 +258,19 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		const mayHaveRecentAbort = source === "session.idle.silent-failure"
 
 		if (modelAlreadyStopped) {
-			logInfo(`Skipping abort — model already stopped (${source})`, {
+			logInfo(`Skipping abort — model already stopped (${source}), waiting for session to settle`, {
 				sessionID,
 				newModel,
 			})
+			// Even though the model has stopped, the host's session may still
+			// be transitioning from the error state.  Without a brief delay,
+			// promptAsync can be accepted but never actually processed — the
+			// session goes idle immediately without generating any output.
+			// A small settling delay lets the host fully clean up before we
+			// start a new prompt loop.
+			await new Promise<void>((resolve) =>
+				setTimeout(() => resolve(), POST_ABORT_DELAY_MS)
+			)
 		} else if (callerAlreadyAborted || mayHaveRecentAbort) {
 			const selfAbortTs = deps.sessionSelfAbortTimestamp.get(sessionID)
 			const msSinceAbort = selfAbortTs ? Date.now() - selfAbortTs : undefined

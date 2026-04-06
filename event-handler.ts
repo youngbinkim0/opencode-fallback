@@ -27,16 +27,19 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 	} = deps
 
 	const handleActivity = async (sessionID: string, activityModel?: string) => {
-		// If a fallback is awaiting results and we know the model that produced
-		// this activity, verify it matches the current fallback model.  Stale
+		// If a fallback is awaiting results, we must verify that this activity
+		// came from the NEW fallback model — not the OLD failed model.  Stale
 		// activity from the failed model (e.g. k2p5 emitting a final
 		// message.part.delta while gemini-flash is being dispatched) must NOT
 		// mark firstTokenReceived or reset the timeout — that would cause
 		// session.idle to declare "fallback model completed" before the actual
 		// fallback model has produced anything.
-		if (activityModel && sessionAwaitingFallbackResult.has(sessionID)) {
+		if (sessionAwaitingFallbackResult.has(sessionID)) {
 			const state = sessionStates.get(sessionID)
-			if (state && state.failedModels.has(activityModel)) {
+
+			// If we know the model that produced this activity, check if it's
+			// a failed model — if so, ignore it entirely.
+			if (activityModel && state && state.failedModels.has(activityModel)) {
 				logInfo("Ignoring activity from already-failed model", {
 					sessionID,
 					activityModel,
@@ -44,6 +47,33 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 				})
 				return
 			}
+
+			// If we DON'T know the model (activityModel is undefined), we
+			// cannot verify this activity came from the fallback model.  It
+			// could be a stale event from the failed model that didn't carry
+			// model info.  Do NOT mark firstTokenReceived — only positively
+			// attributed activity should count as proof the fallback model is
+			// alive.  Still reset the timeout as a safety measure.
+			if (!activityModel) {
+				logInfo("Ignoring unattributed activity during fallback (no model on event)", {
+					sessionID,
+					currentModel: state?.currentModel,
+				})
+				// Reset timeout but don't mark first token received
+				const resolvedAgent = resolveAgentForSession(sessionID, undefined)
+				helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
+				return
+			}
+
+			// Activity is from a known, non-failed model (the fallback model).
+			// Mark first token received and reset the timeout.
+			if (!deps.sessionFirstTokenReceived.get(sessionID)) {
+				deps.sessionFirstTokenReceived.set(sessionID, true)
+			}
+			const resolvedAgent = resolveAgentForSession(sessionID, undefined)
+			helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
+			logInfo("Resetting fallback timeout due to activity", { sessionID, activityModel })
+			return
 		}
 
 		// Any model activity (text deltas, tool calls, diffs) proves the model
@@ -51,13 +81,6 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		// timeout handler skips the abort when it eventually fires.
 		if (!deps.sessionFirstTokenReceived.get(sessionID)) {
 			deps.sessionFirstTokenReceived.set(sessionID, true)
-		}
-
-		if (sessionAwaitingFallbackResult.has(sessionID)) {
-			const resolvedAgent = resolveAgentForSession(sessionID, undefined)
-			helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
-			logInfo("Resetting fallback timeout due to activity", { sessionID, activityModel })
-			return
 		}
 
 		if (sessionAwaitingFallbackResult.size === 0) {

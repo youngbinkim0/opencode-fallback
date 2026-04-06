@@ -1465,7 +1465,7 @@ describe("createEventHandler", () => {
 	})
 
 	describe("#handleActivity sets firstTokenReceived", () => {
-		test("#activity event marks firstTokenReceived true so TTFT timeout skips abort", async () => {
+		test("#activity with no model during fallback does NOT mark firstTokenReceived (unattributed)", async () => {
 			const sessionID = "ses_tool_call_activity"
 			const state = createFallbackState("anthropic/claude-haiku-4-5")
 
@@ -1518,13 +1518,77 @@ describe("createEventHandler", () => {
 			// firstTokenReceived should be false initially
 			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBeUndefined()
 
-			// Simulate a tool call activity event (message.part.delta)
+			// Simulate an activity event with NO model info during fallback
 			await handleActivity(sessionID)
 
-			// After activity, firstTokenReceived must be true
+			// Unattributed activity during fallback must NOT set firstTokenReceived —
+			// we can't verify it came from the fallback model vs the old failed model
+			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBeUndefined()
+
+			// Timeout should still be rescheduled as a safety measure
+			expect(helpers.scheduleSessionFallbackTimeout).toHaveBeenCalled()
+		})
+
+		test("#activity WITH model during fallback marks firstTokenReceived true", async () => {
+			const sessionID = "ses_tool_call_activity_with_model"
+			const state = createFallbackState("anthropic/claude-haiku-4-5")
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+							revert: mock(async () => {}),
+						summarize: mock(async () => ({ data: true })),
+						},
+						tui: {
+							showToast: mock(async () => {}),
+						},
+					},
+				},
+				config: { ...DEFAULT_CONFIG, timeout_seconds: 30 },
+				agentConfigs: undefined,
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
+			}
+
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback: mock(async () => true),
+				resolveAgentForSessionFromContext: mock(async () => undefined),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleActivity } = createEventHandler(deps, helpers)
+
+			// firstTokenReceived should be false initially
+			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBeUndefined()
+
+			// Simulate activity with a known model that is NOT in failedModels
+			await handleActivity(sessionID, "anthropic/claude-haiku-4-5")
+
+			// After attributed activity, firstTokenReceived must be true
 			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBe(true)
 
-			// Timeout should also be rescheduled (since awaiting fallback result)
+			// Timeout should be rescheduled
 			expect(helpers.scheduleSessionFallbackTimeout).toHaveBeenCalled()
 		})
 
@@ -1708,7 +1772,7 @@ describe("createEventHandler", () => {
 			expect(helpers.scheduleSessionFallbackTimeout).toHaveBeenCalled()
 		})
 
-		test("#activity with no model info is accepted (backwards compatible)", async () => {
+		test("#activity with no model info during fallback does NOT mark firstTokenReceived", async () => {
 			const sessionID = "ses_no_model_activity"
 			const state = createFallbackState("kimi-for-coding/k2p5")
 			state.currentModel = "google/gemini-flash"
@@ -1760,12 +1824,15 @@ describe("createEventHandler", () => {
 
 			const { handleActivity } = createEventHandler(deps, helpers)
 
-			// Activity with no model — should still be accepted (backward compat)
+			// Activity with no model during active fallback — cannot be attributed
+			// to the fallback model, so firstTokenReceived must NOT be set.
+			// This prevents stale events from the failed model (which may not
+			// carry model info) from prematurely declaring "fallback completed".
 			await handleActivity(sessionID, undefined)
 
-			// firstTokenReceived should be set
-			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBe(true)
-			// Timeout should be rescheduled
+			// firstTokenReceived should NOT be set
+			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBeUndefined()
+			// Timeout should still be rescheduled as a safety measure
 			expect(helpers.scheduleSessionFallbackTimeout).toHaveBeenCalled()
 		})
 	})
