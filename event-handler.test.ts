@@ -1095,8 +1095,8 @@ describe("createEventHandler", () => {
 	})
 
 	describe("#when session.status fires while sessionAwaitingFallbackResult is set", () => {
-		test("#then it advances the fallback chain to the next model (quota exceeded on current)", async () => {
-			const sessionID = "ses_status_advance"
+		test("#then it stays on the healthy fallback when the retry is not attributable to it (regression: primary model retry must not skip a working fallback)", async () => {
+			const sessionID = "ses_status_stay"
 			const state = createFallbackState("anthropic/claude-opus-4-6")
 			state.currentModel = "github-copilot/grok-code-fast-1"
 			state.attemptCount = 1
@@ -1172,10 +1172,100 @@ describe("createEventHandler", () => {
 				},
 			})
 
-			// Should advance to next model (openai/gpt-4o), not stay on grok-code-fast-1
+			// The current fallback (grok-code-fast-1) is healthy (not in cooldown).
+			// session.status carries no model, so the retry is attributable to the
+			// ORIGINAL model being probed again — stay on the healthy fallback and
+			// do NOT advance past it (this is the fix for the primary-retry bug).
 			expect(autoRetryWithFallback).toHaveBeenCalledTimes(1)
 			const call = autoRetryWithFallback.mock.calls[0]
-			expect(call[1]).toBe("openai/gpt-4o")
+			expect(call[1]).toBe("github-copilot/grok-code-fast-1")
+			// Awaiting should have been cleared
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+		})
+
+		test("#then it advances the chain when the current fallback model itself is in cooldown (genuine failure)", async () => {
+			const sessionID = "ses_status_advance"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			state.currentModel = "github-copilot/grok-code-fast-1"
+			state.attemptCount = 1
+			state.fallbackIndex = 0
+			state.failedModels.set("anthropic/claude-opus-4-6", Date.now())
+			// The current fallback genuinely failed — it should be in cooldown.
+			state.failedModels.set("github-copilot/grok-code-fast-1", Date.now() - 50)
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+						revert: mock(async () => {}),
+						summarize: mock(async () => ({ data: true })),
+					},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {
+					fast: {
+						model: "anthropic/claude-opus-4-6",
+						fallback_models: [
+							"github-copilot/grok-code-fast-1",
+							"openai/gpt-4o",
+						],
+					},
+				},
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				// Fallback already dispatched — awaiting result
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "fast"),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleEvent } = createEventHandler(deps, helpers)
+
+			await handleEvent({
+				event: {
+					type: "session.status",
+					properties: {
+						sessionID,
+						status: {
+							type: "retry",
+							attempt: 1,
+							message: "Too Many Requests: quota exceeded",
+							next: Date.now() + 999999999,
+						},
+					},
+				},
+			})
+
+			// Current fallback genuinely failed (in cooldown) → advance to next model
+			expect(autoRetryWithFallback).toHaveBeenCalledTimes(1)
+			const call2 = autoRetryWithFallback.mock.calls[0]
+			expect(call2[1]).toBe("openai/gpt-4o")
 			// Awaiting should have been cleared
 			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
 		})

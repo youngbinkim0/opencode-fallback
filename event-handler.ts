@@ -11,6 +11,7 @@ import {
 	createFallbackState,
 	prepareFallback,
 	planFallback,
+	isModelInCooldown,
 	snapshotFallbackState,
 	restoreFallbackState,
 } from "./fallback-state"
@@ -365,6 +366,35 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 
 			sessionAwaitingFallbackResult.delete(sessionID)
 			helpers.clearSessionFallbackTimeout(sessionID)
+
+			// ── CORRECT FAILED-MODEL ATTRIBUTION ──
+			// `session.status` does NOT carry the model that triggered the retry.
+			// If we are already inside a fallback chain (currentModel is a fallback)
+			// and that fallback model is NOT in cooldown (it has been working fine),
+			// the retry almost always belongs to the ORIGINAL model being probed
+			// again by the host (e.g. the agent's base model exhausted quota while
+			// the healthy fallback is still active). Blindly advancing the fallback
+			// chain would wrongly burn the healthy fallback (the bug that silently
+			// skipped Gemini 3.8 Flash → DeepSeek). Keep working on the healthy
+			// fallback instead of advancing.
+			if (
+				state.currentModel !== state.originalModel &&
+				!isModelInCooldown(state.currentModel, state, config.cooldown_seconds)
+			) {
+				logInfo("session.status retry during active fallback — current fallback model is healthy, staying on it", {
+					sessionID,
+					originalModel: state.originalModel,
+					currentModel: state.currentModel,
+				})
+				await helpers.autoRetryWithFallback(
+					sessionID,
+					state.currentModel,
+					resolvedAgent,
+					"session.status.stay-on-fallback",
+					undefined
+				)
+				return
+			}
 
 			const plan = planFallback(sessionID, state, fallbackModels, config)
 
@@ -755,6 +785,30 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 
 		sessionAwaitingFallbackResult.delete(sessionID)
 		helpers.clearSessionFallbackTimeout(sessionID)
+
+		// Same failed-model attribution as the main session.status path: if we are
+		// already inside a fallback chain and the current fallback model is not in
+		// cooldown (still healthy), the retry is almost always for the ORIGINAL
+		// model being probed again — stay on the healthy fallback instead of
+		// advancing past it.
+		if (
+			state.currentModel !== state.originalModel &&
+			!isModelInCooldown(state.currentModel, state, config.cooldown_seconds)
+		) {
+			logInfo("session.status immediate retry during active fallback — staying on healthy fallback", {
+				sessionID,
+				originalModel: state.originalModel,
+				currentModel: state.currentModel,
+			})
+			await helpers.autoRetryWithFallback(
+				sessionID,
+				state.currentModel,
+				resolvedAgent,
+				"session.status.immediate-stay-on-fallback",
+				undefined
+			)
+			return
+		}
 
 		const plan = planFallback(sessionID, state, fallbackModels, config)
 
