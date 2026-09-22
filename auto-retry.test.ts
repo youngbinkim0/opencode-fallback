@@ -364,6 +364,36 @@ describe("auto-retry integration", () => {
 		})
 	})
 
+	describe("#given a child session owned by TaskTool", () => {
+		for (const [label, background] of [
+			["foreground", false],
+			["background", true],
+		] as const) {
+			test(`#then ${label} fallback does not cancel the child job`, async () => {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+				})
+				;(deps.ctx.client.session.get as any).mockImplementation(async () => ({
+					data: { parentID: "ses_parent", background },
+				}))
+
+				const helpers = createAutoRetryHelpers(deps)
+				const result = await helpers.autoRetryWithFallback(
+					`ses_${label}`,
+					"openai/gpt-4o",
+					undefined,
+					"session.status"
+				)
+
+				expect(result).toBe(true)
+				expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
+			})
+		}
+	})
+
 	describe("#given autoRetryWithFallback race condition guards", () => {
 		describe("#when state has already been advanced by another handler (plan-based)", () => {
 			test("#then returns false and sets deferredToOtherHandler", async () => {

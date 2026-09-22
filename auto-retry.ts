@@ -143,7 +143,19 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			// next attempt needs a clean slate (the new autoRetryWithFallback
 			// call will re-set the flag if it dispatches compaction again).
 			deps.sessionCompactionInFlight.delete(sessionID)
-			await abortSessionRequest(sessionID, "session.timeout")
+
+			// Aborting a child session also cancels the TaskTool job that is
+			// waiting for it.  Keep the child job alive so its replacement
+			// prompt can complete and deliver its result to the parent.
+			const parentSessionID = await getParentSessionID(sessionID)
+			if (parentSessionID) {
+				logInfo("Skipping timeout abort for child session", {
+					sessionID,
+					parentSessionID,
+				})
+			} else {
+				await abortSessionRequest(sessionID, "session.timeout")
+			}
 
 			if (state.pendingFallbackModel) {
 				state.pendingFallbackModel = undefined
@@ -256,6 +268,8 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		// session.timeout or session.status) may still be propagating.
 		// We must wait for propagation before sending the replay.
 		const mayHaveRecentAbort = source === "session.idle.silent-failure"
+		const parentSessionID = await getParentSessionID(sessionID)
+		const isChildSession = parentSessionID !== null
 
 		if (modelAlreadyStopped) {
 			logInfo(`Skipping abort — model already stopped (${source})`, {
@@ -285,6 +299,14 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					setTimeout(() => resolve(), POST_ABORT_DELAY_MS)
 				)
 			}
+		} else if (isChildSession) {
+			// session.abort marks a foreground TaskTool child as cancelled.  The
+			// retry must remain attached to that job, so dispatch without aborting
+			// the child session first.
+			logInfo(`Skipping pre-fallback abort for child session (${source})`, {
+				sessionID,
+				parentSessionID,
+			})
 		} else {
 			await abortSessionRequest(sessionID, `pre-fallback.${source}`)
 			await new Promise<void>((resolve) =>
@@ -691,7 +713,9 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 										newModel: plan.newModel,
 									})
 									commitSucceeded = false
-									await abortSessionRequest(sessionID, `duplicate-replay.${source}`)
+									if (!isChildSession) {
+										await abortSessionRequest(sessionID, `duplicate-replay.${source}`)
+									}
 								}
 							}
 						}
