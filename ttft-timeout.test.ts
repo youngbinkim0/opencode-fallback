@@ -230,7 +230,7 @@ describe("TTFT-based timeout", () => {
 		})
 
 		describe("#when session is NOT awaiting fallback result", () => {
-			test("#then sessionFirstTokenReceived is not modified", async () => {
+			test("#then sessionFirstTokenReceived is set for first-event content", async () => {
 				const deps = createMockDeps()
 				const mockHelpers = createMockHelpers()
 				// NOT adding to sessionAwaitingFallbackResult
@@ -244,7 +244,7 @@ describe("TTFT-based timeout", () => {
 					parts: [{ type: "text", text: "Hello" }],
 				})
 
-				expect(deps.sessionFirstTokenReceived.has("test-session")).toBe(false)
+				expect(deps.sessionFirstTokenReceived.get("test-session")).toBe(true)
 			})
 		})
 	})

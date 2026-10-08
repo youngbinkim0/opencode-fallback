@@ -53,6 +53,111 @@ function createMockDeps(overrides?: Partial<{
 }
 
 describe("auto-retry integration", () => {
+	describe("#given a child session fallback cancels its parent task", () => {
+		test("#then it retries only the child and leaves result delivery to the task hook", async () => {
+			const childID = "ses_bridge_child"
+			const parentID = "ses_bridge_parent"
+			const childMessages = [
+				{
+					info: { role: "user", agent: "gsd-executor" },
+					parts: [{ type: "text", text: "Execute the worker plan" }],
+				},
+			]
+			const promptCalls: any[] = []
+			const deps = createMockDeps()
+			deps.sessionParentID.set(childID, parentID)
+			;(deps.ctx.client.session.get as any).mockResolvedValue({ data: { status: "idle" } })
+			;(deps.ctx.client.session.messages as any).mockResolvedValue({ data: childMessages })
+			;(deps.ctx.client.session.promptAsync as any).mockImplementation(async (args: any) => {
+				promptCalls.push(args)
+			})
+
+			const { createFallbackState } = await import("./fallback-state")
+			deps.sessionStates.set(childID, createFallbackState("anthropic/claude-sonnet-5"))
+			deps.sessionStates.set(parentID, createFallbackState("openai/gpt-5.6-luna"))
+			const helpers = createAutoRetryHelpers(deps)
+
+			const dispatched = await helpers.autoRetryWithFallback(
+				childID,
+				"openai/gpt-5.6-luna",
+				"gsd-executor",
+				"session.status.immediate",
+				{
+					success: true,
+					newModel: "openai/gpt-5.6-luna",
+					failedModel: "anthropic/claude-sonnet-5",
+					newFallbackIndex: 1,
+				},
+			)
+			await new Promise((resolve) => setTimeout(resolve, 20))
+
+			expect(dispatched).toBe(true)
+			expect((deps.ctx.client.session.abort as any).mock.calls.map((call: any[]) => call[0].path.id)).toEqual([
+				childID,
+			])
+			expect(promptCalls.map((call) => call.path.id)).toEqual([childID])
+			expect(typeof helpers.claimChildFallbackBridge(childID, parentID)).toBe("number")
+		})
+
+		test("#then it never injects a synthetic result turn into the parent", async () => {
+			const childID = "ses_background_child"
+			const parentID = "ses_background_parent"
+			const childMessages: any[] = [
+				{ info: { role: "user", agent: "gsd-executor" }, parts: [{ type: "text", text: "Execute" }] },
+			]
+			const parentMessages = [
+				{
+					info: { role: "assistant", agent: "luna", time: { completed: Date.now() } },
+					parts: [{ type: "text", text: "The executor was cancelled" }],
+				},
+			]
+			const deps = createMockDeps()
+			deps.config.timeout_seconds = 1
+			deps.agentConfigs = {
+				"gsd-executor": { model: "anthropic/claude-sonnet-5" },
+				luna: { model: "openai/gpt-5.6-luna" },
+			}
+			deps.sessionParentID.set(childID, parentID)
+			;(deps.ctx.client.session.get as any).mockResolvedValue({ data: { status: "idle" } })
+			;(deps.ctx.client.session.messages as any).mockImplementation(async ({ path }: any) => ({
+				data: path.id === childID ? childMessages : parentMessages,
+			}))
+			;(deps.ctx.client.session.promptAsync as any).mockImplementation(async ({ path }: any) => {
+				if (path.id === childID) {
+					childMessages.push({
+						info: { role: "assistant", time: { created: Date.now(), completed: Date.now() } },
+						parts: [{ type: "text", text: "Recovered executor result" }],
+					})
+				}
+			})
+			const { createFallbackState } = await import("./fallback-state")
+			deps.sessionStates.set(childID, createFallbackState("anthropic/claude-sonnet-5"))
+			deps.sessionStates.set(parentID, createFallbackState("openai/gpt-5.6-luna"))
+			const helpers = createAutoRetryHelpers(deps)
+
+			await helpers.autoRetryWithFallback(
+				childID,
+				"openai/gpt-5.6-luna",
+				"gsd-executor",
+				"session.status.immediate",
+				{
+					success: true,
+					newModel: "openai/gpt-5.6-luna",
+					failedModel: "anthropic/claude-sonnet-5",
+					newFallbackIndex: 1,
+				},
+			)
+			await new Promise((resolve) => setTimeout(resolve, 20))
+
+			expect((deps.ctx.client.session.abort as any).mock.calls.map((call: any[]) => call[0].path.id)).toEqual([
+				childID,
+			])
+			expect((deps.ctx.client.session.promptAsync as any).mock.calls.map((call: any[]) => call[0].path.id)).toEqual([
+				childID,
+			])
+		})
+	})
+
 	describe("#given autoRetryWithFallback with mixed parts", () => {
 		describe("#when promptAsync succeeds on first call (Tier 1)", () => {
 			test("#then sends all original parts including non-text", async () => {
@@ -360,6 +465,27 @@ describe("auto-retry integration", () => {
 
 				expect(deps.ctx.client.session.abort).toHaveBeenCalled()
 				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
+			})
+
+			test("#then replays the child without an unsupported status poll", async () => {
+				const deps = createMockDeps({
+					messagesData: [{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] }],
+				})
+				deps.sessionParentID.set("child-session", "parent-session")
+				;(deps.ctx.client.session.get as any).mockResolvedValue({ data: { status: "idle" } })
+
+				const helpers = createAutoRetryHelpers(deps)
+				await helpers.autoRetryWithFallback(
+					"child-session",
+					"openai/gpt-4o",
+					undefined,
+					"session.status.immediate",
+				)
+
+				expect(deps.ctx.client.session.abort).toHaveBeenCalled()
+				expect(deps.ctx.client.session.get).not.toHaveBeenCalled()
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalled()
+				helpers.claimChildFallbackBridge("child-session", "parent-session")
 			})
 		})
 	})
@@ -1202,6 +1328,127 @@ describe("auto-retry integration", () => {
 				expect(result).toBe(false)
 				expect(state.currentModel).toBe("google/gemini-flash")
 				expect(state.failedModels.has("kimi-for-coding/k2p5")).toBe(true)
+			})
+		})
+
+		describe("#when summarize reports an error in the result envelope", () => {
+			test("#then it treats it as a failure instead of re-dispatching", async () => {
+				const deps = createMockDeps()
+				// The SDK returns provider failures here rather than throwing.
+				;(deps.ctx.client.session as any).summarize = mock(async () => ({
+					error: { name: "UnknownError", data: {} },
+				}))
+
+				const sessionID = "ses_compact_error_envelope"
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("anthropic/claude-opus-5")
+				deps.sessionStates.set(sessionID, state)
+				deps.globalFallbackModels = [
+					"anthropic/claude-opus-5",
+					"github-copilot/grok-code-fast-1",
+				]
+
+				const helpers = createAutoRetryHelpers(deps)
+				const result = await helpers.autoRetryWithFallback(
+					sessionID,
+					"github-copilot/grok-code-fast-1",
+					"compaction",
+					"session.timeout",
+					{
+						success: true as const,
+						newModel: "github-copilot/grok-code-fast-1",
+						failedModel: "anthropic/claude-opus-5",
+						newFallbackIndex: 1,
+					}
+				)
+
+				// Must not report a successful dispatch, and must not leave a
+				// timeout armed that would walk the rest of the model chain.
+				expect(result).toBe(false)
+				expect(deps.sessionFallbackTimeouts.has(sessionID)).toBe(false)
+				expect(deps.sessionCompactionInFlight.has(sessionID)).toBe(false)
+			})
+		})
+
+		describe("#when session.compacted lands while the fallback is being prepared", () => {
+			test("#then it bails out instead of dispatching a redundant compaction", async () => {
+				const deps = createMockDeps()
+				const sessionID = "ses_compact_completed_race"
+
+				// handleSessionCompacted clears the in-flight sentinel while we
+				// are still aborting/cleaning up messages.
+				;(deps.ctx.client.session.messages as any).mockImplementation(async () => {
+					deps.sessionCompactionInFlight.delete(sessionID)
+					return { data: [] }
+				})
+
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("anthropic/claude-opus-5")
+				deps.sessionStates.set(sessionID, state)
+				deps.globalFallbackModels = [
+					"anthropic/claude-opus-5",
+					"google/antigravity-gemini-3-flash",
+				]
+
+				const helpers = createAutoRetryHelpers(deps)
+				const result = await helpers.autoRetryWithFallback(
+					sessionID,
+					"google/antigravity-gemini-3-flash",
+					"compaction",
+					"session.timeout",
+					{
+						success: true as const,
+						newModel: "google/antigravity-gemini-3-flash",
+						failedModel: "anthropic/claude-opus-5",
+						newFallbackIndex: 1,
+					}
+				)
+
+				expect(result).toBe(false)
+				expect(deps.ctx.client.session.summarize).not.toHaveBeenCalled()
+				expect(deps.sessionFallbackTimeouts.has(sessionID)).toBe(false)
+			})
+		})
+
+		describe("#when two handlers dispatch the same compaction fallback concurrently", () => {
+			test("#then only the first handler aborts and summarizes", async () => {
+				const deps = createMockDeps()
+				const sessionID = "ses_compact_duplicate_dispatch"
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState("anthropic/claude-opus-5")
+				deps.sessionStates.set(sessionID, state)
+				deps.globalFallbackModels = [
+					"anthropic/claude-opus-5",
+					"google/antigravity-gemini-3-flash",
+				]
+
+				const helpers = createAutoRetryHelpers(deps)
+				const plan = {
+					success: true as const,
+					newModel: "google/antigravity-gemini-3-flash",
+					failedModel: "anthropic/claude-opus-5",
+					newFallbackIndex: 1,
+				}
+				const [first, second] = await Promise.all([
+					helpers.autoRetryWithFallback(
+						sessionID,
+						plan.newModel,
+						"compaction",
+						"session.timeout",
+						plan
+					),
+					helpers.autoRetryWithFallback(
+						sessionID,
+						plan.newModel,
+						"compaction",
+						"session.status.immediate",
+						plan
+					),
+				])
+
+				expect([first, second].filter(Boolean)).toHaveLength(1)
+				expect(deps.ctx.client.session.abort).toHaveBeenCalledTimes(1)
+				expect(deps.ctx.client.session.summarize).toHaveBeenCalledTimes(1)
 			})
 		})
 	})

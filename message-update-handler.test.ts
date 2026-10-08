@@ -61,6 +61,30 @@ function createMockHelpers(): AutoRetryHelpers {
 }
 
 describe("message-update-handler", () => {
+	test("#provider-owned child retry does not schedule a TTFT fallback", async () => {
+		const deps = createMockDeps({ timeout_seconds: 30 })
+		const helpers = createMockHelpers()
+		const sessionID = "ses_attached_retry"
+		deps.sessionProviderRetrying = new Set([sessionID])
+
+		const handler = createMessageUpdateHandler(deps, helpers)
+		await handler({
+			info: {
+				role: "assistant",
+				sessionID,
+				providerID: "anthropic",
+				modelID: "claude-sonnet-5",
+				status: "Retrying in 3600 seconds",
+				message: "Too many requests - quota exceeded",
+			},
+			parts: [],
+		})
+
+		expect(helpers.scheduleSessionFallbackTimeout).not.toHaveBeenCalled()
+		expect(helpers.autoRetryWithFallback).not.toHaveBeenCalled()
+		expect(deps.sessionFirstTokenReceived.has(sessionID)).toBe(false)
+	})
+
 	describe("#given hasVisibleAssistantResponse", () => {
 		describe("#when assistant has visible text content", () => {
 			test("#then returns true", async () => {
@@ -538,6 +562,54 @@ describe("message-update-handler", () => {
 				expect(ts).toBeDefined()
 				expect(ts!).toBeGreaterThanOrEqual(before)
 			})
+		})
+	})
+
+	describe("#when an error update races with an active retry", () => {
+		test("#then it preserves the active fallback state", async () => {
+			const deps = createMockDeps()
+			const helpers = createMockHelpers()
+			const sessionID = "ses_retry_race"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			state.currentModel = "google/gemini-pro"
+			deps.sessionStates.set(sessionID, state)
+			deps.sessionAwaitingFallbackResult.add(sessionID)
+			deps.sessionRetryInFlight.add(sessionID)
+
+			const handler = createMessageUpdateHandler(deps, helpers)
+			await handler({
+				info: {
+					sessionID,
+					role: "assistant",
+					model: "google/gemini-pro",
+					error: { statusCode: 429, message: "rate limited" },
+				},
+			})
+
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(true)
+			expect(helpers.clearSessionFallbackTimeout).not.toHaveBeenCalled()
+		})
+	})
+
+	describe("#when the first assistant update already has content", () => {
+		test("#then it records first-token activity without scheduling TTFT", async () => {
+			const deps = createMockDeps({ timeout_seconds: 30 })
+			const helpers = createMockHelpers()
+			const sessionID = "ses_first_content"
+			const handler = createMessageUpdateHandler(deps, helpers)
+
+			await handler({
+				info: {
+					sessionID,
+					role: "assistant",
+					model: "anthropic/claude-opus-4-6",
+				},
+				parts: [{ type: "text", text: "The response starts here." }],
+			})
+
+			expect(deps.sessionStates.has(sessionID)).toBe(true)
+			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBe(true)
+			expect(helpers.scheduleSessionFallbackTimeout).not.toHaveBeenCalled()
 		})
 	})
 

@@ -142,6 +142,12 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 					}
 				: undefined)
 		const role = info?.role as string | undefined
+		const hasConcreteContent = parts?.some(
+			(p) =>
+				(p.type === "text" && typeof p.text === "string" && p.text.trim().length > 0) ||
+				p.type === "tool_call" ||
+				p.type === "tool"
+		)
 		const model =
 			(info?.model as string | undefined) ??
 			(typeof info?.providerID === "string" && typeof info?.modelID === "string"
@@ -159,6 +165,16 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				hasInfoError: !!info?.error,
 				errorType: info?.error ? classifyErrorType(info.error) : undefined,
 			})
+
+			if (deps.sessionProviderRetrying?.has(sessionID)) {
+				if (hasConcreteContent) {
+					deps.sessionProviderRetrying.delete(sessionID)
+				} else if (retrySignal || !info?.error) {
+					return
+				} else {
+					deps.sessionProviderRetrying.delete(sessionID)
+				}
+			}
 		}
 
 		if (sessionID && role === "assistant" && !error) {
@@ -173,7 +189,23 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 		}
 
 		if (sessionID && role === "assistant" && !error) {
+			if (hasConcreteContent) {
+				deps.sessionProviderRetrying?.delete(sessionID)
+			}
 			if (!sessionAwaitingFallbackResult.has(sessionID)) {
+				const eventHasContent = hasConcreteContent
+
+				// Create state even when the first update already contains content.
+				// Otherwise the first response is not tracked until a later event.
+				if (model && !sessionStates.has(sessionID)) {
+					const state = createFallbackState(model)
+					sessionStates.set(sessionID, state)
+					sessionLastAccess.set(sessionID, Date.now())
+				}
+				if (eventHasContent) {
+					deps.sessionFirstTokenReceived.set(sessionID, true)
+				}
+
 				// ── PRIMARY MODEL TTFT TIMEOUT ──
 				// Schedule a TTFT timeout when we see the first message.updated for
 				// a session that hasn't received a first token yet and doesn't
@@ -188,16 +220,11 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 					model &&
 					config.timeout_seconds > 0 &&
 					!deps.sessionFirstTokenReceived.get(sessionID) &&
-					!deps.sessionFallbackTimeouts.has(sessionID)
+					!deps.sessionFallbackTimeouts.has(sessionID) &&
+					!deps.sessionProviderRetrying?.has(sessionID) &&
+					!eventHasContent
 
 				if (needsTimeout) {
-					// Create state if this is a brand new session
-					if (!sessionStates.has(sessionID)) {
-						const state = createFallbackState(model)
-						sessionStates.set(sessionID, state)
-						sessionLastAccess.set(sessionID, Date.now())
-					}
-
 					// Resolve agent asynchronously for timeout handler
 					const agent = info?.agent as string | undefined
 					helpers.resolveAgentForSessionFromContext(sessionID, agent)
@@ -226,12 +253,6 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				// message.updated when it *creates* the assistant message slot
 				// (before any tokens arrive) and we must not treat that empty
 				// frame as proof the model is streaming.
-				const eventHasContent = parts?.some(
-					(p) =>
-						(p.type === "text" && typeof p.text === "string" && p.text.trim().length > 0) ||
-						p.type === "tool_call" ||
-						p.type === "tool"
-				)
 				if (eventHasContent) {
 					deps.sessionFirstTokenReceived.set(sessionID, true)
 				}
@@ -398,8 +419,6 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				return
 			}
 			
-			sessionAwaitingFallbackResult.delete(sessionID)
-
 			// ── EARLY LOCK ACQUISITION ──
 			// Acquire the retry lock BEFORE any async work to prevent
 			// session.error from interleaving via microtask scheduling.
@@ -431,6 +450,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 			// Acquire the lock now — before any async calls that could yield
 			// and allow session.error to interleave.
 			deps.sessionRetryInFlight.add(sessionID)
+			sessionAwaitingFallbackResult.delete(sessionID)
 
 			try {
 				if (retrySignal && timeoutEnabled) {

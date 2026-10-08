@@ -652,8 +652,8 @@ describe("createEventHandler", () => {
 		})
 	})
 
-	describe("#when session.idle resolves idle waiters before checking awaiting state", () => {
-		test("#then waiters are resolved even when sessionAwaitingFallbackResult is set", async () => {
+	describe("#when session completion resolves idle waiters", () => {
+		test("#then status idle resolves waiters even when sessionAwaitingFallbackResult is set", async () => {
 			const sessionID = "ses_idle_waiters"
 			let waiterResolved = false
 
@@ -703,8 +703,8 @@ describe("createEventHandler", () => {
 
 			await handleEvent({
 				event: {
-					type: "session.idle",
-					properties: { sessionID },
+					type: "session.status",
+					properties: { sessionID, status: { type: "idle" } },
 				},
 			})
 
@@ -1178,6 +1178,226 @@ describe("createEventHandler", () => {
 			expect(call[1]).toBe("openai/gpt-4o")
 			// Awaiting should have been cleared
 			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+		})
+	})
+
+	describe("#when a foreground child reports a provider retry beyond the timeout", () => {
+		test("#then it remains attached and does not dispatch a fallback replay", async () => {
+			const sessionID = "ses_attached_child"
+			const state = createFallbackState("anthropic/claude-sonnet-5")
+			const fallbackTimeout = setTimeout(() => {}, 60_000)
+			const autoRetryWithFallback = mock(async () => true)
+			const clearSessionFallbackTimeout = mock(() => {
+				clearTimeout(fallbackTimeout)
+				deps.sessionFallbackTimeouts.delete(sessionID)
+			})
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+							revert: mock(async () => {}),
+							summarize: mock(async () => ({ data: true })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG, timeout_seconds: 30 },
+				agentConfigs: {
+					"gsd-executor": {
+						model: "anthropic/claude-sonnet-5",
+						fallback_models: ["openai/gpt-5.6-luna"],
+					},
+				},
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map([[sessionID, fallbackTimeout]]),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map([[sessionID, "ses_parent"]]),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
+				sessionProviderRetrying: new Set(),
+			}
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout,
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "gsd-executor"),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => "ses_parent"),
+			}
+
+			const { handleEvent } = createEventHandler(deps, helpers)
+			await handleEvent({
+				event: {
+					type: "session.status",
+					properties: {
+						sessionID,
+						status: {
+							type: "retry",
+							message: "This request would exceed your account's rate limit.",
+							next: Date.now() + 3_600_000,
+						},
+					},
+				},
+			})
+
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+			expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
+			expect(clearSessionFallbackTimeout).toHaveBeenCalledWith(sessionID)
+			expect(deps.sessionProviderRetrying?.has(sessionID)).toBe(true)
+		})
+	})
+
+	describe("#when session.status arrives after fallback response activity", () => {
+		test("#then it ignores the stale retry event", async () => {
+			const sessionID = "ses_status_after_response"
+			const state = createFallbackState("anthropic/claude-opus-4-6")
+			state.currentModel = "google/gemini-pro"
+			state.attemptCount = 1
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({
+								data: [{
+									info: { role: "assistant" },
+									parts: [{ type: "text", text: "completed response" }],
+								}],
+							})),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+							revert: mock(async () => {}),
+							summarize: mock(async () => ({ data: true })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {
+					fast: {
+						model: "anthropic/claude-opus-4-6",
+						fallback_models: ["google/gemini-pro", "openai/gpt-4o"],
+					},
+				},
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map([[sessionID, true]]),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "fast"),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleEvent } = createEventHandler(deps, helpers)
+			await handleEvent({
+				event: {
+					type: "session.status",
+					properties: {
+						sessionID,
+						status: { type: "retry", message: "late provider retry" },
+					},
+				},
+			})
+
+			expect(autoRetryWithFallback).not.toHaveBeenCalled()
+			expect(deps.ctx.client.tui.showToast).not.toHaveBeenCalled()
+		})
+
+		test("#then it handles retry when activity had no visible response", async () => {
+			const sessionID = "ses_status_empty_activity"
+			const state = createFallbackState("anthropic/claude-opus-5")
+			const autoRetryWithFallback = mock(async () => true)
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+							get: mock(async () => ({ data: {} })),
+							command: mock(async () => {}),
+							revert: mock(async () => {}),
+							summarize: mock(async () => ({ data: true })),
+						},
+						tui: { showToast: mock(async () => {}) },
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {
+					general: {
+						model: "anthropic/claude-opus-5",
+						fallback_models: ["openai/gpt-5.6-sol"],
+					},
+				},
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set(),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map([[sessionID, true]]),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
+			}
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "general"),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleEvent } = createEventHandler(deps, helpers)
+			await handleEvent({
+				event: {
+					type: "session.status",
+					properties: {
+						sessionID,
+						status: { type: "retry", message: "rate limit" },
+					},
+				},
+			})
+
+			expect(autoRetryWithFallback).toHaveBeenCalledTimes(1)
+			expect(autoRetryWithFallback.mock.calls[0][1]).toBe("openai/gpt-5.6-sol")
 		})
 	})
 
@@ -1772,9 +1992,11 @@ describe("createEventHandler", () => {
 			expect(helpers.scheduleSessionFallbackTimeout).toHaveBeenCalled()
 		})
 
-		test("#activity with no model info during fallback does NOT mark firstTokenReceived", async () => {
+		test("#unattributed activity after fallback commit only resets timeout, never marks firstTokenReceived", async () => {
 			const sessionID = "ses_no_model_activity"
 			const state = createFallbackState("kimi-for-coding/k2p5")
+			// Simulate committed fallback: currentModel differs from original,
+			// and the original model is in failedModels.
 			state.currentModel = "google/gemini-flash"
 			state.failedModels.set("kimi-for-coding/k2p5", Date.now())
 
@@ -1824,16 +2046,102 @@ describe("createEventHandler", () => {
 
 			const { handleActivity } = createEventHandler(deps, helpers)
 
-			// Activity with no model during active fallback — cannot be attributed
-			// to the fallback model, so firstTokenReceived must NOT be set.
-			// This prevents stale events from the failed model (which may not
-			// carry model info) from prematurely declaring "fallback completed".
+			// Stale unattributed activity after fallback commit must NOT be
+			// treated as first output from the fallback model.
 			await handleActivity(sessionID, undefined)
 
-			// firstTokenReceived should NOT be set
-			expect(deps.sessionFirstTokenReceived.get(sessionID)).toBeUndefined()
-			// Timeout should still be rescheduled as a safety measure
-			expect(helpers.scheduleSessionFallbackTimeout).toHaveBeenCalled()
+			// firstTokenReceived MUST remain unset — only attributed activity
+			// (carrying the fallback model's ID) can set it.
+			expect(deps.sessionFirstTokenReceived.has(sessionID)).toBe(false)
+			// Timeout should still be reset (liveness signal is preserved)
+			expect(helpers.scheduleSessionFallbackTimeout).toHaveBeenCalledTimes(1)
+			expect(helpers.scheduleSessionFallbackTimeout.mock.calls[0][0]).toBe(sessionID)
+		})
+
+		test("#given stale unattributed activity after commit + session.idle, #then silent-failure retry still fires", async () => {
+			const sessionID = "ses_stale_idle_regression"
+			const state = createFallbackState("google/antigravity-gemini-3-flash")
+			// Simulate committed fallback to 3.1-pro: original model failed.
+			state.currentModel = "google/antigravity-gemini-3.1-pro"
+			state.attemptCount = 1
+			state.fallbackIndex = 0
+			state.failedModels.set("google/antigravity-gemini-3-flash", Date.now())
+
+			const deps: HookDeps = {
+				ctx: {
+					directory: "/test",
+					client: {
+						session: {
+							abort: mock(async () => {}),
+							messages: mock(async () => ({ data: [] })),
+							promptAsync: mock(async () => {}),
+						get: mock(async () => ({ data: {} })),
+						command: mock(async () => {}),
+						revert: mock(async () => {}),
+						summarize: mock(async () => ({ data: true })),
+					},
+						tui: {
+							showToast: mock(async () => {}),
+						},
+					},
+				},
+				config: { ...DEFAULT_CONFIG },
+				agentConfigs: {
+					test: {
+						model: "google/antigravity-gemini-3-flash",
+						fallback_models: [
+							"google/antigravity-gemini-3.1-pro",
+							"github-copilot/gemini-3.1-pro-preview",
+						],
+					},
+				},
+				globalFallbackModels: [],
+				sessionStates: new Map([[sessionID, state]]),
+				sessionLastAccess: new Map(),
+				sessionRetryInFlight: new Set(),
+				sessionAwaitingFallbackResult: new Set([sessionID]),
+				sessionFallbackTimeouts: new Map(),
+				sessionFirstTokenReceived: new Map(),
+				sessionSelfAbortTimestamp: new Map(),
+				sessionParentID: new Map(),
+				sessionIdleResolvers: new Map(),
+				sessionLastMessageTime: new Map(),
+				sessionCompactionInFlight: new Set(),
+			}
+
+			const autoRetryWithFallback = mock(async () => true)
+			const helpers = {
+				abortSessionRequest: mock(async () => {}),
+				clearSessionFallbackTimeout: mock(() => {}),
+				scheduleSessionFallbackTimeout: mock(() => {}),
+				autoRetryWithFallback,
+				resolveAgentForSessionFromContext: mock(async () => "test"),
+				cleanupStaleSessions: mock(() => {}),
+				getParentSessionID: mock(async () => null),
+			}
+
+			const { handleEvent, handleActivity } = createEventHandler(deps, helpers)
+
+			// 1. Stale unattributed activity arrives after the fallback commit
+			//    (e.g. late message.part.delta / session.diff with no model info).
+			await handleActivity(sessionID, undefined)
+			// The liveness signal resets the timeout, but does NOT mark first token.
+			expect(deps.sessionFirstTokenReceived.has(sessionID)).toBe(false)
+
+			// 2. Session goes idle while still awaiting the fallback result.
+			await handleEvent({
+				event: { type: "session.idle", properties: { sessionID } },
+			})
+
+			// Regression: before the fix, step 1 set firstTokenReceived=true,
+			// so session.idle declared "fallback model completed" and NO retry
+			// fired.  Now the silent-failure path must advance the chain.
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+			expect(autoRetryWithFallback).toHaveBeenCalledTimes(1)
+			const call = autoRetryWithFallback.mock.calls[0]
+			expect(call[0]).toBe(sessionID)
+			expect(call[1]).toBe("github-copilot/gemini-3.1-pro-preview")
+			expect(call[3]).toBe("session.idle.silent-failure")
 		})
 	})
 })

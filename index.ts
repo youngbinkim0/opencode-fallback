@@ -11,7 +11,12 @@ import { createEventHandler } from "./event-handler"
 import { createMessageUpdateHandler } from "./message-update-handler"
 import { createChatMessageHandler } from "./chat-message-handler"
 import { normalizeFallbackModelsField } from "./config-reader"
-import { isEmptyTaskResult, extractChildSessionID, waitForChildFallbackResult } from "./subagent-result-sync"
+import {
+	isEmptyTaskResult,
+	isCancelledTaskResult,
+	extractChildSessionID,
+	waitForChildFallbackResult,
+} from "./subagent-result-sync"
 import { readFileSync, existsSync } from "fs"
 import { join } from "path"
 import { parse as parseJsonc } from "jsonc-parser"
@@ -24,10 +29,10 @@ declare function setInterval(
 
 function loadPluginConfig(directory: string): Partial<FallbackPluginConfig> {
 	const configPaths = [
-		join(directory, ".opencode", "opencode-fallback.json"),
 		join(directory, ".opencode", "opencode-fallback.jsonc"),
-		join(process.env.HOME || "", ".config", "opencode", "opencode-fallback.json"),
+		join(directory, ".opencode", "opencode-fallback.json"),
 		join(process.env.HOME || "", ".config", "opencode", "opencode-fallback.jsonc"),
+		join(process.env.HOME || "", ".config", "opencode", "opencode-fallback.json"),
 	]
 
 	for (const configPath of configPaths) {
@@ -52,7 +57,9 @@ export default async function OpenCodeFallbackPlugin(
 	let agentConfigs: Record<string, unknown> | undefined
 	let fileConfig: Partial<FallbackPluginConfig> = loadPluginConfig(ctx.directory)
 	let mergedConfig: Required<FallbackPluginConfig> | undefined
-	const globalFallbackModels = normalizeFallbackModelsField(fileConfig.fallback_models)
+	const globalFallbackModels = normalizeFallbackModelsField(
+		configOverrides?.fallback_models ?? fileConfig.fallback_models
+	)
 
 	// Config getter that builds config on first access
 	const getConfig = (): Required<FallbackPluginConfig> => {
@@ -114,6 +121,7 @@ export default async function OpenCodeFallbackPlugin(
 		sessionIdleResolvers: new Map(),
 		sessionLastMessageTime: new Map(),
 		sessionCompactionInFlight: new Set(),
+		sessionProviderRetrying: new Set(),
 	}
 
 	const helpers = createAutoRetryHelpers(deps)
@@ -162,11 +170,7 @@ export default async function OpenCodeFallbackPlugin(
 				return
 			}
 			
-			if (
-				event.type === "message.part.delta" ||
-				event.type === "session.diff" ||
-				event.type === "message.part.updated"
-			) {
+			if (hasConcreteAssistantActivity(event.type, event.properties)) {
 				const props = event.properties as Record<string, unknown> | undefined
 				const info = props?.info as Record<string, unknown> | undefined
 				const sessionID =
@@ -195,21 +199,53 @@ export default async function OpenCodeFallbackPlugin(
 			input: { tool: string; sessionID: string; callID: string; args: any },
 			output: { title: string; output: string; metadata: any }
 		) => {
-			// Only intercept task tool calls with empty results
-			if (input.tool !== "task" || !isEmptyTaskResult(output.output)) {
+			// OpenCode can report a child that failed during fallback as either an
+			// empty task result or a cancelled task-tool error.
+			const isEmptyResult = isEmptyTaskResult(output.output)
+			const isCancelledResult = isCancelledTaskResult(output.output, output.metadata)
+			if (input.tool !== "task" || (!isEmptyResult && !isCancelledResult)) {
 				return
 			}
 
-			const childSessionID = extractChildSessionID(output.output)
+			const childSessionID =
+				extractChildSessionID(output.output) ??
+				extractChildSessionID(serializeMetadata(output.metadata))
 			if (!childSessionID) {
-				logInfo("Empty task result but no child session ID found", {
+				logInfo("Task result needs fallback sync but no child session ID found", {
 					sessionID: input.sessionID,
 					outputPreview: output.output?.substring(0, 200),
 				})
 				return
 			}
 
-			logInfo("Detected empty task result, waiting for child fallback", {
+			// A task can also be cancelled by OpenCode when the model exhausts its
+			// reasoning/output limit. Do not wait for a fallback that was never
+			// dispatched; ordinary task cancellation should return immediately.
+			const bridgeStartedAt = helpers.claimChildFallbackBridge(childSessionID, input.sessionID)
+			if (
+				isCancelledResult &&
+				bridgeStartedAt === undefined &&
+				!deps.sessionAwaitingFallbackResult.has(childSessionID) &&
+				!deps.sessionRetryInFlight.has(childSessionID) &&
+				!deps.sessionStates.get(childSessionID)?.pendingFallbackModel
+			) {
+				logInfo("Ignoring cancelled task without active fallback", {
+					parentSession: input.sessionID,
+					childSession: childSessionID,
+				})
+				return
+			}
+
+			if (isEmptyResult && !deps.sessionRetryInFlight.has(childSessionID)) {
+				logInfo("Empty task result has no active fallback; dispatching child fallback", {
+					parentSession: input.sessionID,
+					childSession: childSessionID,
+				})
+				const taskAgent =
+					typeof input.args?.subagent_type === "string" ? input.args.subagent_type : undefined
+				await helpers.retryEmptyChildTask(childSessionID, taskAgent)
+			}
+			logInfo("Detected task result requiring fallback sync, waiting for child fallback", {
 				parentSession: input.sessionID,
 				childSession: childSessionID,
 			})
@@ -219,23 +255,28 @@ export default async function OpenCodeFallbackPlugin(
 				(deps.config.timeout_seconds || 120) * 1000,
 				120_000,
 			)
-			const replacementText = await waitForChildFallbackResult(deps, childSessionID, {
-				maxWaitMs,
-				pollIntervalMs: 500,
-			})
+			try {
+				const replacementText = await waitForChildFallbackResult(deps, childSessionID, {
+					maxWaitMs,
+					pollIntervalMs: 500,
+					notBeforeMs: bridgeStartedAt,
+				})
 
-			if (replacementText) {
-				output.output = replacementText
-				logInfo("Replaced empty task result with fallback response", {
-					parentSession: input.sessionID,
-					childSession: childSessionID,
-					responseLength: replacementText.length,
-				})
-			} else {
-				logInfo("No fallback response available, preserving original output", {
-					parentSession: input.sessionID,
-					childSession: childSessionID,
-				})
+				if (replacementText) {
+					output.output = replacementText
+					logInfo("Replaced task result with fallback response", {
+						parentSession: input.sessionID,
+						childSession: childSessionID,
+						responseLength: replacementText.length,
+					})
+				} else {
+					logInfo("No fallback response available, preserving original output", {
+						parentSession: input.sessionID,
+						childSession: childSessionID,
+					})
+				}
+			} finally {
+				helpers.clearChildFallbackBridge(childSessionID)
 			}
 		},
 
@@ -245,5 +286,30 @@ export default async function OpenCodeFallbackPlugin(
 		) => {
 			await chatMessageHandler(input, output)
 		},
+	}
+}
+
+export function hasConcreteAssistantActivity(type: string, properties: unknown): boolean {
+	const props = properties as Record<string, unknown> | undefined
+	if (type === "message.part.delta") {
+		const field = props?.field
+		return (field === "text" || field === "reasoning") &&
+			typeof props?.delta === "string" && props.delta.length > 0
+	}
+	if (type !== "message.part.updated") return false
+
+	const part = props?.part as Record<string, unknown> | undefined
+	if (!part) return false
+	if (part.type === "tool") return true
+	return (part.type === "text" || part.type === "reasoning") &&
+		typeof part.text === "string" && part.text.length > 0
+}
+
+function serializeMetadata(metadata: unknown): string {
+	if (typeof metadata === "string") return metadata
+	try {
+		return JSON.stringify(metadata) ?? ""
+	} catch {
+		return ""
 	}
 }

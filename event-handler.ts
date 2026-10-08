@@ -6,7 +6,9 @@ import {
 	extractErrorName,
 	classifyErrorType,
 	isRetryableError,
+	extractAutoRetrySignal,
 } from "./error-classifier"
+import { hasVisibleAssistantResponse } from "./message-update-handler"
 import {
 	createFallbackState,
 	prepareFallback,
@@ -25,6 +27,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		sessionAwaitingFallbackResult,
 		sessionFallbackTimeouts,
 	} = deps
+	const checkVisibleResponse = hasVisibleAssistantResponse(extractAutoRetrySignal)
 
 	const handleActivity = async (sessionID: string, activityModel?: string) => {
 		// If a fallback is awaiting results, we must verify that this activity
@@ -48,18 +51,40 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 				return
 			}
 
-			// If we DON'T know the model (activityModel is undefined), we
-			// cannot verify this activity came from the fallback model.  It
-			// could be a stale event from the failed model that didn't carry
-			// model info.  Do NOT mark firstTokenReceived — only positively
-			// attributed activity should count as proof the fallback model is
-			// alive.  Still reset the timeout as a safety measure.
+			// If we DON'T know the model (activityModel is undefined), this
+			// activity is UNATTRIBUTABLE: it could be stale output flushed by
+			// the failed model or it could be real output from the fallback
+			// model.  We cannot tell the difference from the event alone.
+			//
+			// Safety rule (Option B): unattributed activity must NEVER mark
+			// firstTokenReceived — only an attributed first token (via
+			// message.updated with model info, or activity carrying model info)
+			// can do that.  If we let stale unattributed activity after
+			// commitFallback set the flag, session.idle will declare "fallback
+			// model completed" and suppress the silent-failure retry, even
+			// though the fallback model never actually produced a token.
+			//
+			// Unattributed activity is still useful as a liveness signal, so we
+			// reset the fallback timeout in both cases — pre-commit (stale
+			// activity from the failed model) and post-commit (ambiguous, but
+			// resetting the timeout is harmless: if the fallback model is truly
+			// dead, the timeout will fire and retry as usual).
 			if (!activityModel) {
-				logInfo("Ignoring unattributed activity during fallback (no model on event)", {
-					sessionID,
-					currentModel: state?.currentModel,
-				})
-				// Reset timeout but don't mark first token received
+				const fallbackCommitted = state &&
+					state.currentModel !== state.originalModel &&
+					state.failedModels.size > 0
+
+				if (!fallbackCommitted) {
+					logInfo("Ignoring unattributed activity during fallback (pre-commit, no model on event)", {
+						sessionID,
+						currentModel: state?.currentModel,
+					})
+				} else {
+					logInfo("Unattributed activity after fallback commit — resetting timeout only, NOT marking first token (no model on event)", {
+						sessionID,
+						currentModel: state?.currentModel,
+					})
+				}
 				const resolvedAgent = resolveAgentForSession(sessionID, undefined)
 				helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
 				return
@@ -122,6 +147,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 
 		if (sessionID) {
 			logInfo("Cleaning up session state", { sessionID })
+			helpers.clearChildFallbackBridge?.(sessionID)
 			sessionStates.delete(sessionID)
 			sessionLastAccess.delete(sessionID)
 			sessionRetryInFlight.delete(sessionID)
@@ -130,6 +156,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			deps.sessionSelfAbortTimestamp.delete(sessionID)
 			deps.sessionParentID.delete(sessionID)
 			deps.sessionCompactionInFlight.delete(sessionID)
+			deps.sessionProviderRetrying?.delete(sessionID)
 			deps.sessionIdleResolvers.delete(sessionID)
 			deps.sessionLastMessageTime.delete(sessionID)
 			helpers.clearSessionFallbackTimeout(sessionID)
@@ -153,6 +180,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		sessionAwaitingFallbackResult.delete(sessionID)
 		deps.sessionCompactionInFlight.delete(sessionID)
 		deps.sessionSelfAbortTimestamp.delete(sessionID)
+		deps.sessionProviderRetrying?.delete(sessionID)
 
 		const state = sessionStates.get(sessionID)
 		if (state?.pendingFallbackModel) {
@@ -165,6 +193,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 	const handleSessionIdle = async (props: Record<string, unknown> | undefined) => {
 		const sessionID = props?.sessionID as string | undefined
 		if (!sessionID) return
+		deps.sessionProviderRetrying?.delete(sessionID)
 
 		// Resolve any idle waiters FIRST (e.g. subagent-sync waiting for
 		// a child session's fallback to complete). This must happen before
@@ -299,7 +328,54 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		const status = props?.status as
 			| { type?: string; attempt?: number; message?: string; next?: number }
 			| undefined
-		if (!sessionID || !status || status.type !== "retry") return
+		if (!sessionID || !status) return
+
+		// Some OpenCode versions report completion as session.status(idle)
+		// instead of emitting session.idle. Route both forms through the same
+		// waiter-resolution and fallback-state cleanup path.
+		if (status.type === "idle") {
+			await handleSessionIdle(props)
+			return
+		}
+
+		if (status.type !== "retry") return
+		// A provider retry event can arrive after the fallback response has
+		// already produced content and the session is no longer awaiting a
+		// fallback result. Treat it as stale instead of starting another
+		// fallback replay from the completed request.
+		if (
+			deps.sessionFirstTokenReceived.get(sessionID) &&
+			!sessionAwaitingFallbackResult.has(sessionID) &&
+			await checkVisibleResponse(deps.ctx, sessionID, undefined)
+		) {
+			logInfo("Ignoring stale provider retry after response activity", { sessionID })
+			return
+		}
+
+		// Aborting a foreground child also cancels the parent task in OpenCode.
+		// Leave provider retries attached to their original task rather than
+		// replaying the child in a detached session and fabricating a parent turn.
+		const parentID = await helpers.getParentSessionID(sessionID)
+		if (parentID) {
+			deps.sessionProviderRetrying?.add(sessionID)
+			helpers.clearSessionFallbackTimeout(sessionID)
+			logInfo("Leaving foreground child retry attached to parent task", {
+				sessionID,
+				parentID,
+				nextRetryMs: status.next,
+			})
+			if (config.notify_on_fallback) {
+				await deps.ctx.client.tui.showToast({
+					body: {
+						title: "Subagent Provider Retrying",
+						variant: "warning",
+						duration: 8000,
+						message: "Keeping the subagent attached; automatic fallback would cancel its parent task.",
+					},
+				}).catch(() => {})
+			}
+			return
+		}
 
 		// ── EARLY LOCK ACQUISITION ──
 		if (sessionRetryInFlight.has(sessionID)) {
@@ -313,6 +389,18 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 				sessionID,
 				undefined
 			)
+
+			// The response may have completed while agent resolution was
+			// awaiting I/O. Re-check before mutating state or dispatching a
+			// second fallback for the stale retry event.
+			if (
+				deps.sessionFirstTokenReceived.get(sessionID) &&
+				!sessionAwaitingFallbackResult.has(sessionID) &&
+				await checkVisibleResponse(deps.ctx, sessionID, undefined)
+			) {
+				logInfo("Ignoring stale provider retry after response activity", { sessionID })
+				return
+			}
 			const fallbackModels = getFallbackModelsForSession(
 				sessionID,
 				resolvedAgent,
@@ -446,7 +534,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			logInfo("session.error without sessionID, skipping")
 			return
 		}
-
+		deps.sessionProviderRetrying?.delete(sessionID)
 		// ── COMPACTION IN-FLIGHT GUARD ──
 		// Compaction via session.command produces no standard events.  Any
 		// session.error arriving while compaction is running is from the

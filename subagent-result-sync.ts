@@ -10,11 +10,26 @@ export function isEmptyTaskResult(output: string): boolean {
 	return /<task_result>\s*<\/task_result>/.test(output)
 }
 
+/** Detect the task-tool error emitted when OpenCode cancels a child call. */
+export function isCancelledTaskResult(output: string, metadata?: unknown): boolean {
+	let metadataText = ""
+	if (typeof metadata === "string") {
+		metadataText = metadata
+	} else {
+		try {
+			metadataText = JSON.stringify(metadata ?? "") ?? ""
+		} catch {
+			// Metadata is diagnostic only; an unserializable value must not block sync.
+		}
+	}
+	return /task\s+cancelled/i.test(output) || /task\s+cancelled/i.test(metadataText)
+}
+
 /**
  * Extract the child session ID from task tool output.
  * Format: `task_id: ses_XXXXX (for resuming...)`
  */
-const TASK_ID_REGEX = /task_id:\s*(ses_[a-zA-Z0-9]+)/
+const TASK_ID_REGEX = /["']?(?:task_id|sessionID|sessionId)["']?\s*:\s*["']?(ses_[a-zA-Z0-9]+)/
 
 export function extractChildSessionID(output: string): string | null {
 	if (!output) return null
@@ -27,6 +42,8 @@ export interface WaitOptions {
 	maxWaitMs?: number
 	/** Polling interval in milliseconds (only used as fallback for streaming check) */
 	pollIntervalMs?: number
+	/** Ignore assistant messages created before this timestamp. */
+	notBeforeMs?: number
 }
 
 /**
@@ -191,7 +208,7 @@ export async function waitForChildFallbackResult(
 	}
 
 	// Phase 3: Extract the assistant response
-	const result = await extractAssistantResponse(deps, childSessionID)
+	const result = await extractAssistantResponse(deps, childSessionID, options?.notBeforeMs)
 	if (result) {
 		logInfo(`[subagent-sync] Got fallback result for ${childSessionID} (${Date.now() - startTime}ms)`)
 		return result
@@ -208,6 +225,7 @@ export async function waitForChildFallbackResult(
 async function extractAssistantResponse(
 	deps: HookDeps,
 	childSessionID: string,
+	notBeforeMs?: number,
 ): Promise<string | null> {
 	try {
 		const msgs = await deps.ctx.client.session.messages({
@@ -218,9 +236,17 @@ async function extractAssistantResponse(
 		if (!msgs.data || msgs.data.length === 0) return null
 
 		// Find the last assistant message
-		const lastAssistant = [...msgs.data].reverse().find(
-			(m) => m.info?.role === "assistant",
-		)
+		const lastAssistant = [...msgs.data].reverse().find((m) => {
+			if (m.info?.role !== "assistant") return false
+			if (notBeforeMs === undefined) return true
+			const time = m.info.time as { created?: number | string } | undefined
+			const createdAt = typeof time?.created === "number"
+				? time.created
+				: typeof time?.created === "string"
+					? Date.parse(time.created)
+					: NaN
+			return Number.isFinite(createdAt) && createdAt >= notBeforeMs
+		})
 
 		if (!lastAssistant?.parts) return null
 

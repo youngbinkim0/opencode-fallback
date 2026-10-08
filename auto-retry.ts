@@ -60,6 +60,34 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		sessionAwaitingFallbackResult,
 		sessionFallbackTimeouts,
 	} = deps
+	const childFallbackBridges = new Map<
+		string,
+		{ parentID: string; startedAt: number; claimedByToolHook: boolean }
+	>()
+
+	const registerChildFallbackBridge = (childID: string, parentID: string) => {
+		if (childFallbackBridges.has(childID)) return
+		childFallbackBridges.set(childID, {
+			parentID,
+			startedAt: Date.now(),
+			claimedByToolHook: false,
+		})
+		logInfo("Registered child fallback bridge", { childSession: childID, parentSession: parentID })
+	}
+
+	const clearChildFallbackBridge = (childID: string) => {
+		const bridge = childFallbackBridges.get(childID)
+		if (!bridge) return
+		childFallbackBridges.delete(childID)
+		logInfo("Cleared child fallback bridge", { childSession: childID, parentSession: bridge.parentID })
+	}
+
+	const claimChildFallbackBridge = (childID: string, parentID: string): number | undefined => {
+		const bridge = childFallbackBridges.get(childID)
+		if (!bridge || bridge.parentID !== parentID) return undefined
+		bridge.claimedByToolHook = true
+		return bridge.startedAt
+	}
 
 	/** Look up the parentID for a session, with caching.
 	 *  Returns the parentID string if this is a child session, or null. */
@@ -236,6 +264,18 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			modelID: modelParts.slice(1).join("/"),
 		}
 
+		// Claim compaction ownership before getParentSessionID() below can
+		// yield. Timeout, status, and idle handlers may enter this function
+		// concurrently for the same failed compaction.
+		if (resolvedAgent === "compaction") {
+			if (deps.sessionCompactionInFlight.has(sessionID)) {
+				logInfo(`Skipping duplicate compaction fallback (${source})`, { sessionID })
+				deferredToOtherHandler = true
+				return false
+			}
+			deps.sessionCompactionInFlight.add(sessionID)
+		}
+
 		// ── TOP-LEVEL SESSION HANDLING ──
 		// Decide whether to abort based on model state, not session type.
 		//
@@ -249,13 +289,18 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		//
 		// Status sources (session.status, session.status.immediate): the model
 		// is still in a provider retry loop — abort is needed to stop it.
-		const modelAlreadyStopped = source === "session.error" || source === "message.updated"
+		const modelAlreadyStopped =
+			source === "session.error" ||
+			source === "message.updated" ||
+			source === "task.empty-result"
 		const callerAlreadyAborted = source === "session.timeout"
 		// session.idle.silent-failure: the model went idle without producing
 		// tokens.  No NEW abort is needed, but a recent abort (e.g. from
 		// session.timeout or session.status) may still be propagating.
 		// We must wait for propagation before sending the replay.
 		const mayHaveRecentAbort = source === "session.idle.silent-failure"
+		const childParentID = await getParentSessionID(sessionID)
+		if (childParentID) registerChildFallbackBridge(sessionID, childParentID)
 
 		if (modelAlreadyStopped) {
 			logInfo(`Skipping abort — model already stopped (${source}), waiting for session to settle`, {
@@ -300,7 +345,6 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				setTimeout(() => resolve(), POST_ABORT_DELAY_MS)
 			)
 		}
-
 		// Note: The caller holds sessionRetryInFlight. We do NOT manage it here.
 		deps.sessionFirstTokenReceived.set(sessionID, false)
 		let retryDispatched = false
@@ -323,9 +367,6 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					failedModel,
 					newModel,
 				})
-
-				// Suppress stale errors from the failed compaction
-				deps.sessionCompactionInFlight.add(sessionID)
 
 				if (failedModel && plan) {
 					const currentState = sessionStates.get(sessionID)
@@ -428,6 +469,22 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				// Small delay to let deletions settle
 				await new Promise<void>((resolve) => setTimeout(resolve, 200))
 
+				// Step 3b: A session.compacted event can land while we were
+				// aborting, deleting messages and waiting above.  We set the
+				// compaction-in-flight sentinel at the top of this block, so if
+				// it is gone now, handleSessionCompacted cleared it — compaction
+				// already succeeded and re-dispatching would start a redundant
+				// compaction that nothing clears, arming a fallback timeout that
+				// always fires and walks the whole model chain.
+				if (!deps.sessionCompactionInFlight.has(sessionID)) {
+					logInfo(`Compaction already completed while preparing fallback (${source})`, {
+						sessionID,
+						failedModel,
+						newModel,
+					})
+					return false
+				}
+
 				// Step 4: Call session.summarize with the fallback model
 				try {
 					if (sessionAwaitingFallbackResult.has(sessionID)) {
@@ -457,6 +514,18 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						model: newModel,
 						response: (JSON.stringify(summarizeResult) ?? "undefined").slice(0, 500),
 					})
+
+					// The SDK reports transport/provider failures in the result
+					// envelope instead of throwing, so an unchecked result would
+					// commit a model that never compacted and re-dispatch on it.
+					// Route it into the catch below, which already handles a
+					// failed summarize (no re-dispatch, timer cleared, toast).
+					const summarizeError = (summarizeResult as { error?: unknown } | undefined)?.error
+					if (summarizeError) {
+						throw new Error(
+							`session.summarize returned an error: ${JSON.stringify(summarizeError).slice(0, 300)}`
+						)
+					}
 
 					// Commit fallback state after successful dispatch
 					if (plan) {
@@ -767,15 +836,49 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			if (!retryDispatched && !deferredToOtherHandler) {
 				sessionAwaitingFallbackResult.delete(sessionID)
 				deps.sessionCompactionInFlight.delete(sessionID)
+				deps.sessionProviderRetrying?.delete(sessionID)
 				clearSessionFallbackTimeout(sessionID)
 				const state = sessionStates.get(sessionID)
 				if (state?.pendingFallbackModel) {
 					state.pendingFallbackModel = undefined
 				}
 			}
+			if (childParentID && !retryDispatched) {
+				clearChildFallbackBridge(sessionID)
+			}
 		}
 
 		return retryDispatched
+	}
+
+	const retryEmptyChildTask = async (sessionID: string, eventAgent?: string): Promise<boolean> => {
+		const state = sessionStates.get(sessionID)
+		if (!state || sessionRetryInFlight.has(sessionID) || sessionAwaitingFallbackResult.has(sessionID)) {
+			return false
+		}
+
+		const resolvedAgent = resolveAgentForSession(sessionID, eventAgent)
+		const fallbackModels = getFallbackModelsForSession(
+			sessionID,
+			resolvedAgent,
+			deps.agentConfigs,
+			deps.globalFallbackModels,
+		)
+		const plan = planFallback(sessionID, state, fallbackModels, config)
+		if (!plan.success) return false
+
+		sessionRetryInFlight.add(sessionID)
+		try {
+			return await autoRetryWithFallback(
+				sessionID,
+				plan.newModel,
+				resolvedAgent,
+				"task.empty-result",
+				plan,
+			)
+		} finally {
+			sessionRetryInFlight.delete(sessionID)
+		}
 	}
 
 	const resolveAgentForSessionFromContext = async (
@@ -826,6 +929,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		let cleanedCount = 0
 		for (const [sessionID, lastAccess] of sessionLastAccess.entries()) {
 			if (now - lastAccess > SESSION_TTL_MS) {
+				clearChildFallbackBridge(sessionID)
 				sessionStates.delete(sessionID)
 				sessionLastAccess.delete(sessionID)
 				sessionRetryInFlight.delete(sessionID)
@@ -851,6 +955,9 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		clearSessionFallbackTimeout,
 		scheduleSessionFallbackTimeout,
 		autoRetryWithFallback,
+		retryEmptyChildTask,
+		claimChildFallbackBridge,
+		clearChildFallbackBridge,
 		resolveAgentForSessionFromContext,
 		cleanupStaleSessions,
 	}

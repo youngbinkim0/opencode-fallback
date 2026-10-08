@@ -188,4 +188,7 @@ export interface HookDeps {
 	 *  the pre-compaction model are suppressed and session.idle does not
 	 *  treat the silence as a "silent model failure". */
 	sessionCompactionInFlight: Set<string>
+	/** Foreground child sessions whose provider is managing an attached retry.
+	 *  Plugin TTFT fallback is suppressed so it cannot cancel the parent task. */
+	sessionProviderRetrying?: Set<string>
 }

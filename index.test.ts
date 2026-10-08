@@ -1,5 +1,8 @@
 import { describe, expect, it, mock, beforeEach } from "bun:test"
-import OpenCodeFallbackPlugin from "./index"
+import { mkdir, mkdtemp, rm, writeFile } from "fs/promises"
+import { join } from "path"
+import { tmpdir } from "os"
+import OpenCodeFallbackPlugin, { hasConcreteAssistantActivity } from "./index"
 import type { PluginContext } from "./types"
 
 function createMockContext(): PluginContext {
@@ -29,6 +32,22 @@ function createMockContext(): PluginContext {
 }
 
 describe("OpenCodeFallbackPlugin", () => {
+	describe("hasConcreteAssistantActivity", () => {
+		it("rejects lifecycle-only activity and accepts output-bearing parts", () => {
+			expect(hasConcreteAssistantActivity("session.diff", {})).toBe(false)
+			expect(hasConcreteAssistantActivity("message.part.updated", {
+				part: { type: "step-start" },
+			})).toBe(false)
+			expect(hasConcreteAssistantActivity("message.part.delta", {
+				field: "text",
+				delta: "working",
+			})).toBe(true)
+			expect(hasConcreteAssistantActivity("message.part.updated", {
+				part: { type: "tool", state: { status: "running" } },
+			})).toBe(true)
+		})
+	})
+
 	describe("#given a valid plugin context", () => {
 		let ctx: PluginContext
 
@@ -44,6 +63,75 @@ describe("OpenCodeFallbackPlugin", () => {
 				expect(typeof plugin.config).toBe("function")
 				expect(typeof plugin.event).toBe("function")
 				expect(typeof plugin["chat.message"]).toBe("function")
+			})
+		})
+
+		describe("#when fallback_models is supplied as a plugin override", () => {
+			it("#then uses the override as the global fallback chain", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx, {
+					fallback_models: ["google/gemini-pro"],
+				})
+
+				;(ctx.client.session.messages as any).mockImplementation(() =>
+					Promise.resolve({
+						data: [{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] }],
+					})
+				)
+
+				await plugin.event({
+					event: {
+						type: "session.error",
+						properties: {
+							sessionID: "ses_no_agent",
+							error: { statusCode: 429, message: "Rate limited" },
+							model: "anthropic/claude-opus-4-6",
+						},
+					},
+				})
+
+				expect(ctx.client.session.promptAsync).toHaveBeenCalled()
+			})
+		})
+
+		describe("#when both project config formats exist", () => {
+			it("#then the jsonc file takes precedence", async () => {
+				const directory = await mkdtemp(join(tmpdir(), "opencode-fallback-"))
+				try {
+					await mkdir(join(directory, ".opencode"))
+					await writeFile(
+						join(directory, ".opencode", "opencode-fallback.jsonc"),
+						'{ "fallback_models": ["google/gemini-pro"] }'
+					)
+					await writeFile(
+						join(directory, ".opencode", "opencode-fallback.json"),
+						'{ "fallback_models": ["openai/gpt-4o"] }'
+					)
+
+					const fileContext = createMockContext()
+					fileContext.directory = directory
+					const plugin = await OpenCodeFallbackPlugin(fileContext)
+					;(fileContext.client.session.messages as any).mockImplementation(() =>
+						Promise.resolve({
+							data: [{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] }],
+						})
+					)
+
+					await plugin.event({
+						event: {
+							type: "session.error",
+							properties: {
+								sessionID: "ses_no_agent",
+								error: { statusCode: 429, message: "Rate limited" },
+								model: "anthropic/claude-opus-4-6",
+							},
+						},
+					})
+
+					const prompt = (fileContext.client.session.promptAsync as any).mock.calls[0][0]
+					expect(prompt.body.model.providerID).toBe("google")
+				} finally {
+					await rm(directory, { recursive: true, force: true })
+				}
 			})
 		})
 
@@ -372,6 +460,97 @@ describe("OpenCodeFallbackPlugin", () => {
 				await plugin["tool.execute.after"](input, output)
 
 				expect(output.output).toBe("Here is the completed task result from fallback model.")
+			})
+
+			it("#then replaces a cancelled task result when fallback completes afterward", async () => {
+				const childSessionID = "ses_cancelledchild"
+				const plugin = await OpenCodeFallbackPlugin(ctx, {
+					fallback_models: ["openai/gpt-4o"],
+				})
+				;(ctx.client.session.messages as any).mockResolvedValue({
+					data: [{ info: { role: "user" }, parts: [{ type: "text", text: "Do the task" }] }],
+				})
+				await plugin.event({
+					event: {
+						type: "session.error",
+						properties: {
+							sessionID: childSessionID,
+							model: "anthropic/claude-opus-5",
+							error: { statusCode: 429, message: "rate limited" },
+						},
+					},
+				})
+
+				;(ctx.client.session.get as any).mockResolvedValue({ data: { status: "idle" } })
+				;(ctx.client.session.messages as any).mockResolvedValue({
+					data: [
+						{ info: { role: "assistant" }, parts: [{ type: "text", text: "Fallback completed after cancellation." }] },
+					],
+				})
+
+				const input = { tool: "task", sessionID: "ses_parent_cancelled", callID: "call_cancelled", args: {} }
+				const output = {
+					title: "Task",
+					output: "Task cancelled",
+					metadata: { sessionId: childSessionID, error: "Task cancelled" },
+				}
+
+				await plugin["tool.execute.after"](input, output)
+
+				expect(output.output).toBe("Fallback completed after cancellation.")
+			})
+
+			it("#then leaves a provider-retrying child attached to its parent task", async () => {
+				const childSessionID = "ses_123456"
+				const parentSessionID = "ses_654321"
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+				plugin.config({
+					agents: {
+						"gsd-executor": {
+							model: "anthropic/claude-sonnet-5",
+							fallback_models: ["openai/gpt-5.6-luna"],
+						},
+					},
+				})
+				await plugin.event({
+					event: {
+						type: "session.created",
+						properties: { info: { id: childSessionID, parentID: parentSessionID } },
+					},
+				})
+				await plugin.event({
+					event: {
+						type: "session.status",
+						properties: {
+							sessionID: childSessionID,
+							status: {
+								type: "retry",
+								attempt: 1,
+								message: "rate limited",
+								next: Date.now() + 600_000,
+							},
+						},
+					},
+				})
+
+				expect(ctx.client.session.abort).not.toHaveBeenCalled()
+				expect(ctx.client.session.promptAsync).not.toHaveBeenCalled()
+			})
+
+			it("#then does not wait on cancellation when no fallback is active", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+				const childSessionID = "ses_limitchild"
+				const input = { tool: "task", sessionID: "ses_parent_limit", callID: "call_limit", args: {} }
+				const output = {
+					title: "Task",
+					output: "Task cancelled",
+					metadata: { sessionId: childSessionID, error: "Task cancelled" },
+				}
+
+				await plugin["tool.execute.after"](input, output)
+
+				expect(output.output).toBe("Task cancelled")
+				expect(ctx.client.session.get).not.toHaveBeenCalled()
 			})
 
 			it("#then waits while child has active fallback then replaces result", async () => {
