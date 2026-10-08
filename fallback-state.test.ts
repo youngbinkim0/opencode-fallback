@@ -109,6 +109,21 @@ describe("fallback-state", () => {
 			})
 		})
 
+		describe("#when the provider has a workspace-wide rate limit", () => {
+			test("#then skips models on that provider", () => {
+				const state = createFallbackState("system.ai/databricks-claude-haiku-5-5")
+
+				expect(
+					findNextAvailableFallback(
+						state,
+						["system.ai/gpt-6-luna", "openai/gpt-6-luna"],
+						60,
+						"system.ai",
+					)
+				).toBe("openai/gpt-6-luna")
+			})
+		})
+
 		describe("#when current model is at index 0", () => {
 			test("#then returns the model at index 1", () => {
 				const state = createFallbackState("anthropic/claude-opus-4-6")

@@ -6,6 +6,7 @@ import {
 	extractErrorName,
 	classifyErrorType,
 	isRetryableError,
+	isProviderWideRateLimitError,
 	extractAutoRetrySignal,
 } from "./error-classifier"
 import { hasVisibleAssistantResponse } from "./message-update-handler"
@@ -477,7 +478,10 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			sessionAwaitingFallbackResult.delete(sessionID)
 			helpers.clearSessionFallbackTimeout(sessionID)
 
-			const plan = planFallback(sessionID, state, fallbackModels, config)
+			const blockedProvider = isProviderWideRateLimitError(status.message)
+				? state.currentModel.split("/")[0]
+				: undefined
+			const plan = planFallback(sessionID, state, fallbackModels, config, blockedProvider)
 
 			if (plan.success) {
 				if (config.notify_on_fallback) {
@@ -770,7 +774,10 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 				sessionLastAccess.set(sessionID, Date.now())
 			}
 
-			const plan = planFallback(sessionID, state, fallbackModels, config)
+			const blockedProvider = isProviderWideRateLimitError(error)
+				? state.currentModel.split("/")[0]
+				: undefined
+			const plan = planFallback(sessionID, state, fallbackModels, config, blockedProvider)
 
 			if (plan.success) {
 				if (config.notify_on_fallback) {

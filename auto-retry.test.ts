@@ -68,7 +68,7 @@ describe("auto-retry integration", () => {
 			deps.sessionParentID.set(childID, parentID)
 			;(deps.ctx.client.session.get as any).mockResolvedValue({ data: { status: "idle" } })
 			;(deps.ctx.client.session.messages as any).mockResolvedValue({ data: childMessages })
-			;(deps.ctx.client.session.promptAsync as any).mockImplementation(async (args: any) => {
+			;(deps.ctx.client.session.prompt as any) = mock(async (args: any) => {
 				promptCalls.push(args)
 			})
 
@@ -96,6 +96,7 @@ describe("auto-retry integration", () => {
 				childID,
 			])
 			expect(promptCalls.map((call) => call.path.id)).toEqual([childID])
+			expect((deps.ctx.client.session.promptAsync as any)).not.toHaveBeenCalled()
 			expect(typeof helpers.claimChildFallbackBridge(childID, parentID)).toBe("number")
 		})
 

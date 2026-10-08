@@ -723,7 +723,10 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 							agent: resolvedAgent,
 							payload: summarizeParts(parts),
 						})
-						await ctx.client.session.promptAsync({
+						const prompt = childParentID
+							? ctx.client.session.prompt ?? ctx.client.session.promptAsync
+							: ctx.client.session.promptAsync
+						await prompt({
 							path: { id: sessionID },
 							body: {
 								...(resolvedAgent ? { agent: resolvedAgent } : {}),

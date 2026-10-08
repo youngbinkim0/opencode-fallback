@@ -17,6 +17,7 @@ function createMockContext(): PluginContext {
 					})
 				),
 				promptAsync: mock(() => Promise.resolve()),
+				prompt: mock(() => Promise.resolve()),
 			get: mock(() =>
 				Promise.resolve({
 					data: {},

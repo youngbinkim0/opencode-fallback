@@ -6,6 +6,7 @@ import {
 	extractErrorName,
 	classifyErrorType,
 	isRetryableError,
+	isProviderWideRateLimitError,
 	extractAutoRetrySignal,
 	containsErrorContent,
 	extractErrorContentFromParts,
@@ -630,11 +631,15 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 					}
 				}
 
+				const blockedProvider = isProviderWideRateLimitError(error)
+					? state.currentModel.split("/")[0]
+					: undefined
 				const plan = planFallback(
 					sessionID,
 					state,
 					fallbackModels,
 					config,
+					blockedProvider,
 				)
 
 				if (plan.success) {

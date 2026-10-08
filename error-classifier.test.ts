@@ -8,8 +8,18 @@ import {
 	containsErrorContent,
 	detectErrorInTextParts,
 	extractErrorContentFromParts,
+	isProviderWideRateLimitError,
 } from "./error-classifier"
 import { DEFAULT_CONFIG } from "./constants"
+
+test("detects Databricks workspace-wide input-token rate limits", () => {
+	expect(
+		isProviderWideRateLimitError(
+			"REQUEST_LIMIT_EXCEEDED: Exceeded workspace input tokens per minute rate limit"
+		)
+	).toBe(true)
+	expect(isProviderWideRateLimitError("Too Many Requests: model rate limited")).toBe(false)
+})
 
 describe("error-classifier", () => {
 	describe("#given isRetryableError", () => {

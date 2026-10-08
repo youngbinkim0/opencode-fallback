@@ -55,7 +55,8 @@ export function isModelInCooldown(
 export function findNextAvailableFallback(
 	state: FallbackState,
 	fallbackModels: string[],
-	cooldownSeconds: number
+	cooldownSeconds: number,
+	blockedProvider?: string
 ): string | undefined {
 	for (let i = state.fallbackIndex + 1; i < fallbackModels.length; i++) {
 		const candidate = fallbackModels[i]
@@ -63,6 +64,10 @@ export function findNextAvailableFallback(
 		// create an infinite retry loop.
 		if (candidate === state.currentModel) {
 			logInfo(`Skipping fallback model identical to current: ${candidate} (index ${i})`)
+			continue
+		}
+		if (blockedProvider && candidate.split("/")[0] === blockedProvider) {
+			logInfo(`Skipping fallback model on rate-limited provider: ${candidate}`)
 			continue
 		}
 		if (!isModelInCooldown(candidate, state, cooldownSeconds)) {
@@ -109,6 +114,7 @@ export function planFallback(
 	state: FallbackState,
 	fallbackModels: string[],
 	config: Required<FallbackPluginConfig>,
+	blockedProvider?: string,
 ): FallbackPlan | FallbackPlanFailure {
 	if (state.attemptCount >= config.max_fallback_attempts) {
 		logInfo(`Max fallback attempts reached for session ${sessionID} (${state.attemptCount})`)
@@ -119,7 +125,7 @@ export function planFallback(
 		}
 	}
 
-	const nextModel = findNextAvailableFallback(state, fallbackModels, config.cooldown_seconds)
+	const nextModel = findNextAvailableFallback(state, fallbackModels, config.cooldown_seconds, blockedProvider)
 
 	if (!nextModel) {
 		logInfo(`No available fallback models for session ${sessionID}`)

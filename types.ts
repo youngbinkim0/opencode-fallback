@@ -113,6 +113,16 @@ export interface PluginContext {
 				}
 				query: { directory: string }
 			}) => Promise<void>
+			/** Send a prompt and wait for the session request to finish. */
+			prompt?: (args: {
+				path: { id: string }
+				body: {
+					agent?: string
+					model: { providerID: string; modelID: string }
+					parts: MessagePart[]
+				}
+				query: { directory: string }
+			}) => Promise<unknown>
 			/** Re-dispatch a command (e.g. compaction) on a specific model.
 			 *  Uses the SDK's path/body/query format. */
 			command: (args: {
