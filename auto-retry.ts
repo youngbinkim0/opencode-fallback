@@ -17,6 +17,22 @@ declare function clearTimeout(timeout: ReturnType<typeof globalThis.setTimeout>)
 // because OpenCode's abort is session-wide and takes time to fully propagate.
 const POST_ABORT_DELAY_MS = 150
 
+function resolveCanonicalAgentName(
+	agentName: string | undefined,
+	agentConfigs: Record<string, unknown> | undefined
+): string | undefined {
+	if (!agentName || !agentConfigs) return agentName
+	if (Object.prototype.hasOwnProperty.call(agentConfigs, agentName)) return agentName
+
+	const normalizedName = agentName.trim().toLowerCase()
+	const matchingNames = Object.keys(agentConfigs).filter(
+		(name) => name.trim().toLowerCase() === normalizedName
+	)
+	if (matchingNames.length === 1) return matchingNames[0]
+	if (matchingNames.length > 1) return undefined
+	return agentName
+}
+
 function summarizeParts(parts: MessagePart[] | undefined): {
 	count: number
 	types: string[]
@@ -191,6 +207,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		source: string,
 		plan?: FallbackPlan
 	): Promise<boolean> => {
+		const dispatchAgent = resolveCanonicalAgentName(resolvedAgent, deps.agentConfigs)
 		// Track whether we skipped because another handler owns the dispatch.
 		// In that case, the finally block must NOT clear sessionAwaitingFallbackResult.
 		let deferredToOtherHandler = false
@@ -648,7 +665,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						await ctx.client.session.promptAsync({
 							path: { id: sessionID },
 							body: {
-								...(resolvedAgent ? { agent: resolvedAgent } : {}),
+								...(dispatchAgent ? { agent: dispatchAgent } : {}),
 								model: fallbackModelObj,
 								parts,
 							},
