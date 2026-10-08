@@ -11,6 +11,7 @@ function createMockDeps(overrides?: Partial<{
 	promptAsyncFn: (...args: unknown[]) => Promise<void>
 	commandFn: (...args: unknown[]) => Promise<void>
 	showToastFn: (...args: unknown[]) => Promise<void>
+	agentConfigs: Record<string, unknown>
 }>): HookDeps {
 	const messagesData = overrides?.messagesData ?? []
 	const promptAsyncFn = overrides?.promptAsyncFn ?? (async () => {})
@@ -36,7 +37,7 @@ function createMockDeps(overrides?: Partial<{
 			},
 		},
 		config: { ...DEFAULT_CONFIG } as Required<FallbackPluginConfig>,
-		agentConfigs: undefined,
+		agentConfigs: overrides?.agentConfigs,
 		globalFallbackModels: [],
 		sessionStates: new Map(),
 		sessionLastAccess: new Map(),
@@ -791,6 +792,62 @@ describe("auto-retry integration", () => {
 	})
 
 	describe("#given autoRetryWithFallback with resolved agent", () => {
+		describe("#when the resolved name matches a custom configured agent", () => {
+			test("#then sends the canonical configured name to promptAsync", async () => {
+				const promptCalls: any[] = []
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+					promptAsyncFn: async (args: any) => {
+						promptCalls.push(args)
+					},
+					agentConfigs: {
+						"Rafael - Diretor Comercial": {},
+					},
+				})
+
+				const helpers = createAutoRetryHelpers(deps)
+				await helpers.autoRetryWithFallback(
+					"test-session",
+					"openai/gpt-4o",
+					"rafael - diretor comercial",
+					"session.error"
+				)
+
+				expect(promptCalls).toHaveLength(1)
+				expect(promptCalls[0].body.agent).toBe("Rafael - Diretor Comercial")
+			})
+		})
+
+		describe("#when the custom configured agent name contains accents", () => {
+			test("#then preserves the canonical accented name", async () => {
+				const promptCalls: any[] = []
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+					],
+					promptAsyncFn: async (args: any) => {
+						promptCalls.push(args)
+					},
+					agentConfigs: {
+						"José - Diretor Comercial": {},
+					},
+				})
+
+				const helpers = createAutoRetryHelpers(deps)
+				await helpers.autoRetryWithFallback(
+					"test-session",
+					"openai/gpt-4o",
+					"josé - diretor comercial",
+					"session.error"
+				)
+
+				expect(promptCalls).toHaveLength(1)
+				expect(promptCalls[0].body.agent).toBe("José - Diretor Comercial")
+			})
+		})
+
 		describe("#when resolvedAgent is provided", () => {
 			test("#then includes agent in promptAsync body", async () => {
 				const promptCalls: any[] = []
