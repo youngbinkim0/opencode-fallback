@@ -13,6 +13,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
+function getAgentConfig(
+	agentName: string,
+	agents: AgentRecord
+): Record<string, unknown> | undefined {
+	const exactMatch = agents[agentName]
+	if (isRecord(exactMatch)) return exactMatch
+
+	const normalizedName = agentName.trim().toLowerCase()
+	const matchingKeys = Object.keys(agents).filter(
+		(key) => key.trim().toLowerCase() === normalizedName
+	)
+	if (matchingKeys.length !== 1) return undefined
+
+	const agentConfig = agents[matchingKeys[0]]
+	return isRecord(agentConfig) ? agentConfig : undefined
+}
+
 export function normalizeFallbackModelsField(
 	value: unknown
 ): string[] {
@@ -30,8 +47,8 @@ export function readFallbackModels(
 ): string[] {
 	if (!agents) return []
 
-	const agentConfig = agents[agentName]
-	if (!isRecord(agentConfig)) return []
+	const agentConfig = getAgentConfig(agentName, agents)
+	if (!agentConfig) return []
 
 	return normalizeFallbackModelsField(agentConfig.fallback_models)
 }
@@ -79,8 +96,8 @@ export function getFallbackModelsForSession(
 		// becomes available as a recovery target instead of the chain
 		// appearing exhausted.
 		if (models.length > 0) {
-			const agentConfig = agents[resolvedAgent]
-			if (isRecord(agentConfig) && typeof agentConfig.model === "string") {
+			const agentConfig = getAgentConfig(resolvedAgent, agents)
+			if (agentConfig && typeof agentConfig.model === "string") {
 				const primaryModel = agentConfig.model
 				if (!models.includes(primaryModel)) {
 					models.unshift(primaryModel)

@@ -120,6 +120,78 @@ describe("config-reader", () => {
 			})
 		})
 
+		describe("#when explicit agent name contains spaces and mixed case", () => {
+			test("#then finds its configured fallback models", () => {
+				const agents = {
+					"Rafael - Diretor Comercial": {
+						model: "anthropic/claude-sonnet-4-6",
+						fallback_models: ["openai/gpt-4o"],
+					},
+				}
+
+				const result = getFallbackModelsForSession(
+					"ses_random_123",
+					"Rafael - Diretor Comercial",
+					agents
+				)
+
+				expect(result).toEqual([
+					"anthropic/claude-sonnet-4-6",
+					"openai/gpt-4o",
+				])
+			})
+		})
+
+		describe("#when a custom agent name contains accents", () => {
+			test("#then finds the configured fallback models", () => {
+				const agents = {
+					"José - Diretor Comercial": {
+						fallback_models: ["openai/gpt-4o"],
+					},
+				}
+
+				expect(
+					getFallbackModelsForSession(
+						"ses_random_123",
+						"JOSÉ - DIRETOR COMERCIAL",
+						agents
+					)
+				).toEqual(["openai/gpt-4o"])
+			})
+		})
+
+		describe("#when exact and case-insensitive agent keys both match", () => {
+			test("#then prefers the exact key", () => {
+				const agents = {
+					"rafael - diretor comercial": {
+						fallback_models: ["openai/exact"],
+					},
+					"Rafael - Diretor Comercial": {
+						fallback_models: ["openai/case-insensitive"],
+					},
+				}
+
+				expect(readFallbackModels("rafael - diretor comercial", agents)).toEqual([
+					"openai/exact",
+				])
+			})
+		})
+
+		describe("#when multiple agent keys match case-insensitively", () => {
+			test("#then does not arbitrarily select either configuration", () => {
+				const agents = {
+					"Rafael - Diretor Comercial": {
+						fallback_models: ["openai/first"],
+					},
+					"RAFAEL - DIRETOR COMERCIAL": {
+						fallback_models: ["openai/second"],
+					},
+				}
+
+				expect(readFallbackModels("rafael - diretor comercial", agents)).toEqual([])
+			})
+		})
+
 		describe("#when no explicit agent but session ID contains agent name", () => {
 			test("#then detects agent from session ID", () => {
 				const result = resolveAgentForSession("ses_opus_work_456")
@@ -581,7 +653,7 @@ describe("config-reader", () => {
 		})
 
 		describe("#when config key is uppercase but resolved agent is lowercase", () => {
-			test("#then returns empty (config keys are case-sensitive)", () => {
+			test("#then finds the config key case-insensitively", () => {
 				const agents = {
 					OPUS: {
 						model: "anthropic/claude-opus-4-6",
@@ -597,8 +669,8 @@ describe("config-reader", () => {
 					[]
 				)
 
-				// agents["opus"] is undefined, so falls through
-				expect(result).toEqual([])
+				// The normalized event agent still matches the configured key.
+				expect(result).toEqual(["anthropic/claude-opus-4-6", "google/model-a"])
 			})
 		})
 	})
