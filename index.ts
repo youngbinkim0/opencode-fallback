@@ -114,6 +114,8 @@ export default async function OpenCodeFallbackPlugin(
 		sessionIdleResolvers: new Map(),
 		sessionLastMessageTime: new Map(),
 		sessionCompactionInFlight: new Set(),
+		sessionToolExecutionObserved: new Set(),
+		sessionToolExecutionInFlight: new Set(),
 	}
 
 	const helpers = createAutoRetryHelpers(deps)
@@ -195,6 +197,10 @@ export default async function OpenCodeFallbackPlugin(
 			input: { tool: string; sessionID: string; callID: string; args: any },
 			output: { title: string; output: string; metadata: any }
 		) => {
+			deps.sessionLastAccess.set(input.sessionID, Date.now())
+			deps.sessionToolExecutionObserved?.add(input.sessionID)
+			deps.sessionToolExecutionInFlight?.delete(input.sessionID)
+
 			// Only intercept task tool calls with empty results
 			if (input.tool !== "task" || !isEmptyTaskResult(output.output)) {
 				return
@@ -237,6 +243,16 @@ export default async function OpenCodeFallbackPlugin(
 					childSession: childSessionID,
 				})
 			}
+		},
+
+		"tool.execute.before": async (input: {
+			tool: string
+			sessionID: string
+			callID: string
+		}) => {
+			deps.sessionLastAccess.set(input.sessionID, Date.now())
+			deps.sessionToolExecutionObserved?.add(input.sessionID)
+			deps.sessionToolExecutionInFlight?.add(input.sessionID)
 		},
 
 		"chat.message": async (

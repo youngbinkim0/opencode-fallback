@@ -50,6 +50,65 @@ function summarizeParts(parts: MessagePart[] | undefined): {
 	}
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function inspectReplayHistory(messages: unknown): { safe: boolean; reason?: string } {
+	if (!Array.isArray(messages) || messages.length === 0) {
+		return { safe: false, reason: "history-unavailable" }
+	}
+
+	let lastUserIndex = -1
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i]
+		if (!isRecord(message)) return { safe: false, reason: "history-incomplete" }
+		const info = isRecord(message.info) ? message.info : undefined
+		const role = info?.role ?? message.role
+		if (typeof role !== "string" || role.length === 0) {
+			return { safe: false, reason: "history-incomplete" }
+		}
+		if (role.toLowerCase() === "user") {
+			lastUserIndex = i
+			break
+		}
+	}
+
+	if (lastUserIndex < 0) return { safe: false, reason: "user-boundary-unavailable" }
+
+	for (let i = lastUserIndex; i < messages.length; i++) {
+		const message = messages[i] as Record<string, unknown>
+		const info = isRecord(message.info) ? message.info : undefined
+		const role = String(info?.role ?? message.role).toLowerCase()
+		if (role === "tool" || role === "function") {
+			return { safe: false, reason: "tool-activity" }
+		}
+
+		const parts = message.parts ?? info?.parts
+		if (!Array.isArray(parts)) return { safe: false, reason: "history-incomplete" }
+		for (const part of parts) {
+			if (!isRecord(part) || typeof part.type !== "string") {
+				return { safe: false, reason: "history-incomplete" }
+			}
+
+			const type = part.type.toLowerCase()
+			const hasToolMarker =
+				type.includes("tool") ||
+				type.includes("function_call") ||
+				type.includes("function-call") ||
+				"callID" in part ||
+				"callId" in part ||
+				"tool" in part ||
+				"toolName" in part ||
+				"tool_name" in part ||
+				"state" in part
+			if (hasToolMarker) return { safe: false, reason: "tool-activity" }
+		}
+	}
+
+	return { safe: true }
+}
+
 export function createAutoRetryHelpers(deps: HookDeps) {
 	const {
 		ctx,
@@ -535,13 +594,40 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			}
 
 			// ── NORMAL REPLAY DISPATCH PATH ──
-			const messagesResp = await ctx.client.session.messages({
-				path: { id: sessionID },
-				query: { directory: ctx.directory },
-			})
+			if (
+				deps.sessionToolExecutionObserved?.has(sessionID) ||
+				deps.sessionToolExecutionInFlight?.has(sessionID)
+			) {
+				logInfo("Blocking fallback replay after observed tool execution", {
+					sessionID,
+					reason: deps.sessionToolExecutionInFlight?.has(sessionID)
+						? "tool-execution-in-flight"
+						: "tool-execution-observed",
+				})
+				return false
+			}
+
+			let messagesResp
+			try {
+				messagesResp = await ctx.client.session.messages({
+					path: { id: sessionID },
+					query: { directory: ctx.directory },
+				})
+			} catch {
+				logInfo("Blocking fallback replay because session history is unavailable", {
+					sessionID,
+					reason: "history-unavailable",
+				})
+				return false
+			}
 			const msgs = messagesResp.data
-			if (!msgs || msgs.length === 0) {
-				logError(`No messages found in session for auto-retry (${source})`, { sessionID })
+			const replaySafety = inspectReplayHistory(msgs)
+			if (!replaySafety.safe) {
+				logInfo("Blocking fallback replay because history is unsafe or incomplete", {
+					sessionID,
+					reason: replaySafety.reason,
+				})
+				return false
 			}
 
 			// Prefer replaying the last user message.  In child subagent sessions,
@@ -579,6 +665,17 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 
 			const replayPartsRaw = lastUserPartsRaw ?? lastNonAssistantPartsRaw
 			const replaySource = lastUserPartsRaw ? "last-user" : lastNonAssistantPartsRaw ? "last-non-assistant" : "none"
+
+			if (
+				deps.sessionToolExecutionObserved?.has(sessionID) ||
+				deps.sessionToolExecutionInFlight?.has(sessionID)
+			) {
+				logInfo("Blocking fallback replay after tool execution became active", {
+					sessionID,
+					reason: "tool-execution-observed-or-in-flight",
+				})
+				return false
+			}
 
 			if (replayPartsRaw && replayPartsRaw.length > 0) {
 				// Second stale check: re-verify after all async work (abort + delay +
@@ -639,6 +736,17 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				if (allParts.length > 0) {
 					// Build the send function that calls promptAsync
 					const sendFn = async (parts: MessagePart[]): Promise<void> => {
+						if (
+							deps.sessionToolExecutionObserved?.has(sessionID) ||
+							deps.sessionToolExecutionInFlight?.has(sessionID)
+						) {
+							logInfo("Blocking replay retry after tool execution became active", {
+								sessionID,
+								reason: "tool-execution-observed-or-in-flight",
+							})
+							throw new Error("Replay blocked after tool execution")
+						}
+
 						logInfo(`Dispatching fallback replay (${source})`, {
 							sessionID,
 							model: newModel,
@@ -827,6 +935,8 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				deps.sessionIdleResolvers.delete(sessionID)
 				deps.sessionLastMessageTime.delete(sessionID)
 				deps.sessionCompactionInFlight.delete(sessionID)
+				deps.sessionToolExecutionObserved?.delete(sessionID)
+				deps.sessionToolExecutionInFlight?.delete(sessionID)
 				clearSessionFallbackTimeout(sessionID)
 				cleanedCount++
 			}
