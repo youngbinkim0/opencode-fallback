@@ -191,6 +191,51 @@ describe("OpenCodeFallbackPlugin", () => {
 			})
 		})
 
+		describe("#when a tool executes before a fallback-triggering error", () => {
+			it("#then records the execution and blocks the replay", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+				plugin.config({
+					agents: {
+						opus: {
+							model: "anthropic/claude-opus-4-6",
+							fallback_models: ["google/gemini-pro"],
+						},
+					},
+				})
+				;(ctx.client.session.messages as any).mockImplementation(() =>
+					Promise.resolve({
+						data: [
+							{ info: { role: "user" }, parts: [{ type: "text", text: "update the record" }] },
+						],
+					})
+				)
+
+				await plugin["tool.execute.before"]!({
+					tool: "crm.update",
+					sessionID: "ses-opus-unsafe",
+					callID: "call-1",
+				}, { args: {} })
+				await plugin["tool.execute.after"]!({
+					tool: "crm.update",
+					sessionID: "ses-opus-unsafe",
+					callID: "call-1",
+					args: {},
+				}, { title: "Updated", output: "ok", metadata: {} })
+				await plugin.event({
+					event: {
+						type: "session.error",
+						properties: {
+							sessionID: "ses-opus-unsafe",
+							error: { statusCode: 429, message: "Rate limited" },
+							model: "anthropic/claude-opus-4-6",
+						},
+					},
+				})
+
+				expect(ctx.client.session.promptAsync).not.toHaveBeenCalled()
+			})
+		})
+
 		describe("#when plugin is disabled via config", () => {
 			it("#then event handler skips processing", async () => {
 				const plugin = await OpenCodeFallbackPlugin(ctx, {
@@ -260,7 +305,7 @@ describe("OpenCodeFallbackPlugin", () => {
 				expect(true).toBe(true)
 			})
 
-			it("#then replays from non-assistant context and ignores model-less stale session.error", async () => {
+			it("#then blocks replay without a user boundary and ignores stale session.error", async () => {
 				const plugin = await OpenCodeFallbackPlugin(ctx)
 
 				plugin.config({
@@ -328,12 +373,9 @@ describe("OpenCodeFallbackPlugin", () => {
 					},
 				})
 
-				// Must dispatch exactly one replay (to anthropic), and stale session.error
-				// must NOT consume a second fallback attempt.
-				expect(ctx.client.session.promptAsync).toHaveBeenCalledTimes(1)
-				const promptArgs = (ctx.client.session.promptAsync as any).mock.calls[0][0]
-				expect(promptArgs.body.model.providerID).toBe("anthropic")
-				expect(promptArgs.body.model.modelID).toBe("claude-opus-4-6")
+				// With no user boundary (and tool-role content), replay safety cannot
+				// be established. Neither event may dispatch a duplicate request.
+				expect(ctx.client.session.promptAsync).not.toHaveBeenCalled()
 			})
 		})
 

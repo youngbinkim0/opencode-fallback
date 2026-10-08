@@ -188,4 +188,8 @@ export interface HookDeps {
 	 *  the pre-compaction model are suppressed and session.idle does not
 	 *  treat the silence as a "silent model failure". */
 	sessionCompactionInFlight: Set<string>
+	/** Sessions whose current request has attempted a tool execution. */
+	sessionToolExecutionObserved?: Set<string>
+	/** Sessions with a tool execution currently in progress. */
+	sessionToolExecutionInFlight?: Set<string>
 }

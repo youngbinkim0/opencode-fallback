@@ -17,6 +17,14 @@ export function createChatMessageHandler(deps: HookDeps, helpers: AutoRetryHelpe
 		if (!config.enabled) return
 
 		const { sessionID } = input
+		const isPluginReplay =
+			sessionRetryInFlight.has(sessionID) ||
+			sessionAwaitingFallbackResult.has(sessionID) ||
+			deps.sessionCompactionInFlight.has(sessionID)
+		if (!isPluginReplay) {
+			deps.sessionToolExecutionObserved?.delete(sessionID)
+		}
+
 		let state = sessionStates.get(sessionID)
 
 		if (!state) {

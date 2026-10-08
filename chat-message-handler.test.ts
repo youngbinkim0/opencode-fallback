@@ -38,6 +38,8 @@ function createMockDeps(configOverrides?: Partial<FallbackPluginConfig>): HookDe
 		sessionIdleResolvers: new Map(),
 		sessionLastMessageTime: new Map(),
 		sessionCompactionInFlight: new Set(),
+		sessionToolExecutionObserved: new Set(),
+		sessionToolExecutionInFlight: new Set(),
 	}
 }
 
@@ -62,6 +64,29 @@ function createFallbackedState(originalModel: string, fallbackModel: string, coo
 }
 
 describe("chat-message-handler", () => {
+	describe("#given tool-execution replay tracking", () => {
+		test("#then clears prior tool observations for a new user request", async () => {
+			const deps = createMockDeps()
+			deps.sessionToolExecutionObserved?.add("test-session")
+			const handler = createChatMessageHandler(deps, createMockHelpers())
+
+			await handler({ sessionID: "test-session" }, { message: {} })
+
+			expect(deps.sessionToolExecutionObserved?.has("test-session")).toBe(false)
+		})
+
+		test("#then preserves tool observations for a plugin-managed replay", async () => {
+			const deps = createMockDeps()
+			deps.sessionToolExecutionObserved?.add("test-session")
+			deps.sessionAwaitingFallbackResult.add("test-session")
+			const handler = createChatMessageHandler(deps, createMockHelpers())
+
+			await handler({ sessionID: "test-session" }, { message: {} })
+
+			expect(deps.sessionToolExecutionObserved?.has("test-session")).toBe(true)
+		})
+	})
+
 	describe("#given recoverToOriginal wired into chat.message hook", () => {
 		describe("#when currentModel differs from originalModel and primary cooldown has expired", () => {
 			test("#then recovery triggers and model override is skipped", async () => {

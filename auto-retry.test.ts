@@ -49,6 +49,8 @@ function createMockDeps(overrides?: Partial<{
 		sessionIdleResolvers: new Map(),
 		sessionLastMessageTime: new Map(),
 		sessionCompactionInFlight: new Set(),
+		sessionToolExecutionObserved: new Set(),
+		sessionToolExecutionInFlight: new Set(),
 	}
 }
 
@@ -59,7 +61,7 @@ describe("auto-retry integration", () => {
 				const mixedParts = [
 					{ type: "text", text: "hello" },
 					{ type: "image", url: "https://example.com/img.png" },
-					{ type: "tool_result", text: "result" },
+					{ type: "file", url: "file:///test.txt" },
 				]
 				const promptCalls: MessagePart[][] = []
 
@@ -85,7 +87,7 @@ describe("auto-retry integration", () => {
 				expect(promptCalls[0].length).toBe(3)
 				expect(promptCalls[0][0].type).toBe("text")
 				expect(promptCalls[0][1].type).toBe("image")
-				expect(promptCalls[0][2].type).toBe("tool_result")
+				expect(promptCalls[0][2].type).toBe("file")
 
 				// No toast — no degradation
 				expect(deps.ctx.client.tui.showToast).not.toHaveBeenCalled()
@@ -97,7 +99,7 @@ describe("auto-retry integration", () => {
 				const mixedParts = [
 					{ type: "text", text: "hello" },
 					{ type: "image", url: "https://example.com/img.png" },
-					{ type: "tool_result", text: "result" },
+					{ type: "file", url: "file:///test.txt" },
 				]
 				const promptCalls: MessagePart[][] = []
 
@@ -759,9 +761,188 @@ describe("auto-retry integration", () => {
 		})
 	})
 
+	describe("#given autoRetryWithFallback after a completed tool execution", () => {
+		test("#then blocks replaying the user request", async () => {
+			const deps = createMockDeps({
+				messagesData: [
+					{ info: { role: "user" }, parts: [{ type: "text", text: "create a record" }] },
+					{
+						info: { role: "assistant" },
+						parts: [{
+							type: "tool",
+							callID: "call-1",
+							tool: "crm.create",
+							state: {
+								status: "completed",
+								input: { name: "test" },
+								output: "created",
+								title: "Created record",
+								metadata: {},
+								time: { start: 1, end: 2 },
+							},
+						}],
+					},
+				],
+			})
+
+			const helpers = createAutoRetryHelpers(deps)
+			await helpers.autoRetryWithFallback(
+				"test-session",
+				"openai/gpt-4o",
+				undefined,
+				"session.error"
+			)
+
+			expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+		})
+	})
+
+	describe("#given autoRetryWithFallback tool safety checks", () => {
+		test("#then blocks a tool whose result is still running or uncertain", async () => {
+			for (const status of ["pending", "running", "error"]) {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "send it" }] },
+						{
+							info: { role: "assistant" },
+							parts: [{ type: "tool", tool: "message.send", state: { status } }],
+						},
+					],
+				})
+				await createAutoRetryHelpers(deps).autoRetryWithFallback(
+					"test-session", "openai/gpt-4o", undefined, "session.timeout"
+				)
+				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+			}
+		})
+
+		test("#then recognizes alternate tool call and result part types", async () => {
+			for (const part of [
+				{ type: "tool_call", callID: "call-1" },
+				{ type: "tool_result", callID: "call-1" },
+				{ type: "function-call", toolName: "external.write" },
+			]) {
+				const deps = createMockDeps({
+					messagesData: [
+						{ info: { role: "user" }, parts: [{ type: "text", text: "do it" }] },
+						{ info: { role: "assistant" }, parts: [part] },
+					],
+				})
+				await createAutoRetryHelpers(deps).autoRetryWithFallback(
+					"test-session", "openai/gpt-4o", undefined, "session.error"
+				)
+				expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+			}
+		})
+
+		test("#then blocks when message history is incomplete", async () => {
+			const deps = createMockDeps({
+				messagesData: [
+					{ info: { role: "user" }, parts: [{ type: "text", text: "do it" }] },
+					{ info: { role: "assistant" } },
+				],
+			})
+			await createAutoRetryHelpers(deps).autoRetryWithFallback(
+				"test-session", "openai/gpt-4o", undefined, "session.error"
+			)
+			expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+		})
+
+		test("#then blocks if history lookup fails", async () => {
+			const deps = createMockDeps()
+			;(deps.ctx.client.session.messages as any).mockImplementation(async () => {
+				throw new Error("private transport detail")
+			})
+			await createAutoRetryHelpers(deps).autoRetryWithFallback(
+				"test-session", "openai/gpt-4o", undefined, "session.error"
+			)
+			expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+		})
+
+		test("#then blocks while a tool is executing during a timeout", async () => {
+			const deps = createMockDeps({
+				messagesData: [
+					{ info: { role: "user" }, parts: [{ type: "text", text: "do it" }] },
+				],
+			})
+			deps.sessionToolExecutionInFlight?.add("test-session")
+			await createAutoRetryHelpers(deps).autoRetryWithFallback(
+				"test-session", "openai/gpt-4o", undefined, "session.timeout"
+			)
+			expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+		})
+
+		test("#then does not try another replay tier after execution becomes uncertain", async () => {
+			let deps: HookDeps
+			deps = createMockDeps({
+				messagesData: [
+					{
+						info: { role: "user" },
+						parts: [
+							{ type: "text", text: "send it" },
+							{ type: "image", url: "file:///test.png" },
+						],
+					},
+				],
+				promptAsyncFn: async () => {
+					deps.sessionToolExecutionObserved?.add("test-session")
+					deps.sessionToolExecutionInFlight?.add("test-session")
+					throw new Error("simulated unknown dispatch result")
+				},
+			})
+			await createAutoRetryHelpers(deps).autoRetryWithFallback(
+				"test-session", "openai/gpt-4o", undefined, "session.error"
+			)
+			expect(deps.ctx.client.session.promptAsync).toHaveBeenCalledTimes(1)
+		})
+
+		test("#then isolates tool execution state between sessions", async () => {
+			const deps = createMockDeps({
+				messagesData: [
+					{ info: { role: "user" }, parts: [{ type: "text", text: "do it" }] },
+				],
+			})
+			deps.sessionToolExecutionObserved?.add("session-a")
+			const helpers = createAutoRetryHelpers(deps)
+			await helpers.autoRetryWithFallback("session-a", "openai/gpt-4o", undefined, "session.error")
+			await helpers.autoRetryWithFallback("session-b", "openai/gpt-4o", undefined, "session.error")
+			expect(deps.ctx.client.session.promptAsync).toHaveBeenCalledTimes(1)
+			expect((deps.ctx.client.session.promptAsync as any).mock.calls[0][0].path.id).toBe("session-b")
+		})
+
+		test("#then only dispatches once for concurrent fallback events", async () => {
+			const deps = createMockDeps({
+				messagesData: [
+					{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+				],
+			})
+			const helpers = createAutoRetryHelpers(deps)
+			await Promise.all([
+				helpers.autoRetryWithFallback("test-session", "openai/gpt-4o", undefined, "session.error"),
+				helpers.autoRetryWithFallback("test-session", "openai/gpt-4o", undefined, "session.status"),
+			])
+			expect(deps.ctx.client.session.promptAsync).toHaveBeenCalledTimes(1)
+		})
+
+		test("#then preserves the selected fallback model for safe text replay", async () => {
+			const deps = createMockDeps({
+				messagesData: [
+					{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
+				],
+			})
+			await createAutoRetryHelpers(deps).autoRetryWithFallback(
+				"test-session", "openai/gpt-4o", undefined, "session.error"
+			)
+			expect((deps.ctx.client.session.promptAsync as any).mock.calls[0][0].body.model).toEqual({
+				providerID: "openai",
+				modelID: "gpt-4o",
+			})
+		})
+	})
+
 	describe("#given autoRetryWithFallback with non-user replayable message", () => {
-		describe("#when only system/tool messages exist (no user messages)", () => {
-			test("#then falls back to last non-assistant message", async () => {
+		describe("#when no user boundary exists", () => {
+			test("#then blocks replay because history is insufficient", async () => {
 				const promptCalls: any[] = []
 				const deps = createMockDeps({
 					messagesData: [
@@ -782,10 +963,8 @@ describe("auto-retry integration", () => {
 					"session.error"
 				)
 
-				expect(result).toBe(true)
-				expect(promptCalls.length).toBe(1)
-				// Should replay the tool message (last non-assistant with parts)
-				expect(promptCalls[0].body.parts[0].text).toBe("tool result")
+				expect(result).toBe(false)
+				expect(promptCalls).toHaveLength(0)
 			})
 		})
 	})
