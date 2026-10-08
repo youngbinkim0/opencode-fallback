@@ -465,17 +465,27 @@ describe("OpenCodeFallbackPlugin", () => {
 
 			it("#then replaces a cancelled task result when fallback completes afterward", async () => {
 				const childSessionID = "ses_cancelledchild"
+				const parentSessionID = "ses_cancelledparent"
 				const plugin = await OpenCodeFallbackPlugin(ctx, {
 					fallback_models: ["openai/gpt-4o"],
 				})
+				;(ctx.client.session.get as any).mockResolvedValue({ data: { status: "idle" } })
 				;(ctx.client.session.messages as any).mockResolvedValue({
 					data: [{ info: { role: "user" }, parts: [{ type: "text", text: "Do the task" }] }],
+				})
+				;(ctx.client.session.prompt as any).mockImplementation(async () => {})
+				await plugin.event({
+					event: {
+						type: "session.created",
+						properties: { info: { id: childSessionID, parentID: parentSessionID } },
+					},
 				})
 				await plugin.event({
 					event: {
 						type: "session.error",
 						properties: {
 							sessionID: childSessionID,
+							agent: "sp-review-strong",
 							model: "anthropic/claude-opus-5",
 							error: { statusCode: 429, message: "rate limited" },
 						},
@@ -485,7 +495,10 @@ describe("OpenCodeFallbackPlugin", () => {
 				;(ctx.client.session.get as any).mockResolvedValue({ data: { status: "idle" } })
 				;(ctx.client.session.messages as any).mockResolvedValue({
 					data: [
-						{ info: { role: "assistant" }, parts: [{ type: "text", text: "Fallback completed after cancellation." }] },
+						{
+							info: { role: "assistant", time: { created: Date.now(), completed: Date.now() } },
+							parts: [{ type: "text", text: "Fallback completed after cancellation." }],
+						},
 					],
 				})
 
@@ -499,6 +512,8 @@ describe("OpenCodeFallbackPlugin", () => {
 				await plugin["tool.execute.after"](input, output)
 
 				expect(output.output).toBe("Fallback completed after cancellation.")
+				expect(ctx.client.session.prompt).toHaveBeenCalled()
+				expect(ctx.client.session.promptAsync).not.toHaveBeenCalled()
 			})
 
 			it("#then leaves a provider-retrying child attached to its parent task", async () => {
