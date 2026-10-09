@@ -11,7 +11,8 @@
   "scripts": {
     "build": "bun run build.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "test:integration": "bun run build && bun run foreground-task.integration.ts"
   },
   "keywords": [
     "opencode",

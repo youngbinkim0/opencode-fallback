@@ -10,7 +10,7 @@ import { createAutoRetryHelpers } from "./auto-retry"
 import { createEventHandler } from "./event-handler"
 import { createMessageUpdateHandler } from "./message-update-handler"
 import { createChatMessageHandler } from "./chat-message-handler"
-import { normalizeFallbackModelsField } from "./config-reader"
+import { mergeAgentConfigs, normalizeFallbackModelsField } from "./config-reader"
 import {
 	isEmptyTaskResult,
 	isCancelledTaskResult,
@@ -20,7 +20,12 @@ import {
 import { readFileSync, existsSync } from "fs"
 import { join } from "path"
 import { parse as parseJsonc } from "jsonc-parser"
-import { logInfo } from "./logger"
+import { logInfo, withLogContext } from "./logger"
+import { createForegroundTask } from "./foreground-task"
+import { randomUUID } from "node:crypto"
+
+declare const __FALLBACK_BUILD_ID__: string
+const buildID = typeof __FALLBACK_BUILD_ID__ === "string" ? __FALLBACK_BUILD_ID__ : "source"
 
 declare function setInterval(
 	callback: () => void,
@@ -50,10 +55,28 @@ function loadPluginConfig(directory: string): Partial<FallbackPluginConfig> {
 	return {}
 }
 
+function summarizeAgentFallbackConfig(value: unknown): Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return {}
+
+	return Object.fromEntries(
+		Object.entries(value as Record<string, unknown>).flatMap(([name, config]) => {
+			if (typeof config !== "object" || config === null || Array.isArray(config)) return []
+			const agent = config as Record<string, unknown>
+			if (agent.model === undefined && agent.fallback_models === undefined) return []
+			return [[name, { model: agent.model, fallback_models: agent.fallback_models }]]
+		})
+	)
+}
+
 export default async function OpenCodeFallbackPlugin(
 	ctx: PluginContext,
 	configOverrides?: Partial<FallbackPluginConfig>
 ) {
+	const instanceContext = {
+		instanceID: randomUUID(), buildID, moduleURL: import.meta.url,
+		directory: ctx.directory, processStartedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+	}
+	let configRevision = 0
 	let agentConfigs: Record<string, unknown> | undefined
 	let fileConfig: Partial<FallbackPluginConfig> = loadPluginConfig(ctx.directory)
 	let mergedConfig: Required<FallbackPluginConfig> | undefined
@@ -96,6 +119,10 @@ export default async function OpenCodeFallbackPlugin(
 				configOverrides?.fallback_models ??
 				fileConfig?.fallback_models ??
 				DEFAULT_CONFIG.fallback_models,
+			foreground_task_fallback:
+				configOverrides?.foreground_task_fallback ??
+				fileConfig?.foreground_task_fallback ??
+				DEFAULT_CONFIG.foreground_task_fallback,
 		}
 
 		return mergedConfig
@@ -128,6 +155,7 @@ export default async function OpenCodeFallbackPlugin(
 	const { handleEvent: baseEventHandler, handleActivity } = createEventHandler(deps, helpers)
 	const messageUpdateHandler = createMessageUpdateHandler(deps, helpers)
 	const chatMessageHandler = createChatMessageHandler(deps, helpers)
+	const foregroundTask = createForegroundTask(deps)
 
 	const cleanupInterval = setInterval(
 		helpers.cleanupStaleSessions,
@@ -135,25 +163,29 @@ export default async function OpenCodeFallbackPlugin(
 	)
 	cleanupInterval.unref()
 
-	logInfo(`Plugin initialized (${globalFallbackModels.length} global fallback model(s) configured)`)
+	withLogContext(instanceContext, () => logInfo(`Plugin initialized (${globalFallbackModels.length} global fallback model(s) configured)`, {
+		foregroundTaskFallback: deps.config.foreground_task_fallback,
+	}))
 
-	return {
+	const hooks = {
 		name: PLUGIN_NAME,
+		...(deps.config.enabled && deps.config.foreground_task_fallback
+			? { tool: { task: foregroundTask.tool } }
+			: {}),
 
 		config: (opencodeConfig: Record<string, unknown>) => {
-			// Try 'agents' (plural) first, then 'agent' (singular)
+			configRevision++
+			foregroundTask.configure(opencodeConfig)
 			const agentsValue = opencodeConfig.agents
 			const agentValue = opencodeConfig.agent
-			
-			if (agentsValue && typeof agentsValue === "object" && !Array.isArray(agentsValue)) {
-				agentConfigs = agentsValue as Record<string, unknown>
-			} else if (agentValue && typeof agentValue === "object" && !Array.isArray(agentValue)) {
-				agentConfigs = agentValue as Record<string, unknown>
-			} else {
-				agentConfigs = undefined
-			}
-			
-			logInfo(`Plugin initialized with ${agentConfigs ? Object.keys(agentConfigs).length : 0} agents`)
+			agentConfigs = mergeAgentConfigs(agentsValue, agentValue)
+
+			logInfo(`Plugin initialized with ${agentConfigs ? Object.keys(agentConfigs).length : 0} agents`, {
+				configRevision,
+				pluralFallbackConfig: summarizeAgentFallbackConfig(agentsValue),
+				singularFallbackConfig: summarizeAgentFallbackConfig(agentValue),
+				mergedFallbackConfig: summarizeAgentFallbackConfig(agentConfigs),
+			})
 		},
 
 		event: async ({
@@ -161,6 +193,16 @@ export default async function OpenCodeFallbackPlugin(
 		}: {
 			event: { type: string; properties?: unknown }
 		}) => {
+			const props = event.properties as Record<string, any> | undefined
+			if (event.type === "session.created" || event.type === "session.error" ||
+				(event.type === "session.status" && props?.status?.type === "retry")) {
+				logInfo("Fallback event routed to plugin instance", {
+					eventType: event.type, sessionID: props?.sessionID ?? props?.info?.id,
+					configRevision, ownedForegroundTask: foregroundTask.owns(props?.sessionID ?? props?.info?.id),
+					agentFallbackConfig: summarizeAgentFallbackConfig(agentConfigs),
+				})
+			}
+			if (foregroundTask.handleEvent(event)) return
 			if (event.type === "message.updated") {
 				if (!deps.config.enabled) return
 				const props = event.properties as
@@ -199,6 +241,7 @@ export default async function OpenCodeFallbackPlugin(
 			input: { tool: string; sessionID: string; callID: string; args: any },
 			output: { title: string; output: string; metadata: any }
 		) => {
+			if (!output) return
 			// OpenCode can report a child that failed during fallback as either an
 			// empty task result or a cancelled task-tool error.
 			const isEmptyResult = isEmptyTaskResult(output.output)
@@ -284,9 +327,27 @@ export default async function OpenCodeFallbackPlugin(
 			input: ChatMessageInput,
 			output: ChatMessageOutput
 		) => {
+			// Owned task prompts use their explicit model, not the replay state.
+			if (foregroundTask.owns(input.sessionID)) return
 			await chatMessageHandler(input, output)
 		},
 	}
+
+	// Carry the instance identity through hooks, async work and timeout callbacks,
+	// including owned foreground tasks that consume retry events before handlers.
+	const tracedHooks = Object.fromEntries(Object.entries(hooks).map(([name, hook]) => [
+		name, typeof hook === "function"
+			? (...args: any[]) => withLogContext(instanceContext, () => (hook as Function)(...args))
+			: hook,
+	])) as typeof hooks
+	if (tracedHooks.tool) {
+		const execute = foregroundTask.tool.execute
+		tracedHooks.tool = { task: {
+			...foregroundTask.tool,
+			execute: (...args: Parameters<typeof execute>) => withLogContext(instanceContext, () => execute(...args)),
+		} }
+	}
+	return tracedHooks
 }
 
 export function hasConcreteAssistantActivity(type: string, properties: unknown): boolean {

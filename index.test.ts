@@ -217,6 +217,53 @@ describe("OpenCodeFallbackPlugin", () => {
 			})
 		})
 
+		describe("#when both plural and singular agent maps define the same agent", () => {
+			it("#then keeps the explicit singular fallback_models when handling its rate limit", async () => {
+				const plugin = await OpenCodeFallbackPlugin(ctx)
+				const primary = "databricks-responses/system.ai.claude-haiku-5-5"
+				const fallback = "databricks-responses/system.ai.gpt-6-luna"
+
+				plugin.config({
+					agents: {
+						explore: {
+							model: primary,
+							fallback_models: [primary],
+						},
+					},
+					agent: {
+						explore: {
+							model: primary,
+							fallback_models: [fallback],
+						},
+					},
+				})
+
+				;(ctx.client.session.messages as any).mockImplementation(() =>
+					Promise.resolve({
+						data: [{ info: { role: "user" }, parts: [{ type: "text", text: "inspect this" }] }],
+					})
+				)
+
+				await plugin.event({
+					event: {
+						type: "session.error",
+						properties: {
+							sessionID: "ses-explore-config-merge",
+							agent: "explore",
+							error: { statusCode: 429, message: "Rate limited" },
+							model: primary,
+						},
+					},
+				})
+
+				const prompt = (ctx.client.session.promptAsync as any).mock.calls[0][0]
+				expect(prompt.body.model).toEqual({
+					providerID: "databricks-responses",
+					modelID: "system.ai.gpt-6-luna",
+				})
+			})
+		})
+
 		describe("#when config hook is called with non-object agents", () => {
 			it("#then agentConfigs is set to undefined", async () => {
 				const plugin = await OpenCodeFallbackPlugin(ctx)

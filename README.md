@@ -118,7 +118,12 @@ All fields are optional — omit any you want to keep at the default.
   // fallback_models in opencode.json.
   // Accepts a string (single model) or an array of strings.
   // Default: []
-  "fallback_models": []
+  "fallback_models": [],
+
+  // Replacement for foreground task calls. Keeps the parent's task
+  // promise pending across child retries. Background jobs are unsupported.
+  // Default: true. Set false to use OpenCode's native task tool instead.
+  "foreground_task_fallback": true
 }
 ```
 
@@ -140,6 +145,46 @@ opencode-fallback.jsonc fallback_models  ← used if no per-agent list
 ---
 
 ## How It Works
+
+### Foreground subagents that enter provider retry
+
+OpenCode's native task tool can throw `Task cancelled` when its child is
+aborted. On the normal tool path, `tool.execute.after` is only called after a
+successful return, so it cannot reliably replace that cancellation with a
+fallback result. The plugin therefore uses its own foreground task loop by
+default (verified against OpenCode 1.18.35's tool registry/lifecycle).
+
+No extra flag is required. Configure your fallback chain as usual, for example
+in `opencode-fallback.jsonc`:
+
+```jsonc
+{
+  "fallback_models": ["openai/gpt-5.4"]
+}
+```
+
+The plugin registers a replacement `task` tool. The parent awaits a single
+promise throughout the handoff: a retry signal selects a fallback, the loop
+aborts and awaits its own child prompt, then synchronously prompts the same
+child on the fallback. Only the final answer is returned to the parent.
+Workspace-wide rate-limit errors skip other models on the blocked provider.
+If no suitable fallback exists, provider retries continue on the original
+request. Real user cancellation still stops the task.
+
+The replacement supports foreground tasks and `task_id` continuation, inherits
+parent session restrictions, and uses the selected agent's permissions.
+It does not support native background jobs or promotion. Prompts are sent as
+text; the native task tool's `@file` expansion is not replicated. Slash-command
+subtasks that invoke OpenCode's built-in task directly are not replaced.
+Set `"foreground_task_fallback": false` to use OpenCode's native task tool;
+native foreground child retries then remain attached to the provider.
+Quit and restart OpenCode after changing the option or updating the plugin;
+already-running native tasks cannot be transferred into this loop.
+
+The regression harness runs against the installed OpenCode binary with local
+mock providers: `bun run test:integration`.
+It verifies that a rate-limited child switches providers, the task remains
+`completed`, and the parent receives the backup answer without `Task cancelled`.
 
 ```
 Primary model fails (rate limit, quota, model not found, …)

@@ -21,6 +21,14 @@ test("detects Databricks workspace-wide input-token rate limits", () => {
 	expect(isProviderWideRateLimitError("Too Many Requests: model rate limited")).toBe(false)
 })
 
+test("named Databricks model quotas do not block the entire provider", () => {
+	const message = "Too Many Requests: REQUEST_LIMIT_EXCEEDED: Exceeded workspace input tokens per minute rate limit for databricks-claude-haiku-5-5. Work with your Databricks account team to request a higher FMAPI rate limit tier."
+	expect(isProviderWideRateLimitError(message)).toBe(false)
+	expect(isProviderWideRateLimitError({ name: "APIError", data: { statusCode: 429, message } })).toBe(false)
+	expect(isProviderWideRateLimitError("REQUEST_LIMIT_EXCEEDED")).toBe(false)
+	expect(isProviderWideRateLimitError("Request a higher FMAPI rate limit tier")).toBe(false)
+})
+
 describe("error-classifier", () => {
 	describe("#given isRetryableError", () => {
 		describe("#when error has retryable HTTP status codes", () => {

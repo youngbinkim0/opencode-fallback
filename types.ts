@@ -14,6 +14,9 @@ export interface FallbackPluginConfig {
 	timeout_seconds?: number
 	notify_on_fallback?: boolean
 	fallback_models?: string | string[]
+	/** Replace the foreground task tool with a plugin-owned execution loop.
+	 *  Enabled by default; set false to use OpenCode's native task tool. */
+	foreground_task_fallback?: boolean
 }
 
 export interface FallbackState {

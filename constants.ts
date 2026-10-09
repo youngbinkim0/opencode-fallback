@@ -11,6 +11,7 @@ export const DEFAULT_CONFIG: Required<FallbackPluginConfig> = {
 	timeout_seconds: 30,
 	notify_on_fallback: true,
 	fallback_models: [],
+	foreground_task_fallback: true,
 }
 
 export const RETRYABLE_ERROR_PATTERNS = [

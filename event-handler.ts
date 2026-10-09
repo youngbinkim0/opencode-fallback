@@ -416,6 +416,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 				nextRetryMs: status.next,
 				resolvedAgent,
 				totalFallbackModels: fallbackModels.length,
+				fallbackModels,
 			})
 
 			if (fallbackModels.length === 0) {

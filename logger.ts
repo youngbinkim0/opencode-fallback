@@ -2,6 +2,13 @@ import { PLUGIN_NAME } from "./constants"
 import { appendFileSync, mkdirSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
+import { AsyncLocalStorage } from "node:async_hooks"
+
+const logContext = new AsyncLocalStorage<Record<string, unknown>>()
+
+export function withLogContext<T>(context: Record<string, unknown>, callback: () => T): T {
+	return logContext.run(context, callback)
+}
 
 const LOG_FILE = join(homedir(), ".config", "opencode", "opencode-fallback.log")
 
@@ -14,8 +21,9 @@ try {
 
 function writeToFile(level: string, message: string, context?: Record<string, unknown>): void {
 	const timestamp = new Date().toISOString()
-	const contextStr = context ? ` ${JSON.stringify(context)}` : ""
-	const logLine = `[${timestamp}] [${level}] [${PLUGIN_NAME}] ${message}${contextStr}\n`
+	const combinedContext = { ...logContext.getStore(), ...context }
+	const contextStr = Object.keys(combinedContext).length ? ` ${JSON.stringify(combinedContext)}` : ""
+	const logLine = `[${timestamp}] [${level}] [${PLUGIN_NAME}] [pid=${process.pid}] ${message}${contextStr}\n`
 	
 	try {
 		appendFileSync(LOG_FILE, logLine)

@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test"
 import {
+	mergeAgentConfigs,
 	readFallbackModels,
 	resolveAgentForSession,
 	getFallbackModelsForSession,
@@ -7,6 +8,42 @@ import {
 } from "./config-reader"
 
 describe("config-reader", () => {
+	describe("#given mergeAgentConfigs", () => {
+		test("#then explicit singular settings override plugin agent fields without dropping other agents", () => {
+			const result = mergeAgentConfigs(
+				{
+					explore: {
+						model: "databricks-responses/system.ai.claude-haiku-5-5",
+						fallback_models: ["databricks-responses/system.ai.claude-haiku-5-5"],
+						temperature: 0,
+					},
+					plugin_only: { model: "openai/gpt-4o" },
+				},
+				{
+					explore: {
+						fallback_models: ["databricks-responses/system.ai.gpt-6-luna"],
+					},
+				}
+			)
+
+			expect(result).toEqual({
+				explore: {
+					model: "databricks-responses/system.ai.claude-haiku-5-5",
+					fallback_models: ["databricks-responses/system.ai.gpt-6-luna"],
+					temperature: 0,
+				},
+				plugin_only: { model: "openai/gpt-4o" },
+			})
+		})
+
+		test("#then accepts either config shape on its own", () => {
+			expect(mergeAgentConfigs(undefined, { explore: { fallback_models: ["google/gemini-pro"] } }))
+				.toEqual({ explore: { fallback_models: ["google/gemini-pro"] } })
+			expect(mergeAgentConfigs({ explore: { fallback_models: ["google/gemini-pro"] } }, undefined))
+				.toEqual({ explore: { fallback_models: ["google/gemini-pro"] } })
+		})
+	})
+
 	describe("#given readFallbackModels", () => {
 		describe("#when agent has fallback_models as array", () => {
 			test("#then returns the array", () => {

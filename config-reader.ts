@@ -5,12 +5,42 @@
  * (passed via the plugin config hook), NOT from oh-my-opencode.jsonc.
  */
 
+import { logInfo } from "./logger"
+
 type AgentRecord = Record<string, unknown>
 
 const SESSION_ID_NOISE_WORDS = new Set(["ses", "work", "task", "session"])
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/**
+ * OpenCode and plugins may expose agent definitions under either `agent` or
+ * `agents`. Preserve both sources, with explicit singular entries overriding
+ * fields for the same agent.
+ */
+export function mergeAgentConfigs(
+	pluralAgents: unknown,
+	singularAgent: unknown
+): AgentRecord | undefined {
+	const plural = isRecord(pluralAgents) ? pluralAgents : {}
+	const singular = isRecord(singularAgent) ? singularAgent : {}
+	const names = new Set([...Object.keys(plural), ...Object.keys(singular)])
+	if (names.size === 0) return undefined
+
+	const merged: AgentRecord = {}
+	for (const name of names) {
+		const pluralConfig = isRecord(plural[name]) ? plural[name] : undefined
+		const singularConfig = isRecord(singular[name]) ? singular[name] : undefined
+		if (pluralConfig && singularConfig) {
+			merged[name] = { ...pluralConfig, ...singularConfig }
+		} else {
+			merged[name] = singularConfig ?? pluralConfig ?? singular[name] ?? plural[name]
+		}
+	}
+
+	return merged
 }
 
 export function normalizeFallbackModelsField(
@@ -63,6 +93,14 @@ export function getFallbackModelsForSession(
 	globalFallbackModels?: string[]
 ): string[] {
 	const resolvedAgent = resolveAgentForSession(sessionID, eventAgent)
+	const agentConfig = resolvedAgent && agents ? agents[resolvedAgent] : undefined
+	logInfo("Resolving session fallback configuration", {
+		sessionID, eventAgent, resolvedAgent,
+		agentFound: isRecord(agentConfig),
+		configuredModel: isRecord(agentConfig) ? agentConfig.model : undefined,
+		configuredFallbackModels: isRecord(agentConfig) ? agentConfig.fallback_models : undefined,
+		globalFallbackModels,
+	})
 
 	// Tier 1: Per-agent fallback_models
 	if (resolvedAgent && agents) {
