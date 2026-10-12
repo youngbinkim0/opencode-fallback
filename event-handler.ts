@@ -1,5 +1,6 @@
 import type { HookDeps } from "./types"
 import type { AutoRetryHelpers } from "./auto-retry"
+import { acquireRetryLock, releaseRetryLock } from "./retry-lock"
 import { logInfo, logError } from "./logger"
 import {
 	extractStatusCode,
@@ -154,6 +155,10 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			sessionRetryInFlight.delete(sessionID)
 			sessionAwaitingFallbackResult.delete(sessionID)
 			deps.sessionFirstTokenReceived.delete(sessionID)
+			deps.sessionRequestMessages?.delete(sessionID)
+			deps.sessionActiveRequests?.delete(sessionID)
+			deps.sessionDispatchModels?.delete(sessionID)
+			deps.sessionRetryLockTokens?.delete(sessionID)
 			deps.sessionSelfAbortTimestamp.delete(sessionID)
 			deps.sessionParentID.delete(sessionID)
 			deps.sessionCompactionInFlight.delete(sessionID)
@@ -167,6 +172,9 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 	const handleSessionStop = async (props: Record<string, unknown> | undefined) => {
 		const sessionID = props?.sessionID as string | undefined
 		if (!sessionID) return
+		deps.sessionActiveRequests?.delete(sessionID)
+		deps.sessionDispatchModels?.delete(sessionID)
+		deps.sessionRetryLockTokens?.delete(sessionID)
 
 		helpers.clearSessionFallbackTimeout(sessionID)
 
@@ -195,6 +203,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		const sessionID = props?.sessionID as string | undefined
 		if (!sessionID) return
 		deps.sessionProviderRetrying?.delete(sessionID)
+		deps.sessionActiveRequests?.delete(sessionID)
 
 		// Resolve any idle waiters FIRST (e.g. subagent-sync waiting for
 		// a child session's fallback to complete). This must happen before
@@ -209,6 +218,9 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			for (const resolve of idleResolvers) resolve()
 			deps.sessionIdleResolvers.delete(sessionID)
 		}
+		// An abort may emit idle while another handler is still planning its
+		// replacement. That handler owns the lock and pending state cleanup.
+		if (deps.sessionRetryLockTokens?.has(sessionID) && !sessionAwaitingFallbackResult.has(sessionID)) return
 
 		if (sessionAwaitingFallbackResult.has(sessionID)) {
 			// ── COMPACTION IN-FLIGHT: SKIP SILENT-FAILURE DETECTION ──
@@ -252,7 +264,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 					})
 					return
 				}
-				sessionRetryInFlight.add(sessionID)
+				const retryLock = acquireRetryLock(deps, sessionID)
 
 				// Now safe to clear awaiting state and timeout
 				sessionAwaitingFallbackResult.delete(sessionID)
@@ -292,7 +304,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 							})
 						}
 					} finally {
-						sessionRetryInFlight.delete(sessionID)
+						releaseRetryLock(deps, sessionID, retryLock)
 					}
 					return
 				}
@@ -306,11 +318,13 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			})
 			sessionAwaitingFallbackResult.delete(sessionID)
 			helpers.clearSessionFallbackTimeout(sessionID)
-			sessionRetryInFlight.delete(sessionID)
+			if (!deps.sessionRetryLockTokens?.has(sessionID)) sessionRetryInFlight.delete(sessionID)
 			return
 		}
 
 		const hadTimeout = sessionFallbackTimeouts.has(sessionID)
+		// Retain successful-output evidence for late provider retry events.
+		// The next assistant request ID resets it, not duplicate idle events.
 		helpers.clearSessionFallbackTimeout(sessionID)
 		sessionRetryInFlight.delete(sessionID)
 
@@ -340,6 +354,9 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 		}
 
 		if (status.type !== "retry") return
+		// Pending summarize owns its recovery timer. A retry status must not
+		// tear it down then collide with the compaction dispatch guard.
+		if (deps.sessionCompactionInFlight.has(sessionID)) return
 		// A provider retry event can arrive after the fallback response has
 		// already produced content and the session is no longer awaiting a
 		// fallback result. Treat it as stale instead of starting another
@@ -383,13 +400,15 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			logInfo("session.status skipped -- retry lock already held", { sessionID })
 			return
 		}
-		sessionRetryInFlight.add(sessionID)
+		if (deps.sessionCompactionInFlight.has(sessionID)) return
+		const retryLock = acquireRetryLock(deps, sessionID)
 
 		try {
 			const resolvedAgent = await helpers.resolveAgentForSessionFromContext(
 				sessionID,
 				undefined
 			)
+			if (deps.sessionCompactionInFlight.has(sessionID)) return
 
 			// The response may have completed while agent resolution was
 			// awaiting I/O. Re-check before mutating state or dispatching a
@@ -525,7 +544,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 				}
 			}
 		} finally {
-			sessionRetryInFlight.delete(sessionID)
+			releaseRetryLock(deps, sessionID, retryLock)
 		}
 	}
 
@@ -637,7 +656,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 			})
 			return
 		}
-		sessionRetryInFlight.add(sessionID)
+		const retryLock = acquireRetryLock(deps, sessionID)
 
 		try {
 			const resolvedAgent = await helpers.resolveAgentForSessionFromContext(
@@ -810,7 +829,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
 				})
 			}
 		} finally {
-			sessionRetryInFlight.delete(sessionID)
+			releaseRetryLock(deps, sessionID, retryLock)
 		}
 	}
 

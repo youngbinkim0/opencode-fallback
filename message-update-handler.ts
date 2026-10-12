@@ -1,5 +1,6 @@
 import type { HookDeps } from "./types"
 import type { AutoRetryHelpers } from "./auto-retry"
+import { acquireRetryLock, releaseRetryLock } from "./retry-lock"
 import { PLUGIN_NAME } from "./constants"
 import {
 	extractStatusCode,
@@ -118,6 +119,8 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 		sessionAwaitingFallbackResult,
 	} = deps
 	const checkVisibleResponse = hasVisibleAssistantResponse(extractAutoRetrySignal)
+	const requestMessages = deps.sessionRequestMessages ??= new Map<string, string>()
+	const activeRequests = deps.sessionActiveRequests ??= new Map<string, string>()
 
 	return async (props: Record<string, unknown> | undefined) => {
 		const info = props?.info as Record<string, unknown> | undefined
@@ -143,6 +146,8 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 					}
 				: undefined)
 		const role = info?.role as string | undefined
+		const messageID = typeof info?.id === "string" ? info.id : undefined
+		const completed = !!info?.finish || !!(info?.time as { completed?: number } | undefined)?.completed
 		const hasConcreteContent = parts?.some(
 			(p) =>
 				(p.type === "text" && typeof p.text === "string" && p.text.trim().length > 0) ||
@@ -156,6 +161,37 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				: undefined)
 
 		if (sessionID && role === "assistant") {
+			// Each assistant slot starts a provider request, including tool-loop
+			// requests and auto-compaction that starts without a session.idle.
+			// Reset once per ID, never on subsequent updates from that request.
+			if (messageID && !error && !completed && requestMessages.get(sessionID) !== messageID) {
+				const state = sessionStates.get(sessionID)
+				// An awaiting flag belongs to the fallback handoff, not every
+				// later tool-loop/compaction request. Transfer after output or a
+				// genuinely new model, while retaining stale-model protection.
+				const expectedModel = state?.pendingFallbackModel ?? state?.currentModel
+				if (state && sessionAwaitingFallbackResult.has(sessionID) &&
+					!deps.sessionDispatchModels?.has(sessionID) &&
+					!deps.sessionCompactionInFlight.has(sessionID) &&
+					(deps.sessionFirstTokenReceived.get(sessionID) ||
+						(model && model !== expectedModel && !state.failedModels.has(model)))) {
+					sessionAwaitingFallbackResult.delete(sessionID)
+				}
+				requestMessages.set(sessionID, messageID)
+				activeRequests.set(sessionID, messageID)
+				deps.sessionFirstTokenReceived.delete(sessionID)
+				if (!sessionAwaitingFallbackResult.has(sessionID) && !deps.sessionDispatchModels?.has(sessionID)) {
+					helpers.clearSessionFallbackTimeout(sessionID)
+					const state = sessionStates.get(sessionID)
+					if (state && model && !state.pendingFallbackModel) state.currentModel = model
+				}
+			}
+			if (completed && (!messageID || activeRequests.get(sessionID) === messageID)) {
+				activeRequests.delete(sessionID)
+				// Compaction's timer also owns failure recovery; completion of
+				// an empty/error slot is not proof that compaction succeeded.
+				if (!sessionAwaitingFallbackResult.has(sessionID)) helpers.clearSessionFallbackTimeout(sessionID)
+			}
 			// Track last message activity — used by subagent-sync to detect
 			// that the child session is still alive and reset its timeout.
 			deps.sessionLastMessageTime.set(sessionID, Date.now())
@@ -178,8 +214,12 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 			}
 		}
 
+		const requestAtStart = sessionID ? requestMessages.get(sessionID) : undefined
+		const isCurrentRequest = () => !sessionID || requestMessages.get(sessionID) === requestAtStart
+
 		if (sessionID && role === "assistant" && !error) {
 			const errorContent = await checkLastAssistantForErrorContent(ctx, sessionID)
+			if (!isCurrentRequest()) return
 			if (errorContent) {
 				logInfo("Detected error content in message parts", {
 					sessionID,
@@ -219,6 +259,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				// and no timeout is running, we must schedule one.
 				const needsTimeout =
 					model &&
+					!completed &&
 					config.timeout_seconds > 0 &&
 					!deps.sessionFirstTokenReceived.get(sessionID) &&
 					!deps.sessionFallbackTimeouts.has(sessionID) &&
@@ -230,6 +271,11 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 					const agent = info?.agent as string | undefined
 					helpers.resolveAgentForSessionFromContext(sessionID, agent)
 						.then((resolvedAgent) => {
+							// Resolution yields: content or a newer request can arrive
+							// before it returns. Never arm a stale request's timer.
+							if (deps.sessionFirstTokenReceived.get(sessionID) ||
+								deps.sessionFallbackTimeouts.has(sessionID) ||
+								(messageID && activeRequests.get(sessionID) !== messageID)) return
 							const fallbackModels = getFallbackModelsForSession(
 								sessionID,
 								resolvedAgent,
@@ -246,31 +292,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 							}
 						})
 						.catch(() => {})
-			} else if (sessionStates.has(sessionID)) {
-				// Subsequent successful message.updated — model *may* be active.
-				// The timeout's purpose is to detect models that go completely
-				// silent (hung/dead).  We only mark first token received when
-				// actual content is present — OpenCode sends an initial
-				// message.updated when it *creates* the assistant message slot
-				// (before any tokens arrive) and we must not treat that empty
-				// frame as proof the model is streaming.
-				if (eventHasContent) {
-					deps.sessionFirstTokenReceived.set(sessionID, true)
 				}
-				// Reschedule the timeout — resets the clock on every activity
-				// (even empty frames, since the server is still processing).
-				// If a timeout was scheduled but model is streaming, this
-				// prevents the false-abort that occurred when the model was
-				// actively producing tokens but firstTokenReceived was never set.
-				if (deps.sessionFallbackTimeouts.has(sessionID)) {
-					const agent = info?.agent as string | undefined
-					helpers.resolveAgentForSessionFromContext(sessionID, agent)
-						.then((resolvedAgent) => {
-							helpers.scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
-						})
-						.catch(() => {})
-				}
-			}
 				return
 			}
 
@@ -280,6 +302,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 			// received for that empty frame; otherwise the timeout handler
 			// skips the abort and the session gets stuck forever.
 			const hasVisible = await checkVisibleResponse(ctx, sessionID, info)
+			if (!isCurrentRequest()) return
 			if (!hasVisible) {
 				// Also check the event's own parts for any text content or tool calls.
 				// If the event parts have text/tools, the model is streaming even
@@ -450,7 +473,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 
 			// Acquire the lock now — before any async calls that could yield
 			// and allow session.error to interleave.
-			deps.sessionRetryInFlight.add(sessionID)
+			const retryLock = acquireRetryLock(deps, sessionID)
 			sessionAwaitingFallbackResult.delete(sessionID)
 
 			try {
@@ -475,14 +498,9 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 				const resolvedAgent =
 					await helpers.resolveAgentForSessionFromContext(sessionID, agent)
 
-				// Set compaction-in-flight IMMEDIATELY after detecting the agent,
-				// before any further async work.  session.error runs concurrently
-				// and checks this flag at its compaction guard — if we don't set
-				// it here (synchronously after the first await), session.error
-				// slips past the guard and double-advances the fallback chain.
-				if (resolvedAgent === "compaction") {
-					deps.sessionCompactionInFlight.add(sessionID)
-				}
+				// The retry lock above protects planning; autoRetryWithFallback
+				// alone acquires compaction ownership before dispatch. Setting it
+				// here would make the helper mistake this caller for a competitor.
 
 				// ── COMPACTION ON ALREADY-FAILED MODEL ──
 				// When a compaction error arrives from a model we already moved
@@ -503,8 +521,6 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 						failedModel: model,
 						currentFallbackModel: state.currentModel,
 					})
-
-					deps.sessionCompactionInFlight.add(sessionID)
 
 					if (config.notify_on_fallback) {
 						const fromName = (model || "primary").split("/").pop()!
@@ -665,7 +681,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
 					)
 				}
 			} finally {
-				deps.sessionRetryInFlight.delete(sessionID)
+				releaseRetryLock(deps, sessionID, retryLock)
 			}
 		}
 	}

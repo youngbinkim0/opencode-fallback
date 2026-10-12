@@ -1,7 +1,15 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test"
 import { createAutoRetryHelpers } from "./auto-retry"
+import { createMessageUpdateHandler } from "./message-update-handler"
+import { createEventHandler } from "./event-handler"
+import { createFallbackState, planFallback } from "./fallback-state"
 import type { HookDeps, FallbackPluginConfig, MessagePart } from "./types"
 import { DEFAULT_CONFIG } from "./constants"
+
+// Mirrors FALLBACK_CONTINUATION_PROMPT (continuation-prompt.ts). Literal kept here so
+// tests state the exact contract the retry must send.
+const CONTINUATION_TEXT =
+	"Continue the existing task from where it stopped. Follow the original instructions and constraints, use completed tool results, and do not repeat completed work."
 
 function createMockDeps(overrides?: Partial<{
 	messagesData: Array<{
@@ -53,6 +61,21 @@ function createMockDeps(overrides?: Partial<{
 }
 
 describe("auto-retry integration", () => {
+	for (const method of ["promptAsync", "prompt"] as const) {
+		test(`continuation dispatch preserves the SDK ${method} receiver`, async () => {
+			const deps = createMockDeps({ messagesData: [{ info: { role: "user" }, parts: [{ type: "text", text: "Original task" }] }] })
+			deps.config.timeout_seconds = 0
+			deps.config.notify_on_fallback = false
+			if (method === "prompt") deps.sessionParentID.set("receiver-session", "parent")
+			const prompt = mock(async function(this: unknown, _args: unknown) {
+				if (this !== deps.ctx.client.session) throw new Error("SDK method lost its client receiver")
+			})
+			deps.ctx.client.session[method] = prompt as any
+			const helpers = createAutoRetryHelpers(deps)
+			expect(await helpers.autoRetryWithFallback("receiver-session", "openai/backup", "build", "message.updated")).toBe(true)
+			expect(prompt).toHaveBeenCalledWith(expect.objectContaining({ body: expect.objectContaining({ parts: [{ type: "text", text: CONTINUATION_TEXT }] }) }))
+		})
+	}
 	describe("#given a child session fallback cancels its parent task", () => {
 		test("#then it retries only the child and leaves result delivery to the task hook", async () => {
 			const childID = "ses_bridge_child"
@@ -160,8 +183,8 @@ describe("auto-retry integration", () => {
 	})
 
 	describe("#given autoRetryWithFallback with mixed parts", () => {
-		describe("#when promptAsync succeeds on first call (Tier 1)", () => {
-			test("#then sends all original parts including non-text", async () => {
+		describe("#when promptAsync accepts the continuation", () => {
+			test("#then sends only the continuation prompt, not the original non-text parts", async () => {
 				const mixedParts = [
 					{ type: "text", text: "hello" },
 					{ type: "image", url: "https://example.com/img.png" },
@@ -186,20 +209,16 @@ describe("auto-retry integration", () => {
 					"test"
 				)
 
-				// Should have sent all 3 parts
 				expect(promptCalls.length).toBe(1)
-				expect(promptCalls[0].length).toBe(3)
-				expect(promptCalls[0][0].type).toBe("text")
-				expect(promptCalls[0][1].type).toBe("image")
-				expect(promptCalls[0][2].type).toBe("tool_result")
+				expect(promptCalls[0]).toEqual([{ type: "text", text: CONTINUATION_TEXT }])
 
-				// No toast — no degradation
+				// No degradation: the original parts are never replayed
 				expect(deps.ctx.client.tui.showToast).not.toHaveBeenCalled()
 			})
 		})
 
-		describe("#when promptAsync rejects non-text parts but accepts text-only", () => {
-			test("#then degrades to text-only and shows toast with dropped types", async () => {
+		describe("#when promptAsync would reject non-text original parts", () => {
+			test("#then never sends them, so the first continuation dispatch succeeds with no degradation toast", async () => {
 				const mixedParts = [
 					{ type: "text", text: "hello" },
 					{ type: "image", url: "https://example.com/img.png" },
@@ -212,39 +231,29 @@ describe("auto-retry integration", () => {
 						{ info: { role: "user" }, parts: mixedParts },
 					],
 					promptAsyncFn: async (args: any) => {
-						const parts = args.body.parts
-						promptCalls.push(parts)
-						// Reject anything with non-text parts
-						if (parts.some((p: MessagePart) => p.type !== "text")) {
+						promptCalls.push(args.body.parts)
+						if (args.body.parts.some((p: MessagePart) => p.type !== "text")) {
 							throw new Error("Unsupported part types")
 						}
 					},
 				})
 
 				const helpers = createAutoRetryHelpers(deps)
-				await helpers.autoRetryWithFallback(
+				const result = await helpers.autoRetryWithFallback(
 					"test-session",
 					"openai/gpt-4o",
 					undefined,
 					"test"
 				)
 
-				// Should have tried multiple times, last successful with text-only
-				expect(promptCalls.length).toBeGreaterThan(1)
-				const lastCall = promptCalls[promptCalls.length - 1]
-				expect(lastCall.length).toBe(1)
-				expect(lastCall[0].type).toBe("text")
-
-				// Toast should have been called with dropped types
-				expect(deps.ctx.client.tui.showToast).toHaveBeenCalled()
-				const toastArgs = (deps.ctx.client.tui.showToast as any).mock.calls[0][0]
-				expect(toastArgs.body.message).toContain("image")
-				expect(toastArgs.body.variant).toBe("warning")
+				expect(result).toBe(true)
+				expect(promptCalls).toEqual([[{ type: "text", text: CONTINUATION_TEXT }]])
+				expect(deps.ctx.client.tui.showToast).not.toHaveBeenCalled()
 			})
 		})
 
-		describe("#when all replay tiers fail", () => {
-			test("#then retry is not dispatched and session state is cleaned up", async () => {
+		describe("#when the continuation dispatch fails", () => {
+			test("#then session state is cleaned up", async () => {
 				const mixedParts = [
 					{ type: "text", text: "hello" },
 					{ type: "image", url: "https://example.com/img.png" },
@@ -269,13 +278,14 @@ describe("auto-retry integration", () => {
 
 				// Session should NOT be in awaiting state
 				expect(deps.sessionAwaitingFallbackResult.has("test-session")).toBe(false)
+				expect(deps.ctx.client.session.promptAsync).toHaveBeenCalledTimes(1)
 				// Retry in flight should be cleared
 				expect(deps.sessionRetryInFlight.has("test-session")).toBe(false)
 			})
 		})
 
 		describe("#when message has only text parts", () => {
-			test("#then sends text parts and shows no toast (backward compatible)", async () => {
+			test("#then sends the continuation prompt instead of the original text parts", async () => {
 				const textParts = [
 					{ type: "text", text: "hello world" },
 					{ type: "text", text: "second part" },
@@ -300,9 +310,7 @@ describe("auto-retry integration", () => {
 				)
 
 				expect(promptCalls.length).toBe(1)
-				expect(promptCalls[0].length).toBe(2)
-				expect(promptCalls[0][0].type).toBe("text")
-				expect(promptCalls[0][1].type).toBe("text")
+				expect(promptCalls[0]).toEqual([{ type: "text", text: CONTINUATION_TEXT }])
 
 				// No toast — no degradation
 				expect(deps.ctx.client.tui.showToast).not.toHaveBeenCalled()
@@ -911,8 +919,85 @@ describe("auto-retry integration", () => {
 
 				expect(result).toBe(true)
 				expect(promptCalls.length).toBe(1)
-				// Should replay the tool message (last non-assistant with parts)
-				expect(promptCalls[0].body.parts[0].text).toBe("tool result")
+				// Selection guard still requires replayable history; payload is the continuation
+				expect(promptCalls[0].body.parts).toEqual([{ type: "text", text: CONTINUATION_TEXT }])
+			})
+		})
+	})
+
+	describe("#given normal replay with existing user history", () => {
+		const userParts = [
+			{ type: "text", text: "Refactor the parser" },
+			{ type: "image", url: "https://example.com/spec.png" },
+		]
+		const history = () => [
+			{ info: { role: "user", id: "u1", agent: "build" }, parts: userParts },
+			{ info: { role: "assistant", id: "a1", agent: "build" }, parts: [{ type: "text", text: "partial" }] },
+		]
+
+		describe("#when the retry dispatches promptAsync", () => {
+			test("#then body.parts is a single short continuation text, never the original user parts", async () => {
+				const deps = createMockDeps({ messagesData: history() })
+				const helpers = createAutoRetryHelpers(deps)
+
+				await helpers.autoRetryWithFallback("ses_cont", "openai/gpt-4o", "build", "session.error")
+
+				const calls = (deps.ctx.client.session.promptAsync as any).mock.calls
+				expect(calls.length).toBe(1)
+				expect(calls[0][0].body.parts).toEqual([{ type: "text", text: CONTINUATION_TEXT }])
+				expect(JSON.stringify(calls[0][0].body.parts)).not.toContain("Refactor the parser")
+				expect(JSON.stringify(calls[0][0].body.parts)).not.toContain("spec.png")
+			})
+
+			test("#then keeps the same session, agent, and model as the original dispatch", async () => {
+				const deps = createMockDeps({ messagesData: history() })
+				const helpers = createAutoRetryHelpers(deps)
+
+				await helpers.autoRetryWithFallback("ses_cont", "openai/gpt-4o", "build", "session.error")
+
+				const [call] = (deps.ctx.client.session.promptAsync as any).mock.calls[0]
+				expect(call.path.id).toBe("ses_cont")
+				expect(call.body.agent).toBe("build")
+				expect(call.body.model).toEqual({ providerID: "openai", modelID: "gpt-4o" })
+				expect(call.query).toEqual({ directory: "/test" })
+			})
+
+			test("#then does not delete, revert, or mutate existing session history", async () => {
+				const messagesData = history()
+				const before = JSON.parse(JSON.stringify(messagesData))
+				const deps = createMockDeps({ messagesData })
+				const deleteMessage = mock(async () => {})
+				;(deps.ctx.client.session as any)._client = { delete: deleteMessage }
+				const helpers = createAutoRetryHelpers(deps)
+
+				await helpers.autoRetryWithFallback("ses_cont", "openai/gpt-4o", "build", "session.error")
+
+				expect(messagesData).toEqual(before)
+				expect(deps.ctx.client.session.revert).not.toHaveBeenCalled()
+				expect(deleteMessage).not.toHaveBeenCalled()
+			})
+		})
+
+		describe("#when the child session uses the synchronous prompt endpoint", () => {
+			test("#then the continuation goes through prompt with the same agent and model", async () => {
+				const childID = "ses_cont_child"
+				const parentID = "ses_cont_parent"
+				const deps = createMockDeps({ messagesData: history() })
+				deps.sessionParentID.set(childID, parentID)
+				const promptCalls: any[] = []
+				;(deps.ctx.client.session as any).prompt = mock(async (args: any) => {
+					promptCalls.push(args)
+				})
+				const helpers = createAutoRetryHelpers(deps)
+
+				const result = await helpers.autoRetryWithFallback(childID, "openai/gpt-4o", "build", "session.error")
+
+				expect(result).toBe(true)
+				expect(promptCalls.length).toBe(1)
+				expect(promptCalls[0].body.parts).toEqual([{ type: "text", text: CONTINUATION_TEXT }])
+				expect(promptCalls[0].body.agent).toBe("build")
+				expect(promptCalls[0].body.model).toEqual({ providerID: "openai", modelID: "gpt-4o" })
+				expect((deps.ctx.client.session.promptAsync as any)).not.toHaveBeenCalled()
 			})
 		})
 	})
@@ -1452,5 +1537,616 @@ describe("auto-retry integration", () => {
 				expect(deps.ctx.client.session.summarize).toHaveBeenCalledTimes(1)
 			})
 		})
+
+		describe("#when the compaction agent pins a model (agent.compaction.model)", () => {
+			const sessionID = "ses_pin_guard"
+			const PIN = "openai/gpt-5.6-luna"
+			const TARGET = "google/gemini-flash"
+			const OTHER_FAILED = "kimi-for-coding/k2p5"
+
+			const pinnedPlan = (failedModel: string) => ({
+				success: true as const,
+				newModel: TARGET,
+				failedModel,
+				newFallbackIndex: 1,
+			})
+
+			async function setupPinned(options: { failedModel: string; pin: string; notify?: boolean }) {
+				const deps = createMockDeps()
+				deps.config.notify_on_fallback = options.notify ?? false
+				deps.agentConfigs = { compaction: { model: options.pin } }
+				deps.globalFallbackModels = [options.failedModel, TARGET]
+				const { createFallbackState } = await import("./fallback-state")
+				const state = createFallbackState(options.failedModel)
+				deps.sessionStates.set(sessionID, state)
+				return { deps, state, helpers: createAutoRetryHelpers(deps) }
+			}
+
+				describe("#when the pin is the failed current model", () => {
+					test("#then it refuses the dispatch before any abort, delete, or summarize", async () => {
+						const { deps, state, helpers } = await setupPinned({ failedModel: PIN, pin: PIN })
+						state.pendingFallbackModel = TARGET
+						const activeTimeout = setTimeout(() => {}, 60_000)
+						deps.sessionFallbackTimeouts.set(sessionID, activeTimeout)
+
+						try {
+							const result = await helpers.autoRetryWithFallback(
+								sessionID,
+								TARGET,
+								"compaction",
+								"session.status.immediate",
+								pinnedPlan(PIN),
+							)
+
+							expect(result).toBe(false)
+							expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
+							expect(deps.ctx.client.session.messages).not.toHaveBeenCalled()
+							expect(deps.ctx.client.session.summarize).not.toHaveBeenCalled()
+							expect(deps.ctx.client.session.promptAsync).not.toHaveBeenCalled()
+							expect(state.currentModel).toBe(PIN)
+							expect(state.pendingFallbackModel).toBeUndefined()
+							expect(state.attemptCount).toBe(0)
+							expect(state.failedModels.size).toBe(0)
+							expect(deps.sessionFallbackTimeouts.has(sessionID)).toBe(false)
+							expect(deps.sessionCompactionInFlight.has(sessionID)).toBe(false)
+							expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+						} finally {
+							clearTimeout(activeTimeout)
+						}
+					})
+			})
+
+			describe("#when the pin differs from the requested target", () => {
+				test("#then the target is never dispatched", async () => {
+					const { deps, state, helpers } = await setupPinned({ failedModel: OTHER_FAILED, pin: PIN })
+
+					const result = await helpers.autoRetryWithFallback(
+						sessionID,
+						TARGET,
+						"compaction",
+						"session.error",
+						pinnedPlan(OTHER_FAILED),
+					)
+
+					expect(result).toBe(false)
+					expect(deps.ctx.client.session.summarize).not.toHaveBeenCalled()
+					expect(state.currentModel).toBe(OTHER_FAILED)
+					expect(state.attemptCount).toBe(0)
+				})
+			})
+
+			describe("#when state already advanced and no plan is supplied", () => {
+					test("#then it leaves another handler's timer and state untouched", async () => {
+					const { deps, state, helpers } = await setupPinned({ failedModel: OTHER_FAILED, pin: PIN })
+					state.currentModel = "google/gemini-pro"
+					state.attemptCount = 1
+					state.failedModels.set(PIN, Date.now())
+					const otherHandlerTimer = setTimeout(() => {}, 60_000)
+					deps.sessionFallbackTimeouts.set(sessionID, otherHandlerTimer)
+
+					try {
+						const result = await helpers.autoRetryWithFallback(
+							sessionID,
+							TARGET,
+							"compaction",
+							"session.status.immediate",
+						)
+
+						expect(result).toBe(false)
+						expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
+						expect(deps.ctx.client.session.summarize).not.toHaveBeenCalled()
+						expect(deps.sessionFallbackTimeouts.get(sessionID)).toBe(otherHandlerTimer)
+						expect(state.currentModel).toBe("google/gemini-pro")
+						expect(state.attemptCount).toBe(1)
+						expect(state.failedModels.has(PIN)).toBe(true)
+					} finally {
+						clearTimeout(otherHandlerTimer)
+					}
+				})
+			})
+
+			describe("#when the pin equals the requested target and is viable", () => {
+				test("#then it dispatches summarize on the pin and commits the plan", async () => {
+					const { deps, state, helpers } = await setupPinned({ failedModel: OTHER_FAILED, pin: TARGET })
+
+					const result = await helpers.autoRetryWithFallback(
+						sessionID,
+						TARGET,
+						"compaction",
+						"session.error",
+						pinnedPlan(OTHER_FAILED),
+					)
+
+					expect(result).toBe(true)
+					expect(deps.ctx.client.session.summarize).toHaveBeenCalledTimes(1)
+					expect(state.currentModel).toBe(TARGET)
+				})
+			})
+
+			describe("#when the pin equals the requested target but already failed", () => {
+				test("#then it refuses the dispatch", async () => {
+					const { deps, state, helpers } = await setupPinned({ failedModel: OTHER_FAILED, pin: TARGET })
+					state.failedModels.set(TARGET, Date.now())
+
+					const result = await helpers.autoRetryWithFallback(
+						sessionID,
+						TARGET,
+						"compaction",
+						"session.error",
+						pinnedPlan(OTHER_FAILED),
+					)
+
+					expect(result).toBe(false)
+					expect(deps.ctx.client.session.summarize).not.toHaveBeenCalled()
+					expect(state.currentModel).toBe(OTHER_FAILED)
+				})
+			})
+
+			describe("#when the pin blocks the dispatch and notifications are enabled", () => {
+				test("#then it toasts an actionable message naming agent.compaction.model", async () => {
+					const { deps, helpers } = await setupPinned({ failedModel: PIN, pin: PIN, notify: true })
+
+					await helpers.autoRetryWithFallback(sessionID, TARGET, "compaction", "session.error", pinnedPlan(PIN))
+
+					expect(deps.ctx.client.tui.showToast).toHaveBeenCalledTimes(1)
+					const toastBody = (deps.ctx.client.tui.showToast as any).mock.calls[0][0].body
+					expect(toastBody.message).toContain("agent.compaction.model")
+				})
+			})
+
+			describe("#when the pin blocks the dispatch and notifications are disabled", () => {
+				test("#then it refuses without a toast", async () => {
+					const { deps, helpers } = await setupPinned({ failedModel: PIN, pin: PIN, notify: false })
+
+					const result = await helpers.autoRetryWithFallback(sessionID, TARGET, "compaction", "session.error", pinnedPlan(PIN))
+
+					expect(result).toBe(false)
+					expect(deps.ctx.client.tui.showToast).not.toHaveBeenCalled()
+				})
+			})
+
+			describe("#when a non-compaction agent runs with an unrelated compaction pin", () => {
+				test("#then the normal replay dispatch still proceeds", async () => {
+					const deps = createMockDeps({
+						messagesData: [{ info: { role: "user" }, parts: [{ type: "text", text: "continue" }] }],
+					})
+					deps.agentConfigs = { compaction: { model: PIN }, luna: { model: TARGET } }
+					const { createFallbackState } = await import("./fallback-state")
+					deps.sessionStates.set(sessionID, createFallbackState(OTHER_FAILED))
+					const helpers = createAutoRetryHelpers(deps)
+
+					const result = await helpers.autoRetryWithFallback(
+						sessionID,
+						TARGET,
+						"luna",
+						"session.error",
+						pinnedPlan(OTHER_FAILED),
+					)
+
+					expect(result).toBe(true)
+					expect(deps.ctx.client.session.promptAsync).toHaveBeenCalledTimes(1)
+					expect(deps.ctx.client.session.summarize).not.toHaveBeenCalled()
+				})
+			})
+
+			describe("#when the guard refuses the same pinned dispatch repeatedly", () => {
+				test("#then it does not mutate attempt count or failed models and does not loop", async () => {
+					const { deps, state, helpers } = await setupPinned({ failedModel: PIN, pin: PIN })
+
+					const first = await helpers.autoRetryWithFallback(
+						sessionID,
+						TARGET,
+						"compaction",
+						"session.status.immediate",
+						pinnedPlan(PIN),
+					)
+					const failedAfterFirst = new Map(state.failedModels)
+					const attemptsAfterFirst = state.attemptCount
+					const second = await helpers.autoRetryWithFallback(
+						sessionID,
+						TARGET,
+						"compaction",
+						"session.status.immediate",
+						pinnedPlan(PIN),
+					)
+
+					expect([first, second]).toEqual([false, false])
+					expect(state.attemptCount).toBe(attemptsAfterFirst)
+					expect(state.failedModels).toEqual(failedAfterFirst)
+					expect(state.failedModels.has(PIN)).toBe(false)
+					expect(deps.sessionCompactionInFlight.has(sessionID)).toBe(false)
+					expect(deps.sessionFallbackTimeouts.has(sessionID)).toBe(false)
+					expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
+					expect(deps.ctx.client.session.summarize).not.toHaveBeenCalled()
+				})
+			})
+
+				describe("#when another handler owns the awaiting flag", () => {
+					test("#then the guard leaves that flag in place", async () => {
+						const { deps, helpers } = await setupPinned({ failedModel: PIN, pin: PIN })
+						deps.sessionAwaitingFallbackResult.add(sessionID)
+						const activeTimeout = setTimeout(() => {}, 60_000)
+						deps.sessionFallbackTimeouts.set(sessionID, activeTimeout)
+
+						try {
+							await helpers.autoRetryWithFallback(sessionID, TARGET, "compaction", "session.error", pinnedPlan(PIN))
+
+							expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(true)
+							expect(deps.sessionFallbackTimeouts.get(sessionID)).toBe(activeTimeout)
+						} finally {
+							clearTimeout(activeTimeout)
+						}
+					})
+			})
+		})
+	})
+
+	describe("#given a real message.updated compaction error flow", () => {
+		const sessionID = "ses_real_compaction_error"
+		const failedModel = "openai/gpt-5.6-luna"
+		const fallbackModel = "google/gemini-flash"
+
+		function setupRealCompactionHandler(pinnedModel?: string) {
+			const deps = createMockDeps()
+			deps.config.notify_on_fallback = true
+			deps.config.timeout_seconds = 30
+			deps.agentConfigs = pinnedModel ? { compaction: { model: pinnedModel } } : { compaction: {} }
+			deps.globalFallbackModels = [failedModel, fallbackModel]
+			const state = createFallbackState(failedModel)
+			deps.sessionStates.set(sessionID, state)
+			const helpers = createAutoRetryHelpers(deps)
+			const handleMessageUpdate = createMessageUpdateHandler(deps, helpers)
+			return { deps, state, helpers, handleMessageUpdate }
+		}
+
+		const failedCompactionEvent = () => ({
+			info: {
+				sessionID,
+				role: "assistant",
+				agent: "compaction",
+				model: failedModel,
+				error: { statusCode: 500, message: "provider unavailable" },
+			},
+		})
+
+		test("#then pinned model guard shows actionable guidance without dispatch or state mutation", async () => {
+			const { deps, state, handleMessageUpdate } = setupRealCompactionHandler(failedModel)
+
+			await handleMessageUpdate(failedCompactionEvent())
+
+			expect(deps.ctx.client.tui.showToast).toHaveBeenCalled()
+			const toastMessages = (deps.ctx.client.tui.showToast as any).mock.calls.map(
+				(call: any[]) => call[0].body.message,
+			)
+			expect(toastMessages.some((message: string) =>
+				message.includes("agent.compaction.model") && message.toLowerCase().includes("unset"),
+			)).toBe(true)
+			expect(deps.ctx.client.session.summarize).not.toHaveBeenCalled()
+			expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
+			expect(deps.sessionCompactionInFlight.has(sessionID)).toBe(false)
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+			expect(deps.sessionFallbackTimeouts.has(sessionID)).toBe(false)
+			expect(state.currentModel).toBe(failedModel)
+			expect(state.pendingFallbackModel).toBeUndefined()
+			expect(state.attemptCount).toBe(0)
+			expect(state.failedModels.size).toBe(0)
+		})
+
+		test("#then unpinned compaction summarizes once and session.compacted clears dispatch state", async () => {
+			const { deps, state, helpers, handleMessageUpdate } = setupRealCompactionHandler()
+
+			await handleMessageUpdate(failedCompactionEvent())
+
+			expect(deps.ctx.client.session.summarize).toHaveBeenCalledTimes(1)
+			expect((deps.ctx.client.session.summarize as any).mock.calls[0][0].body).toEqual({
+				providerID: "google",
+				modelID: "gemini-flash",
+			})
+			expect(state.currentModel).toBe(fallbackModel)
+			expect(deps.sessionCompactionInFlight.has(sessionID)).toBe(true)
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(true)
+			expect(deps.sessionFallbackTimeouts.has(sessionID)).toBe(true)
+
+			const eventHandler = createEventHandler(deps, helpers)
+			await eventHandler.handleEvent({
+				event: { type: "session.compacted", properties: { sessionID } },
+			})
+
+			expect(deps.sessionCompactionInFlight.has(sessionID)).toBe(false)
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+			expect(deps.sessionFallbackTimeouts.has(sessionID)).toBe(false)
+		})
+	})
+
+	describe("#given host callbacks that race fallback dispatch", () => {
+		test("#then a response emitted inside promptAsync commits once without aborting or rearming TTFT", async () => {
+			const sessionID = "ses_prompt_emits_fallback_response"
+			const failedModel = "openai/primary"
+			const fallbackModel = "google/backup"
+			const messagesData: any[] = [
+				{ info: { role: "user", id: "user-1" }, parts: [{ type: "text", text: "hello" }] },
+			]
+			let handleMessageUpdate: (props: any) => Promise<void>
+			const deps = createMockDeps({
+				messagesData,
+				promptAsyncFn: async () => {
+					expect((deps as any).sessionDispatchModels.get(sessionID)).toBe(fallbackModel)
+					await handleMessageUpdate({
+						info: { sessionID, role: "assistant", id: "backup-slot", model: fallbackModel },
+						parts: [],
+					})
+					expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(true)
+					expect(deps.sessionStates.get(sessionID)?.currentModel).toBe(failedModel)
+					messagesData.push({
+						info: { sessionID, role: "assistant", id: "backup-slot", model: fallbackModel, finish: "stop" },
+						parts: [{ type: "text", text: "backup response" }],
+					})
+					await handleMessageUpdate({
+						info: { sessionID, role: "assistant", id: "backup-slot", model: fallbackModel, finish: "stop" },
+						parts: [{ type: "text", text: "backup response" }],
+					})
+				},
+			})
+			;(deps as any).sessionDispatchModels = new Map<string, string>()
+			deps.config.timeout_seconds = 30
+			deps.globalFallbackModels = [failedModel, fallbackModel]
+			const state = createFallbackState(failedModel)
+			deps.sessionStates.set(sessionID, state)
+			const helpers = createAutoRetryHelpers(deps)
+			handleMessageUpdate = createMessageUpdateHandler(deps, helpers)
+			const plan = planFallback(sessionID, state, deps.globalFallbackModels, deps.config)
+			expect(plan.success).toBe(true)
+
+			await helpers.autoRetryWithFallback(sessionID, fallbackModel, "build", "message.updated", plan)
+
+			expect(state.currentModel).toBe(fallbackModel)
+			expect(state.attemptCount).toBe(1)
+			expect(state.failedModels.has(failedModel)).toBe(true)
+			expect(deps.ctx.client.session.abort).not.toHaveBeenCalled()
+			expect(deps.sessionFallbackTimeouts.has(sessionID)).toBe(false)
+			expect((deps as any).sessionDispatchModels.has(sessionID)).toBe(false)
+		})
+
+		test("#then session.compacted inside summarize prevents stale post-response timer and lock state", async () => {
+			const sessionID = "ses_compacted_before_summarize_resolves"
+			const failedModel = "openai/primary"
+			const fallbackModel = "google/backup"
+			const deps = createMockDeps()
+			deps.config.timeout_seconds = 30
+			deps.agentConfigs = { compaction: {} }
+			deps.globalFallbackModels = [failedModel, fallbackModel]
+			;(deps as any).sessionDispatchModels = new Map<string, string>()
+			const state = createFallbackState(failedModel)
+			deps.sessionStates.set(sessionID, state)
+			const helpers = createAutoRetryHelpers(deps)
+			const eventHandler = createEventHandler(deps, helpers)
+			deps.sessionRetryInFlight.add(sessionID)
+			deps.ctx.client.session.summarize = mock(async () => {
+				await eventHandler.handleEvent({
+					event: { type: "session.compacted", properties: { sessionID } },
+				})
+				return { data: true }
+			}) as any
+			const plan = planFallback(sessionID, state, deps.globalFallbackModels, deps.config)
+			expect(plan.success).toBe(true)
+
+			await helpers.autoRetryWithFallback(sessionID, fallbackModel, "compaction", "message.updated", plan)
+
+			expect(state.currentModel).toBe(fallbackModel)
+			expect(state.attemptCount).toBe(1)
+			expect(state.failedModels.has(failedModel)).toBe(true)
+			expect(deps.sessionFallbackTimeouts.has(sessionID)).toBe(false)
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+			expect(deps.sessionCompactionInFlight.has(sessionID)).toBe(false)
+			expect(deps.sessionRetryInFlight.has(sessionID)).toBe(false)
+		})
+
+		test("#then a hung summarize times out to the next compaction model without stale settlement stealing ownership", async () => {
+			const sessionID = "ses_hung_compaction_summarize"
+			const failedModel = "openai/primary"
+			const firstFallback = "google/backup"
+			const recoveryFallback = "anthropic/recovery"
+			const deps = createMockDeps()
+			deps.config.timeout_seconds = 0.03
+			deps.config.max_fallback_attempts = 4
+			deps.agentConfigs = {
+				compaction: { fallback_models: [failedModel, firstFallback, recoveryFallback] },
+			}
+			deps.globalFallbackModels = [failedModel, firstFallback, "openai/global-recovery"]
+			;(deps as any).sessionDispatchModels = new Map<string, string>()
+			const state = createFallbackState(failedModel)
+			deps.sessionStates.set(sessionID, state)
+			let resolveFirstSummarize!: (value: any) => void
+			let resolveSecondSummarize!: (value: any) => void
+			const firstSummarize = new Promise<any>((resolve) => { resolveFirstSummarize = resolve })
+			const secondSummarize = new Promise<any>((resolve) => { resolveSecondSummarize = resolve })
+			const summarizeCalls: any[] = []
+			deps.ctx.client.session.summarize = mock(async (request: any) => {
+				summarizeCalls.push(request)
+				return summarizeCalls.length === 1 ? firstSummarize : secondSummarize
+			}) as any
+			const helpers = createAutoRetryHelpers(deps)
+			deps.sessionRetryInFlight.add(sessionID)
+			const firstPlan = planFallback(sessionID, state, [failedModel, firstFallback, recoveryFallback], deps.config)
+			expect(firstPlan.success).toBe(true)
+			const firstDispatch = helpers.autoRetryWithFallback(
+				sessionID, firstFallback, "compaction", "message.updated", firstPlan,
+			)
+
+			const waitFor = async (predicate: () => boolean, label: string) => {
+				const deadline = Date.now() + 5000
+				while (!predicate() && Date.now() < deadline) {
+					await new Promise((resolve) => setTimeout(resolve, 20))
+				}
+				expect(predicate(), label).toBe(true)
+			}
+			await waitFor(() => summarizeCalls.length >= 1, "first summarize dispatch should begin")
+			await waitFor(() => summarizeCalls.length >= 2, "TTFT recovery should dispatch a second summarize")
+
+			expect(summarizeCalls[0].body).toEqual({ providerID: "google", modelID: "backup" })
+			expect(summarizeCalls[1].body).toEqual({ providerID: "anthropic", modelID: "recovery" })
+			expect(state.currentModel).toBe(recoveryFallback)
+			expect(state.attemptCount).toBe(2)
+			expect(state.failedModels.has(failedModel)).toBe(true)
+			expect(state.failedModels.has(firstFallback)).toBe(true)
+			expect(deps.ctx.client.session.abort).toHaveBeenCalled()
+			expect(deps.sessionRetryInFlight.has(sessionID)).toBe(false)
+			expect(deps.sessionCompactionInFlight.has(sessionID)).toBe(true)
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(true)
+			const currentTimeout = deps.sessionFallbackTimeouts.get(sessionID)
+			expect(currentTimeout).toBeDefined()
+
+			resolveFirstSummarize({ data: true })
+			await firstDispatch
+			await new Promise((resolve) => setTimeout(resolve, 0))
+			expect(deps.sessionFallbackTimeouts.get(sessionID)).toBe(currentTimeout)
+			expect(deps.sessionCompactionInFlight.has(sessionID)).toBe(true)
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(true)
+			expect(state.currentModel).toBe(recoveryFallback)
+
+			const eventHandler = createEventHandler(deps, helpers)
+			await eventHandler.handleEvent({
+				event: { type: "session.compacted", properties: { sessionID } },
+			})
+			resolveSecondSummarize({ data: true })
+			await new Promise((resolve) => setTimeout(resolve, 10))
+			expect(deps.sessionFallbackTimeouts.has(sessionID)).toBe(false)
+			expect(deps.sessionCompactionInFlight.has(sessionID)).toBe(false)
+			expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
+		}, 15000)
+	})
+
+	describe("#given provider status during a pending compaction summarize", () => {
+		const failedModel = "openai/primary"
+		const firstFallback = "google/backup"
+		const recoveryFallback = "anthropic/recovery"
+
+		function setupPendingCompaction(sessionID: string, timeoutSeconds: number) {
+			const messagesData = [{
+				info: { sessionID, role: "assistant", agent: "compaction", model: failedModel },
+				parts: [{ type: "compaction" }],
+			}]
+			const deps = createMockDeps({ messagesData })
+			deps.config.timeout_seconds = timeoutSeconds
+			deps.config.max_fallback_attempts = 4
+			deps.agentConfigs = {
+				compaction: { fallback_models: [failedModel, firstFallback, recoveryFallback] },
+			}
+			deps.globalFallbackModels = [failedModel, firstFallback, recoveryFallback]
+			const state = createFallbackState(failedModel)
+			deps.sessionStates.set(sessionID, state)
+			const helpers = createAutoRetryHelpers(deps)
+			const handleMessageUpdate = createMessageUpdateHandler(deps, helpers)
+			const handleEvent = createEventHandler(deps, helpers)
+			return { deps, state, helpers, handleMessageUpdate, handleEvent, messagesData }
+		}
+
+		const failedCompactionUpdate = (sessionID: string) => ({
+			info: {
+				sessionID,
+				role: "assistant",
+				agent: "compaction",
+				model: failedModel,
+				error: { statusCode: 500, message: "provider unavailable" },
+			},
+		})
+
+		test("#then a provider retry leaves recovery armed and recovers to the next compaction model", async () => {
+			const sessionID = "ses_status_during_pending_summarize"
+			const { deps, state, handleMessageUpdate, handleEvent } = setupPendingCompaction(sessionID, 0.15)
+			const summarizeResolvers: Array<(value: any) => void> = []
+			const summarizeCalls: any[] = []
+			deps.ctx.client.session.summarize = mock(async (request: any) => {
+				summarizeCalls.push(request)
+				return await new Promise((resolve) => summarizeResolvers.push(resolve))
+			}) as any
+
+			let finishInitialCaller!: () => void
+			const initialCallerDone = new Promise<void>((resolve) => { finishInitialCaller = resolve })
+			const initialCaller = handleMessageUpdate(failedCompactionUpdate(sessionID)).finally(finishInitialCaller)
+			const waitFor = async (predicate: () => boolean, label: string) => {
+				const deadline = Date.now() + 5000
+				while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 15))
+				expect(predicate(), label).toBe(true)
+			}
+
+			try {
+				await waitFor(() => summarizeCalls.length === 1, "initial summarize should be pending")
+				const recoveryTimer = deps.sessionFallbackTimeouts.get(sessionID)
+				expect(recoveryTimer).toBeDefined()
+
+				await handleEvent.handleEvent({
+					event: {
+						type: "session.status",
+						properties: { sessionID, status: { type: "retry", attempt: 2, message: "rate limited" } },
+					},
+				})
+
+				expect(deps.sessionFallbackTimeouts.get(sessionID)).toBe(recoveryTimer)
+				expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(true)
+				expect(deps.sessionCompactionInFlight.has(sessionID)).toBe(true)
+				await waitFor(() => summarizeCalls.length === 2, "TTFT recovery should dispatch the next model")
+				expect(summarizeCalls[1].body).toEqual({ providerID: "anthropic", modelID: "recovery" })
+				expect(state.currentModel).toBe(recoveryFallback)
+				expect(state.attemptCount).toBe(2)
+			} finally {
+				for (const resolve of summarizeResolvers) resolve({ data: true })
+				deps.sessionFallbackTimeouts.forEach(clearTimeout)
+				deps.sessionFallbackTimeouts.clear()
+				await Promise.race([initialCaller, new Promise((resolve) => setTimeout(resolve, 3000))])
+				await initialCallerDone
+			}
+		}, 15000)
+
+		test("#then stale summarize settlement cannot release the recovery caller's retry lock", async () => {
+			const sessionID = "ses_stale_summarize_cannot_release_recovery_lock"
+			const { deps, handleMessageUpdate } = setupPendingCompaction(sessionID, 0.05)
+			let resolveInitialSummarize!: (value: any) => void
+			const firstSummarize = new Promise<any>((resolve) => { resolveInitialSummarize = resolve })
+			let summarizeCalls = 0
+			deps.ctx.client.session.summarize = mock(async () => {
+				summarizeCalls++
+				return summarizeCalls === 1 ? firstSummarize : { data: true }
+			}) as any
+
+			let releaseRecoveryMessages!: () => void
+			let signalRecoveryMessages!: () => void
+			const recoveryMessagesGate = new Promise<void>((resolve) => { releaseRecoveryMessages = resolve })
+			const recoveryMessagesStarted = new Promise<void>((resolve) => { signalRecoveryMessages = resolve })
+			let gateRecoveryMessages = false
+			deps.ctx.client.session.messages = mock(async () => {
+				if (gateRecoveryMessages) {
+					signalRecoveryMessages()
+					await recoveryMessagesGate
+				}
+				return { data: [] }
+			}) as any
+
+			const initialCaller = handleMessageUpdate(failedCompactionUpdate(sessionID))
+			const waitFor = async (predicate: () => boolean, label: string) => {
+				const deadline = Date.now() + 5000
+				while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 15))
+				expect(predicate(), label).toBe(true)
+			}
+
+			try {
+				await waitFor(() => summarizeCalls === 1, "initial summarize should be pending")
+				gateRecoveryMessages = true
+				await recoveryMessagesStarted
+				expect(deps.sessionRetryInFlight.has(sessionID)).toBe(true)
+				const recoveryLockToken = deps.sessionRetryLockTokens?.get(sessionID)
+
+				resolveInitialSummarize({ data: true })
+				await initialCaller
+				expect(deps.sessionRetryInFlight.has(sessionID)).toBe(true)
+				expect(deps.sessionRetryLockTokens?.get(sessionID)).toBe(recoveryLockToken)
+			} finally {
+				releaseRecoveryMessages()
+				resolveInitialSummarize({ data: true })
+				deps.sessionFallbackTimeouts.forEach(clearTimeout)
+				deps.sessionFallbackTimeouts.clear()
+				await Promise.race([initialCaller, new Promise((resolve) => setTimeout(resolve, 3000))])
+			}
+		}, 15000)
 	})
 })

@@ -4,19 +4,28 @@ import { getFallbackModelsForSession } from "./config-reader"
 import { createFallbackState, planFallback, commitFallback } from "./fallback-state"
 import { getErrorMessage, isRetryableError, isProviderWideRateLimitError } from "./error-classifier"
 import { logInfo } from "./logger"
+import { FALLBACK_CONTINUATION_PROMPT } from "./continuation-prompt"
 
 type Signal = { type: "retry"; error: unknown } | { type: "cancel" }
 type Owner = { signal: (signal: Signal) => void; activity: () => void }
 type Permission = { permission: string; pattern: string; action: "allow" | "deny" | "ask" }
 type Session = { id: string; parentID?: string; permission?: Permission[] }
 type Options = { query: { directory: string }; throwOnError: true }
+type TaskArgs = {
+	description: string
+	prompt: string
+	subagent_type: string
+	task_id?: string
+	command?: string
+	background?: boolean
+}
 // Modern SDK fields are not present in the minimum peer version's declarations.
 type TaskClient = {
 	app: { agents(options: Options): Promise<{ data?: Array<{ name: string; mode: string; model?: { providerID: string; modelID: string }; permission: Permission[] }> }> }
 	session: {
 		get(options: Options & { path: { id: string } }): Promise<{ data?: Session }>
 		create(options: Options & { body: { parentID: string; title: string; permission: Permission[] } }): Promise<{ data?: Session }>
-		messages(options: Options & { path: { id: string } }): Promise<{ data?: Array<{ info: { id: string; role: string; providerID: string; modelID: string } }> }>
+		messages(options: Options & { path: { id: string } }): Promise<{ data?: Array<{ info: { id: string; role: string; providerID: string; modelID: string }; parts?: Array<{ type: string; text?: string }> }> }>
 		prompt(options: Options & { path: { id: string }; body: { agent: string; model: { providerID: string; modelID: string }; parts: Array<{ type: "text"; text: string }> } }): Promise<{ data?: { info: { error?: unknown }; parts: Array<{ type: string; text?: string }> } }>
 		abort(options: Options & { path: { id: string } }): Promise<unknown>
 	}
@@ -30,7 +39,9 @@ export function createForegroundTask(deps: HookDeps) {
 	const client = deps.ctx.client as unknown as TaskClient
 	const query = { directory: deps.ctx.directory }
 
-	const definition = tool({
+	// Define the supported host result directly: the minimum peer SDK's tool()
+	// typing accepts only strings, while modern hosts also accept metadata/output.
+	const definition = {
 		description: "Launch a foreground subagent and wait for its result, transparently switching to configured fallback models on retryable failures. Background execution is not supported by this task replacement.",
 		args: {
 			description: tool.schema.string().describe("A short (3-5 words) description of the task"),
@@ -40,7 +51,7 @@ export function createForegroundTask(deps: HookDeps) {
 			command: tool.schema.string().optional(),
 			background: tool.schema.boolean().optional(),
 		},
-		async execute(args, context: ToolContext) {
+		async execute(args: TaskArgs, context: ToolContext) {
 			if (args.background) throw new Error("foreground_task_fallback supports foreground tasks only")
 			context.abort.throwIfAborted()
 			await context.ask({
@@ -78,6 +89,11 @@ export function createForegroundTask(deps: HookDeps) {
 				? (await client.session.get({ path: { id: args.task_id }, query, throwOnError: true })).data!
 				: (await client.session.create({ query, body: { parentID: context.sessionID, title: `${args.description} (@${agent.name} subagent)`, permission }, throwOnError: true })).data!
 			if (child.parentID !== context.sessionID) throw new Error("Cannot resume a task belonging to another parent")
+			const previousMessageIDs = args.task_id
+				? new Set(((await client.session.messages({ path: { id: child.id }, query, throwOnError: true })).data ?? []).map((message) => message.info.id))
+				: new Set<string>()
+			// Check ownership after the snapshot await; no yield may separate
+			// this check from registering the owner in the first attempt.
 			if (owners.has(child.id)) throw new Error("Task is already running")
 			context.abort.throwIfAborted()
 			const state = createFallbackState(`${initial.providerID}/${initial.modelID}`)
@@ -87,13 +103,15 @@ export function createForegroundTask(deps: HookDeps) {
 				agent: agent.name, currentModel: state.currentModel, fallbackModels: models,
 			})
 			const blockedProviders = new Set<string>()
+			let taskPromptSaved = false
 			let lastError: unknown
 			try {
 				while (true) {
 					context.abort.throwIfAborted()
 					const [providerID, ...modelParts] = state.currentModel.split("/")
 					const model = { providerID, modelID: modelParts.join("/") }
-					context.metadata({ title: args.description, metadata: { sessionId: child.id, model } })
+					const metadata = { parentSessionId: context.sessionID, sessionId: child.id, model }
+					context.metadata({ title: args.description, metadata })
 					let wake!: (signal: Signal) => void
 					const signal = new Promise<Signal>((resolve) => { wake = resolve })
 					let timer: ReturnType<typeof setTimeout> | undefined
@@ -115,7 +133,7 @@ export function createForegroundTask(deps: HookDeps) {
 					// win the race while the original HTTP request is still pending.
 					const request = client.session.prompt({
 						path: { id: child.id }, query, throwOnError: true,
-						body: { agent: agent.name, model, parts: [{ type: "text", text: args.prompt }] },
+						body: { agent: agent.name, model, parts: [{ type: "text", text: taskPromptSaved ? FALLBACK_CONTINUATION_PROMPT : args.prompt }] },
 					}).then((result) => ({ type: "result" as const, result }), (error: unknown) => ({ type: "error" as const, error }))
 					try {
 						const outcome = await Promise.race([request, signal])
@@ -138,7 +156,14 @@ export function createForegroundTask(deps: HookDeps) {
 							if (!lastError) {
 								const text = result.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n")
 								if (!text.trim()) throw new Error("Subagent returned no text result")
-								return `task_id: ${child.id}\n\n<task_result>\n${text}\n</task_result>`
+								// Some hosts discard streaming metadata callbacks. Include
+								// the child link in the final result so task timing/navigation
+								// survives the registry's completed-state replacement.
+								return {
+									title: args.description,
+									output: `task_id: ${child.id}\n\n<task_result>\n${text}\n</task_result>`,
+									metadata,
+								}
 							}
 							if (!isRetryableError(lastError, deps.config.retry_on_errors, deps.config.retryable_error_patterns)) throw new Error(JSON.stringify(lastError))
 						}
@@ -148,6 +173,13 @@ export function createForegroundTask(deps: HookDeps) {
 					}
 					const plan = nextPlan(lastError)
 					if (!plan.success) throw new Error(`Subagent failed (task_id: ${child.id}): ${plan.error}; ${JSON.stringify(lastError)}`)
+					// A rejected SDK request can fail before the host saves the task.
+					// Continue only once its original instructions exist in history.
+					if (!taskPromptSaved) {
+						const history = await client.session.messages({ path: { id: child.id }, query, throwOnError: true })
+						taskPromptSaved = history.data?.some((message) => !previousMessageIDs.has(message.info.id) && message.info.role === "user" &&
+							message.parts?.some((part) => part.type === "text" && part.text === args.prompt)) ?? false
+					}
 					commitFallback(state, plan)
 					logInfo("Foreground task switching model while retaining parent promise", { childSession: child.id, model: state.currentModel })
 					if (deps.config.notify_on_fallback) {
@@ -170,7 +202,7 @@ export function createForegroundTask(deps: HookDeps) {
 				return planFallback(child.id, state, models.map((model) => blockedProviders.has(model.split("/")[0]) ? state.currentModel : model), deps.config)
 			}
 		},
-	})
+	}
 	let maxDepth = 1
 	let primaryTools: string[] = []
 	return {

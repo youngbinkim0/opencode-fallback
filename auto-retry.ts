@@ -1,8 +1,10 @@
 import type { HookDeps, MessagePart, FallbackPlan } from "./types"
 import { logInfo, logError } from "./logger"
 import { getFallbackModelsForSession, resolveAgentForSession } from "./config-reader"
-import { prepareFallback, planFallback, commitFallback, createFallbackState } from "./fallback-state"
+import { prepareFallback, planFallback, commitFallback, createFallbackState, isModelInCooldown } from "./fallback-state"
+import { acquireRetryLock, releaseRetryLock } from "./retry-lock"
 import { replayWithDegradation } from "./message-replay"
+import { FALLBACK_CONTINUATION_PROMPT } from "./continuation-prompt"
 
 const SESSION_TTL_MS = 30 * 60 * 1000
 
@@ -64,6 +66,22 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		string,
 		{ parentID: string; startedAt: number; claimedByToolHook: boolean }
 	>()
+	const compactionDispatchOwners = new Map<string, { generation: number; model: string }>()
+	let nextCompactionDispatchGeneration = 0
+	const sessionDispatchModels = deps.sessionDispatchModels ??= new Map<string, string>()
+	const ownsCompactionDispatch = (
+		sessionID: string,
+		owner: { generation: number; model: string } | undefined,
+	) => Boolean(owner && compactionDispatchOwners.get(sessionID) === owner)
+	const clearCompactionDispatch = (
+		sessionID: string,
+		owner: { generation: number; model: string } | undefined,
+	) => {
+		if (!ownsCompactionDispatch(sessionID, owner)) return false
+		compactionDispatchOwners.delete(sessionID)
+		deps.sessionCompactionInFlight.delete(sessionID)
+		return true
+	}
 
 	const registerChildFallbackBridge = (childID: string, parentID: string) => {
 		if (childFallbackBridges.has(childID)) return
@@ -133,14 +151,21 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		}
 	}
 
-	const scheduleSessionFallbackTimeout = (sessionID: string, resolvedAgent?: string) => {
+	const scheduleSessionFallbackTimeout = (
+		sessionID: string,
+		resolvedAgent?: string,
+		compactionOwner?: { generation: number; model: string },
+	) => {
 		clearSessionFallbackTimeout(sessionID)
 
 		const timeoutMs = config.timeout_seconds * 1000
 		if (timeoutMs <= 0) return
 
 		const timer = setTimeout(async () => {
+			if (sessionFallbackTimeouts.get(sessionID) !== timer) return
+			if (compactionOwner && !ownsCompactionDispatch(sessionID, compactionOwner)) return
 			sessionFallbackTimeouts.delete(sessionID)
+			if (compactionOwner && !deps.sessionCompactionInFlight.has(sessionID)) return
 
 			// TTFT: if first token has been received, model is streaming — don't abort
 			if (deps.sessionFirstTokenReceived.get(sessionID)) {
@@ -170,7 +195,12 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 			// Clear compaction-in-flight: the compaction timed out, so the
 			// next attempt needs a clean slate (the new autoRetryWithFallback
 			// call will re-set the flag if it dispatches compaction again).
-			deps.sessionCompactionInFlight.delete(sessionID)
+			if (compactionOwner) {
+				clearCompactionDispatch(sessionID, compactionOwner)
+				sessionAwaitingFallbackResult.delete(sessionID)
+			} else {
+				deps.sessionCompactionInFlight.delete(sessionID)
+			}
 			await abortSessionRequest(sessionID, "session.timeout")
 
 			if (state.pendingFallbackModel) {
@@ -184,6 +214,12 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				deps.globalFallbackModels
 			)
 			if (fallbackModels.length === 0) return
+			// Abort/cleanup above can yield to another handler. Recheck immediately
+			// before acquiring so this timeout never overwrites a newer owner.
+			if (sessionRetryInFlight.has(sessionID)) {
+				logInfo("Timeout recovery yielded to a retry started during abort", { sessionID })
+				return
+			}
 
 			logInfo("Session fallback timeout reached", {
 				sessionID,
@@ -191,8 +227,10 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				currentModel: state.currentModel,
 			})
 
-			// Timeout callback manages its own lock lifecycle
-			sessionRetryInFlight.add(sessionID)
+			// Timeout callback owns only the lock token it acquires. A later
+			// recovery dispatch may acquire a replacement while this callback is
+			// still unwinding from a long summarize promise.
+			const retryLockToken = acquireRetryLock(deps, sessionID)
 			try {
 				const plan = planFallback(sessionID, state, fallbackModels, config)
 				if (plan.success) {
@@ -205,7 +243,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					)
 				}
 			} finally {
-				sessionRetryInFlight.delete(sessionID)
+				releaseRetryLock(deps, sessionID, retryLockToken)
 			}
 		}, timeoutMs)
 
@@ -222,6 +260,11 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		// Track whether we skipped because another handler owns the dispatch.
 		// In that case, the finally block must NOT clear sessionAwaitingFallbackResult.
 		let deferredToOtherHandler = false
+		let compactionOwner: { generation: number; model: string } | undefined
+		let normalDispatchModel: string | undefined
+		// Callers own the lock. Snapshot that owner's token before yielding so
+		// the summarize wait can release it without later touching a replacement.
+		const retryLockToken = deps.sessionRetryLockTokens?.get(sessionID)
 
 		// Guard: if the state has already been advanced past this model by
 		// a concurrent handler (race between message.updated / session.error /
@@ -274,6 +317,66 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				return false
 			}
 			deps.sessionCompactionInFlight.add(sessionID)
+			compactionOwner = { generation: ++nextCompactionDispatchGeneration, model: newModel }
+			compactionDispatchOwners.set(sessionID, compactionOwner)
+		}
+
+		// OpenCode's compaction processor prefers agent.compaction.model over
+		// the model in session.summarize's body. Refuse a fallback that the host
+		// would silently run on a different model, before aborting or deleting
+		// any session messages. A stale request may overlap another handler's
+		// dispatch; leave that handler's awaiting flag and timer untouched.
+		if (resolvedAgent === "compaction") {
+			const compactionConfig = deps.agentConfigs?.compaction
+			const pinnedModel =
+				typeof compactionConfig === "object" && compactionConfig !== null &&
+					typeof (compactionConfig as Record<string, unknown>).model === "string"
+						? ((compactionConfig as Record<string, unknown>).model as string)
+						: undefined
+			const pinnedModelInCooldown = Boolean(
+				pinnedModel && pinnedModel === newModel && preCheckState &&
+				isModelInCooldown(pinnedModel, preCheckState, config.cooldown_seconds)
+			)
+			if (pinnedModel && (pinnedModel !== newModel || pinnedModelInCooldown)) {
+				clearCompactionDispatch(sessionID, compactionOwner)
+				if (sessionAwaitingFallbackResult.has(sessionID)) {
+					logInfo(`Skipping pinned compaction fallback (${source}); another handler owns the result`, {
+						sessionID,
+						pinnedModel,
+						requestedModel: newModel,
+					})
+					deferredToOtherHandler = true
+					return false
+				}
+				const reason = pinnedModelInCooldown
+					? `Pinned compaction model ${pinnedModel} is still in fallback cooldown.`
+					: `Compaction is pinned to ${pinnedModel}, so it cannot switch to ${newModel}.`
+				const action = pinnedModelInCooldown
+					? "Wait for the fallback cooldown or unset agent.compaction.model."
+					: "Unset agent.compaction.model to allow switching compaction models."
+				logError(reason, {
+					sessionID,
+					pinnedModel,
+					requestedModel: newModel,
+					action,
+				})
+				if (preCheckState) preCheckState.pendingFallbackModel = undefined
+				sessionAwaitingFallbackResult.delete(sessionID)
+				clearSessionFallbackTimeout(sessionID)
+				if (config.notify_on_fallback) {
+					await ctx.client.tui
+						.showToast({
+							body: {
+								title: "Compaction Fallback Blocked",
+								message: `${reason} ${action}`,
+								variant: "warning",
+								duration: 10000,
+							},
+						})
+						.catch(() => {})
+				}
+				return false
+			}
 		}
 
 		// ── TOP-LEVEL SESSION HANDLING ──
@@ -486,9 +589,47 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				}
 
 				// Step 4: Call session.summarize with the fallback model
+				const handleSummarizeFailure = async (summarizeErr: unknown) => {
+					if (!ownsCompactionDispatch(sessionID, compactionOwner)) return
+					logError(`session.summarize failed (${source})`, {
+						sessionID,
+						model: newModel,
+						error: String(summarizeErr),
+					})
+					sessionAwaitingFallbackResult.delete(sessionID)
+					if (plan) {
+						const currentState = sessionStates.get(sessionID)
+						if (currentState && commitFallback(currentState, plan)) {
+							logInfo(`Committed compaction fallback state as last resort (${source})`, {
+								sessionID,
+								from: plan.failedModel,
+								to: plan.newModel,
+							})
+						}
+					}
+					clearCompactionDispatch(sessionID, compactionOwner)
+					clearSessionFallbackTimeout(sessionID)
+					sessionAwaitingFallbackResult.delete(sessionID)
+
+					if (config.notify_on_fallback) {
+						const fromName = (failedModel || "primary").split("/").pop()!
+						const toName = newModel.split("/").pop() || newModel
+						await ctx.client.tui
+							.showToast({
+								body: {
+									title: "Compaction Failed",
+									message: `${fromName} can't compact — try /compact after switching to ${toName}`,
+									variant: "warning",
+									duration: 10000,
+								},
+							})
+							.catch(() => {})
+					}
+				}
 				try {
 					if (sessionAwaitingFallbackResult.has(sessionID)) {
 						logInfo(`Skipping duplicate compaction summarize (${source})`, { sessionID })
+						clearCompactionDispatch(sessionID, compactionOwner)
 						deferredToOtherHandler = true
 						return false
 					}
@@ -500,7 +641,34 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						modelID: fallbackModelObj.modelID,
 					})
 
-					const summarizeResult = await ctx.client.session.summarize({
+					// Commit at dispatch start, before summarize can synchronously run
+					// the session loop and emit session.compacted. Committing after that
+					// callback would let a completed operation look stale to other
+					// handlers and could advance state after completion.
+					if (plan) {
+						const stateToCommit = sessionStates.get(sessionID)
+						if (stateToCommit && !commitFallback(stateToCommit, plan)) {
+							logInfo(`Compaction fallback state advanced before dispatch (${source})`, {
+								sessionID,
+								from: plan.failedModel,
+								to: plan.newModel,
+								currentModel: stateToCommit.currentModel,
+							})
+							deferredToOtherHandler = true
+							await abortSessionRequest(sessionID, `stale-compaction.${source}`)
+							return false
+						}
+						if (stateToCommit) {
+							logInfo(`Committed fallback at compaction dispatch (${source})`, {
+								sessionID,
+								from: plan.failedModel,
+								to: plan.newModel,
+								attemptCount: stateToCommit.attemptCount,
+							})
+						}
+					}
+
+					const summarizePromise = ctx.client.session.summarize({
 						path: { id: sessionID },
 						body: {
 							providerID: fallbackModelObj.providerID,
@@ -509,42 +677,45 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						query: { directory: ctx.directory },
 					})
 
+					retryDispatched = true
+					// The timeout is recovery ownership for the in-flight summarize
+					// loop. Release the retry lock before waiting so the timer can
+					// acquire it and dispatch the next candidate.
+					if (ownsCompactionDispatch(sessionID, compactionOwner) &&
+						deps.sessionCompactionInFlight.has(sessionID) &&
+						sessionAwaitingFallbackResult.has(sessionID) &&
+						!deps.sessionFirstTokenReceived.get(sessionID)) {
+						scheduleSessionFallbackTimeout(sessionID, resolvedAgent, compactionOwner)
+					}
+					releaseRetryLock(deps, sessionID, retryLockToken)
+
+					const summarizeResult = await summarizePromise
+
+					// A session.compacted event may fire inside summarize, before the
+					// host promise settles. It owns completion; never restore a timer
+					// or clear state that a newer dispatch now owns.
+					if (!ownsCompactionDispatch(sessionID, compactionOwner)) {
+						deferredToOtherHandler = true
+						return true
+					}
+					if (!deps.sessionCompactionInFlight.has(sessionID) ||
+						!sessionAwaitingFallbackResult.has(sessionID)) {
+						clearCompactionDispatch(sessionID, compactionOwner)
+						deferredToOtherHandler = true
+						return true
+					}
+
 					logInfo(`session.summarize response (${source})`, {
 						sessionID,
 						model: newModel,
 						response: (JSON.stringify(summarizeResult) ?? "undefined").slice(0, 500),
 					})
-
-					// The SDK reports transport/provider failures in the result
-					// envelope instead of throwing, so an unchecked result would
-					// commit a model that never compacted and re-dispatch on it.
-					// Route it into the catch below, which already handles a
-					// failed summarize (no re-dispatch, timer cleared, toast).
 					const summarizeError = (summarizeResult as { error?: unknown } | undefined)?.error
 					if (summarizeError) {
 						throw new Error(
 							`session.summarize returned an error: ${JSON.stringify(summarizeError).slice(0, 300)}`
 						)
 					}
-
-					// Commit fallback state after successful dispatch
-					if (plan) {
-						const stateToCommit = sessionStates.get(sessionID)
-						if (stateToCommit) {
-							const committed = commitFallback(stateToCommit, plan)
-							if (committed) {
-								logInfo(`Committed fallback after compaction summarize (${source})`, {
-									sessionID,
-									from: plan.failedModel,
-									to: plan.newModel,
-									attemptCount: stateToCommit.attemptCount,
-								})
-							}
-						}
-					}
-
-					scheduleSessionFallbackTimeout(sessionID, undefined)
-					retryDispatched = true
 
 					if (config.notify_on_fallback) {
 						const fromName = (failedModel || "primary").split("/").pop()!
@@ -567,46 +738,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 					})
 					return true
 				} catch (summarizeErr) {
-					logError(`session.summarize failed (${source})`, {
-						sessionID,
-						model: newModel,
-						error: String(summarizeErr),
-					})
-					sessionAwaitingFallbackResult.delete(sessionID)
-
-					// Summarize failed — commit fallback state so chat.message
-					// override works for regular prompts
-					if (plan) {
-						const currentState = sessionStates.get(sessionID)
-						if (currentState) {
-							commitFallback(currentState, plan)
-							logInfo(`Committed compaction fallback state as last resort (${source})`, {
-								sessionID,
-								from: plan.failedModel,
-								to: plan.newModel,
-							})
-						}
-					}
-
-					deps.sessionCompactionInFlight.delete(sessionID)
-					clearSessionFallbackTimeout(sessionID)
-					sessionAwaitingFallbackResult.delete(sessionID)
-
-					if (config.notify_on_fallback) {
-						const fromName = (failedModel || "primary").split("/").pop()!
-						const toName = newModel.split("/").pop() || newModel
-						await ctx.client.tui
-							.showToast({
-								body: {
-									title: "Compaction Failed",
-									message: `${fromName} can't compact — try /compact after switching to ${toName}`,
-									variant: "warning",
-									duration: 10000,
-								},
-							})
-							.catch(() => {})
-					}
-
+					await handleSummarizeFailure(summarizeErr)
 					deferredToOtherHandler = true
 					return false
 				}
@@ -706,12 +838,19 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						typeof p.type === "string" && p.type !== "compaction"
 				)
 
+				// Replay guard: the selected user/non-assistant history must be
+				// replayable, but its original parts are NOT resent. The retry sends
+				// a short continuation instead; the original message stays in history.
+				const continuationParts: MessagePart[] = [
+					{ type: "text", text: FALLBACK_CONTINUATION_PROMPT },
+				]
+
 				logInfo(`Prepared replay payload (${source})`, {
 					sessionID,
 					model: newModel,
 					agent: resolvedAgent,
 					replaySource,
-					payload: summarizeParts(allParts),
+					payload: summarizeParts(continuationParts),
 				})
 
 				if (allParts.length > 0) {
@@ -726,7 +865,9 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						const prompt = childParentID
 							? ctx.client.session.prompt ?? ctx.client.session.promptAsync
 							: ctx.client.session.promptAsync
-						await prompt({
+						normalDispatchModel = newModel
+						sessionDispatchModels?.set(sessionID, newModel)
+						await prompt.call(ctx.client.session, {
 							path: { id: sessionID },
 							body: {
 								...(resolvedAgent ? { agent: resolvedAgent } : {}),
@@ -742,7 +883,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 						})
 					}
 
-					const replayResult = await replayWithDegradation(allParts, sendFn)
+					const replayResult = await replayWithDegradation(continuationParts, sendFn)
 
 					if (replayResult.success) {
 						// Commit the fallback plan to state NOW — after the API call
@@ -784,8 +925,22 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 							return false
 						}
 
-						// sessionAwaitingFallbackResult already set before dispatch
-						scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
+						if (sessionDispatchModels?.get(sessionID) === newModel) {
+							sessionDispatchModels.delete(sessionID)
+						}
+						normalDispatchModel = undefined
+
+						// A fast response may arrive before promptAsync settles. Do
+						// not arm a timer after the response has already produced a
+						// first token and transferred/cleared the awaiting state.
+						if (deps.sessionFirstTokenReceived.get(sessionID)) {
+							const state = sessionStates.get(sessionID)
+							if (state?.pendingFallbackModel === newModel) state.pendingFallbackModel = undefined
+							sessionAwaitingFallbackResult.delete(sessionID)
+							clearSessionFallbackTimeout(sessionID)
+						} else if (sessionAwaitingFallbackResult.has(sessionID)) {
+							scheduleSessionFallbackTimeout(sessionID, resolvedAgent)
+						}
 						retryDispatched = true
 
 						logInfo(`Fallback replay succeeded (${source})`, {
@@ -825,20 +980,33 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				})
 			}
 		} catch (retryError) {
+			const ownsCurrentDispatch = compactionOwner
+				? ownsCompactionDispatch(sessionID, compactionOwner)
+				: !sessionDispatchModels?.has(sessionID) || sessionDispatchModels.get(sessionID) === normalDispatchModel
+			if (!ownsCurrentDispatch) {
+				deferredToOtherHandler = true
+				return false
+			}
 			logError(`Auto-retry failed (${source})`, {
 				sessionID,
 				error: String(retryError),
 			})
 			sessionAwaitingFallbackResult.delete(sessionID)
-			deps.sessionCompactionInFlight.delete(sessionID)
+			if (compactionOwner) clearCompactionDispatch(sessionID, compactionOwner)
 			clearSessionFallbackTimeout(sessionID)
 		} finally {
+			if (normalDispatchModel && sessionDispatchModels?.get(sessionID) === normalDispatchModel) {
+				sessionDispatchModels.delete(sessionID)
+			}
 			// Note: sessionRetryInFlight is managed by the caller, not here.
 			// Don't clear awaiting flag if we deferred to another handler that
 			// IS dispatching — they own the flag now.
-			if (!retryDispatched && !deferredToOtherHandler) {
+			const ownsCurrentDispatch = compactionOwner
+				? ownsCompactionDispatch(sessionID, compactionOwner)
+				: !sessionDispatchModels?.has(sessionID) || sessionDispatchModels.get(sessionID) === normalDispatchModel
+			if (!retryDispatched && !deferredToOtherHandler && ownsCurrentDispatch) {
 				sessionAwaitingFallbackResult.delete(sessionID)
-				deps.sessionCompactionInFlight.delete(sessionID)
+				if (compactionOwner) clearCompactionDispatch(sessionID, compactionOwner)
 				deps.sessionProviderRetrying?.delete(sessionID)
 				clearSessionFallbackTimeout(sessionID)
 				const state = sessionStates.get(sessionID)
@@ -870,7 +1038,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 		const plan = planFallback(sessionID, state, fallbackModels, config)
 		if (!plan.success) return false
 
-		sessionRetryInFlight.add(sessionID)
+		const retryLockToken = acquireRetryLock(deps, sessionID)
 		try {
 			return await autoRetryWithFallback(
 				sessionID,
@@ -880,7 +1048,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				plan,
 			)
 		} finally {
-			sessionRetryInFlight.delete(sessionID)
+			releaseRetryLock(deps, sessionID, retryLockToken)
 		}
 	}
 
@@ -936,8 +1104,13 @@ export function createAutoRetryHelpers(deps: HookDeps) {
 				sessionStates.delete(sessionID)
 				sessionLastAccess.delete(sessionID)
 				sessionRetryInFlight.delete(sessionID)
+				deps.sessionRetryLockTokens?.delete(sessionID)
 				sessionAwaitingFallbackResult.delete(sessionID)
 				deps.sessionFirstTokenReceived.delete(sessionID)
+				deps.sessionRequestMessages?.delete(sessionID)
+				deps.sessionActiveRequests?.delete(sessionID)
+				sessionDispatchModels.delete(sessionID)
+				compactionDispatchOwners.delete(sessionID)
 				deps.sessionSelfAbortTimestamp.delete(sessionID)
 				deps.sessionParentID.delete(sessionID)
 				deps.sessionIdleResolvers.delete(sessionID)

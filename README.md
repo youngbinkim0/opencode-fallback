@@ -134,13 +134,49 @@ All fields are optional — omit any you want to keep at the default.
 1. **Per-agent** — inside the agent block in `opencode.json` (highest priority)
 2. **Global** — in the plugin config file above (used as fallback when no per-agent list is set)
 
-Per-agent always wins. If an agent defines its own list, the global list is ignored entirely for that agent.
+A non-empty per-agent list always wins. If an agent defines its own non-empty list, the global list is ignored entirely for that agent. An empty list falls back to the global chain.
 
 ```
 opencode.json agent.fallback_models   ← takes priority
 opencode-fallback.jsonc fallback_models  ← used if no per-agent list
 (nothing)                                ← error passes through to user
 ```
+
+### Agents defined in Markdown
+
+Markdown-defined agents use the same fallback mechanism as JSON-defined
+agents. No linking step is needed: OpenCode loads the agent, and the plugin
+resolves its fallback chain by agent name.
+
+For example, define `.opencode/agents/custom-review.md`:
+
+```markdown
+---
+description: Review code changes
+mode: subagent
+model: anthropic/claude-sonnet-4-6
+---
+Review the changes and report actionable findings.
+```
+
+Then add a per-agent chain under that same name in `opencode.json`:
+
+```json
+{
+  "agent": {
+    "custom-review": {
+      "fallback_models": ["openai/gpt-5.4"]
+    }
+  }
+}
+```
+
+The Markdown prompt remains the agent's instructions; it does not override
+fallback selection. A non-empty per-agent JSON chain takes precedence over
+the plugin's global chain. Without one, the global chain applies. Put
+`fallback_models` in JSON as shown: Markdown frontmatter handling varies
+between OpenCode versions. This configuration is verified with local mock
+providers on OpenCode 1.18.35.
 
 ---
 
@@ -166,7 +202,12 @@ in `opencode-fallback.jsonc`:
 The plugin registers a replacement `task` tool. The parent awaits a single
 promise throughout the handoff: a retry signal selects a fallback, the loop
 aborts and awaits its own child prompt, then synchronously prompts the same
-child on the fallback. Only the final answer is returned to the parent.
+child on the fallback with a short continuation. The original task is sent
+once; retries retain the session history and completed tool results instead
+of appending another copy of the task. Only the final answer is returned to
+the parent. If a transport failure happened before OpenCode saved the task,
+the retry sends the original instructions until their presence in history is
+confirmed.
 Workspace-wide rate-limit errors skip other models on the blocked provider.
 If no suitable fallback exists, provider retries continue on the original
 request. Real user cancellation still stops the task.
@@ -189,18 +230,45 @@ It verifies that a rate-limited child switches providers, the task remains
 ```
 Primary model fails (rate limit, quota, model not found, …)
   └─▶ Abort the in-flight request
-  └─▶ Replay the last user message with fallback_models[0]
+  └─▶ Continue the existing session with fallback_models[0]
         └─▶ If that also fails → fallback_models[1] → …
               └─▶ All fallbacks exhausted → surface error to user
 ```
 
-**TTFT timeout** — after sending to a fallback model a timer starts. If no token arrives by the deadline the model is considered hung and the next fallback is tried. Actively streaming models are never interrupted.
+**TTFT timeout** — each assistant request gets a fresh first-token window, including later turns, requests after tool calls, and auto-compaction that starts mid-turn. Repeated updates for the same message do not reset that window. If no token arrives by the deadline the model is considered hung and the next fallback is tried. Actively streaming models are never interrupted.
 
 **Cooldown & auto-recovery** — failed models enter cooldown. On the next prompt the plugin checks whether the primary model's cooldown has expired and, if so, automatically switches back.
 
-**Message replay** — the last user message is re-sent with a three-tier degradation strategy: (1) all parts, (2) text + images only, (3) text only — maximising compatibility across providers.
+**Retry continuation** — automatic retries add a short continuation message
+to the same session. The fallback model receives the original instructions,
+conversation history, and completed tool results without another copy of the
+full task prompt. Existing history still contributes to the model's input
+context; this avoids prompt duplication rather than removing that history.
 
-**Compaction-aware fallback** — when `/compact` fails, the plugin detects compaction by checking the `agent: "compaction"` field and retries via `session.command` instead of `promptAsync` (compaction messages contain parts that `promptAsync` cannot accept). Fallback models are resolved per-agent — configure a `"compaction"` agent in your fallback config, or fall back to the global chain. Toast notifications fire on compaction fallback trigger and when all fallback models are exhausted. The same TTFT timeout applies: compaction streaming produces `compaction_delta` events that keep the timer alive just like normal chat tokens. When compaction completes successfully, the plugin clears all fallback tracking state via the `session.compacted` event.
+**Compaction-aware fallback** — when `/compact` fails, the plugin detects
+`agent: "compaction"` and retries via `session.summarize`, since compaction
+messages cannot be replayed with `promptAsync`. Fallback models are resolved
+per-agent or from the global chain. Successful `session.compacted` events
+clear fallback tracking state.
+
+For compaction model switching, leave `agent.compaction.model` unset:
+
+```json
+{
+  "agent": {
+    "compaction": {
+      "fallback_models": ["openai/gpt-5.4", "anthropic/claude-sonnet-4-6"]
+    }
+  }
+}
+```
+
+OpenCode prefers a pinned `agent.compaction.model` over the model sent to
+`session.summarize`. When that pin prevents the requested fallback, the
+plugin logs an actionable error, shows a toast if notifications are enabled,
+and skips re-dispatch rather than repeatedly running the failed model.
+It does not change your agent's pinned model. Remove the pin and restart
+OpenCode to enable compaction model switching.
 
 ---
 
@@ -228,7 +296,13 @@ bun install        # install deps
 bun test           # run tests
 bun run build      # compile to dist/
 bun run typecheck  # type check without emitting
+bun run test:integration # local mock providers against installed OpenCode
 ```
+
+Additional host regressions: `bun run foreground-task.integration.ts --model-scoped`,
+`--markdown-global`, `--markdown-json`, and `--main-session`. These cases
+verify continuation without duplicating the original task and preservation
+of completed tool results.
 
 ## License
 

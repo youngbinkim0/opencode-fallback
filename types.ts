@@ -183,6 +183,14 @@ export interface HookDeps {
 	sessionAwaitingFallbackResult: Set<string>
 	sessionFallbackTimeouts: Map<string, ReturnType<typeof setTimeout>>
 	sessionFirstTokenReceived: Map<string, boolean>
+	/** Latest assistant request ID; repeated updates must not reset its TTFT window. */
+	sessionRequestMessages?: Map<string, string>
+	/** Active request IDs invalidate deferred TTFT scheduling when a request ends. */
+	sessionActiveRequests?: Map<string, string>
+	/** Expected fallback model while the host dispatch is not yet committed. */
+	sessionDispatchModels?: Map<string, string>
+	/** Prevent a settled old dispatch from releasing a newer handler's retry lock. */
+	sessionRetryLockTokens?: Map<string, symbol>
 	/** Timestamp of the last plugin-initiated abort per session.
 	 *  Used to distinguish self-inflicted MessageAbortedError from user cancellation. */
 	sessionSelfAbortTimestamp: Map<string, number>
