@@ -59,7 +59,7 @@ try {
 	await writeFile(progressFile, progressMarker)
 	const wrapper = join(root, "plugin.ts")
 	const globalFallback = modelScoped ? [] : ["mock-backup/backup"]
-	await writeFile(wrapper, `import plugin from ${JSON.stringify(pathToFileURL(join(import.meta.dir, "dist/index.js")).href)}; export default ctx => plugin(ctx, { fallback_models: ${JSON.stringify(globalFallback)}, timeout_seconds: 10, notify_on_fallback: false });`)
+	await writeFile(wrapper, `import plugin from ${JSON.stringify(pathToFileURL(join(import.meta.dir, "dist/index.js")).href)}; export default { ...plugin, server: ctx => plugin.server(ctx, { fallback_models: ${JSON.stringify(globalFallback)}, timeout_seconds: 10, notify_on_fallback: false }) };`)
 	const provider = (models: string[]) => ({ npm: "@ai-sdk/openai-compatible", name: "Local mock", options: { baseURL: `http://127.0.0.1:${mock.port}/v1`, apiKey: "local-test" }, models: Object.fromEntries(models.map((name) => [name, { name, limit: { context: 32000, output: 4096 }, toolcall: true }])) })
 	// --markdown-json: the per-agent json-backup lives on its own provider, so the
 	// global mock-backup chain and the per-agent chain are independent.

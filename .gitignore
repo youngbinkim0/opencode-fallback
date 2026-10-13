@@ -1,6 +1,8 @@
 node_modules/
 dist/
 *.js
+!index.js
+!tui.js
 *.d.ts
 *.map
 !build.ts

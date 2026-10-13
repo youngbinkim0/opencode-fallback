@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test"
-import OpenCodeFallbackPlugin from "./index"
+import OpenCodeFallbackPlugin from "./v1"
 import type { PluginContext } from "./types"
 import type { ToolContext } from "@opencode-ai/plugin"
 import { FALLBACK_CONTINUATION_PROMPT } from "./continuation-prompt"

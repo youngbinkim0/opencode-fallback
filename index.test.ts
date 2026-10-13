@@ -2,7 +2,7 @@ import { describe, expect, it, mock, beforeEach } from "bun:test"
 import { mkdir, mkdtemp, rm, writeFile } from "fs/promises"
 import { join } from "path"
 import { tmpdir } from "os"
-import OpenCodeFallbackPlugin, { hasConcreteAssistantActivity } from "./index"
+import OpenCodeFallbackPlugin, { hasConcreteAssistantActivity } from "./v1"
 import type { PluginContext } from "./types"
 
 function createMockContext(): PluginContext {

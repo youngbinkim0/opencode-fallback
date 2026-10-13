@@ -1,18 +1,28 @@
 {
   "name": "opencode-runtime-fallback",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "description": "Automatic model fallback plugin for OpenCode. Switches to backup models when API errors occur.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "default": "./dist/index.js" },
+    "./v1": { "types": "./dist/v1.d.ts", "import": "./dist/v1.js", "default": "./dist/v1.js" },
+    "./tui": { "types": "./dist/tui.d.ts", "import": "./dist/tui.js", "default": "./dist/tui.js" },
+    "./rpc": { "types": "./dist/fallback-rpc.d.ts", "import": "./dist/fallback-rpc.js", "default": "./dist/fallback-rpc.js" }
+  },
   "files": [
+    "index.js",
+    "tui.js",
     "dist/"
   ],
   "scripts": {
     "build": "bun run build.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "test:integration": "bun run build && bun run foreground-task.integration.ts"
+    "test:integration": "bun run build && bun run foreground-task.integration.ts",
+    "test:integration:v2": "bun run build && bun run v2.integration.ts && bun run v2.integration.ts --hung-primary && bun run v2.integration.ts --hung-backup && bun run v2.integration.ts --legacy-config && bun run v2.integration.ts --legacy-config --markdown-agent && bun run v2.integration.ts --legacy-config --foreground-task && bun run v2.integration.ts --compaction --notifications && bun run v2.integration.ts --compaction --hung-primary && bun run v2.integration.ts --compaction --hung-backup && bun run v2.integration.ts --compaction --cancel-compaction && bun run v2.integration.ts --compaction --legacy-config && bun run v2.integration.ts --compaction --anthropic-backup && bun run v2.integration.ts --tui && bun run test:integration:v2:background && bun run v2.integration.ts --streaming-tool-input",
+    "test:integration:v2:background": "bun run v2.integration.ts --background-task && bun run v2.integration.ts --background-task --hung-primary && bun run v2.integration.ts --background-task --background-no-error && bun run v2.integration.ts --background-task --background-exhausted && bun run v2.integration.ts --background-task --native-reload && bun run v2.integration.ts --background-task --native-cancel && bun run v2.integration.ts --synthetic-contract"
   },
   "keywords": [
     "opencode",
@@ -23,9 +33,14 @@
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.1.0"
+    "@opencode-ai/plugin": ">=1.1.0",
+    "@opencode/plugin": ">=2.0.27"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": { "optional": true }
   },
   "devDependencies": {
+    "@opencode/plugin": "^2.0.27",
     "@opencode-ai/plugin": "^1.1.19",
     "bun-types": "1.3.6",
     "typescript": "^5.7.3"

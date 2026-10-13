@@ -10,7 +10,8 @@ Automatic model fallback plugin for [OpenCode](https://github.com/sst/opencode).
 - **TTFT timeout** — aborts models that produce no tokens within a configurable window; models that are actively streaming are never interrupted
 - **Cooldown & auto-recovery** — failed models enter cooldown and the plugin automatically switches back to the primary once it recovers
 - **Custom retryable patterns** — extend the built-in error matching with your own regex patterns
-- **Toast notifications** — optional UI feedback when models are switched
+- **Toast notifications** — optional UI feedback when models are switched, with a v2 CLI companion
+- **Compaction fallback** — retries summary generation on backup models without duplicating the original task
 
 ---
 
@@ -24,9 +25,157 @@ Then add the plugin to your `opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-runtime-fallback"]
+  "plugins": ["opencode-runtime-fallback"]
 }
 ```
+
+Version 0.3 supports **OpenCode v2** and **OpenCode v1.18.29+** through
+the same package. On v1, use `"plugin"` instead of `"plugins"`.
+For older v1 hosts, stay on plugin version 0.2.6 or load the legacy
+`dist/v1.js` entry directly. Quit and restart OpenCode after updating.
+
+## OpenCode v2 configuration
+
+V2 uses a domain-based plugin API and a new session/event protocol. The plugin
+uses v2 request hooks, interrupts, model selection, and prompt admission to
+continue the existing conversation on a backup model. Completed tool results
+remain in history; the original task is not sent again.
+
+Configure a global chain and per-agent overrides in **plugin options**:
+
+```json
+{
+  "plugins": [
+    {
+      "package": "opencode-runtime-fallback",
+      "options": {
+        "fallback_models": ["openai/gpt-5.4"],
+        "timeout_seconds": 30,
+        "agents": {
+          "build": {
+            "fallback_models": ["anthropic/claude-sonnet-4-6", "openai/gpt-5.4#high"]
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+The same options, including `agents`, can go in `opencode-fallback.jsonc` at
+the paths below. Inline plugin options override file settings. Non-empty
+per-agent chains take precedence over the global chain. V2 model references
+support `provider/model#variant`.
+
+Existing v1 `agent.<name>.fallback_models` settings in `opencode.json` or
+`opencode.jsonc` also work on v2, as does `fallback_models` in Markdown agent
+frontmatter. OpenCode resolves global/project/environment configuration and
+the plugin reads the resolved agent's request body before each model request.
+There is no need to move your chains into a separate file. Explicit plugin
+agent options (including standalone plugin-file settings) override legacy
+agent settings; an empty per-agent chain uses the global chain. Non-empty per-agent chains take
+precedence over the global chain. As on v1, an opted-in agent's configured
+primary model is included as a recovery candidate after a manual model switch.
+
+For a local checkout on v2, configure the package directory, not a built file:
+
+```jsonc
+"plugins": ["/absolute/path/to/opencode-fallback"]
+```
+
+V2 supports `opencode reload` and watches local plugin directories. Check the
+`V2 fallback plugin initialized` log after a change: `runtime` and
+`backgroundRuntime` record the imported implementation revisions and module IDs,
+`runtime.buildID` identifies a compiled build (or `source`), and `generationID`
+identifies each setup. A new setup alone does not prove dependencies were
+re-imported. Cold restart (`opencode service restart`) clears module caches but
+also loses this plugin's in-memory background delivery jobs; restart when idle.
+
+### V2 behavior
+
+- Retryable provider failures select the next available model after the failed
+  execution settles. Before recovery takes ownership, an unavailable fallback
+  preserves the host's retry policy. Once an owned chain or attempt budget is
+  exhausted, retryable errors end with a final failure instead of another native
+  retry loop on the last model.
+- TTFT starts before model dispatch, including streams that never produce their
+  first frame. Text, reasoning, or tool activity cancels the timer. Each later
+  model request gets a fresh window.
+- Cooldowns and maximum fallback attempts apply; later user turns can recover
+  to the original model. Manual model selections are respected.
+- Subagent sessions use the same session-level fallback machinery. With
+  `foreground_task_fallback` enabled (the default), the native foreground
+  `subagent` call stays pending through an owned fallback and returns the
+  recovered child's answer to its parent. Child creation, agent selection and
+  permissions remain owned by OpenCode; background outcome delivery uses the
+  adapter described below.
+- Background subagents (`background: true`) return OpenCode's native running
+  result immediately, so the parent turn finishes and accepts new prompts while
+  the child is pending. An owned fallback runs in the background child; the
+  outcome is delivered once, as a native-shaped `<subagent>` notification with a
+  per-call `msg_` id, after the child settles. Limitations: native explicit
+  promotion and blocking job promotion remain native-owned, and the plugin cannot
+  suppress native failure state. When the chain is exhausted, the child delivers
+  one error outcome (`--background-exhausted`). A user interruption of the child
+  delivers one cancelled outcome (`--native-cancel`). Pending delivery can rebind
+  across an in-process reload; it waits for an active plugin binding and has no
+  durable ledger across cold restarts. When a reloaded generation does not own
+  the child, an unchanged idle failure/interruption is observed for 30 seconds
+  before being reported, to allow an admitted continuation to start.
+- Compaction uses a dedicated summary hook. Attempts run in temporary native
+  child sessions with the saved structured history, system instructions, and
+  request options for the original model; fallback models use their native
+  compaction-agent options and output limits. Tools are disabled. Hung attempts are interrupted before
+  advancing the chain, and children are removed afterwards. The parent model
+  and agent stay selected, and no continuation prompt is appended for compaction.
+  `compaction`-specific chains take precedence over the parent agent's chain.
+- Without an available compaction fallback, native retries and slow streaming
+  requests are preserved. Title and transient generation retain native retries.
+- `notify_on_fallback` publishes typed server events to the automatically loaded
+  `./tui` companion, which displays CLI toasts. Notifications are never added to
+  the model conversation. Desktop notifications and sounds are opt-in below.
+- Unloading cancels event subscriptions and timers and disposes registrations.
+  Stream loss or unload abandons plugin-owned compaction attempts and leaves
+  native summary generation available; a user interrupt cancels the compaction.
+
+Validated against **OpenCode v2.0.27 and v2.0.28** using local mock providers for a 429
+after a completed tool call, primary and backup streams with no first token,
+legacy `opencode.jsonc` and Markdown agent chains, parent-visible foreground subagent
+results, compaction timeout cascades and cancellation, cross-protocol compaction
+fallback with model-specific output limits, compaction-specific legacy
+chains, RPC delivery, and toast rendering in the real CLI. The following legacy
+agent examples work on both hosts.
+
+The remaining v2 accounting limitation is compaction cost attribution: its
+summary-result API accepts token usage but cannot report a different model or
+cost. Successful-attempt tokens are returned, and metadata records the actual
+model. Removed temporary children do not retain attempt costs in session usage;
+returned tokens may be priced against the original compaction model by the host.
+Provider-specific
+state is retained only when the original model produced the summary.
+
+### V2 notification options
+
+The CLI companion defaults to toasts. These options belong in the plugin's
+inline `options` (standalone server config files do not configure CLI options):
+
+```json
+{
+  "plugins": [{
+    "package": "opencode-runtime-fallback",
+    "options": {
+      "notify_on_fallback": true,
+      "notify_toast": true,
+      "notify_desktop": false,
+      "notify_sound": false
+    }
+  }]
+}
+```
+
+Desktop and sound alerts are requested while the terminal is blurred and respect
+OpenCode's attention settings. Terminals must report focus changes. Setting
+`notify_on_fallback: false` on the server suppresses all fallback events.
 
 ---
 
@@ -245,13 +394,14 @@ conversation history, and completed tool results without another copy of the
 full task prompt. Existing history still contributes to the model's input
 context; this avoids prompt duplication rather than removing that history.
 
-**Compaction-aware fallback** — when `/compact` fails, the plugin detects
+**Compaction-aware fallback on v1** — when `/compact` fails, the plugin detects
 `agent: "compaction"` and retries via `session.summarize`, since compaction
 messages cannot be replayed with `promptAsync`. Fallback models are resolved
 per-agent or from the global chain. Successful `session.compacted` events
 clear fallback tracking state.
 
-For compaction model switching, leave `agent.compaction.model` unset:
+Configure a compaction-specific chain on either host. On v1, leave
+`agent.compaction.model` unset for model switching:
 
 ```json
 {
@@ -263,12 +413,13 @@ For compaction model switching, leave `agent.compaction.model` unset:
 }
 ```
 
-OpenCode prefers a pinned `agent.compaction.model` over the model sent to
+OpenCode v1 prefers a pinned `agent.compaction.model` over the model sent to
 `session.summarize`. When that pin prevents the requested fallback, the
 plugin logs an actionable error, shows a toast if notifications are enabled,
 and skips re-dispatch rather than repeatedly running the failed model.
 It does not change your agent's pinned model. Remove the pin and restart
-OpenCode to enable compaction model switching.
+OpenCode v1 to enable compaction model switching. V2 uses summary injection
+and supports a pinned initial compaction model without changing the pin.
 
 ---
 
@@ -297,7 +448,12 @@ bun test           # run tests
 bun run build      # compile to dist/
 bun run typecheck  # type check without emitting
 bun run test:integration # local mock providers against installed OpenCode
+bun run test:integration:v2 # requires a v2 binary; includes compaction, notifications, and real CLI checks
 ```
+
+If your default binary is v1, set `OPENCODE_V2_BIN` to a v2 binary path for
+`test:integration:v2`. Each host harness uses an isolated temporary configuration
+and local providers. Unit tests exercise both implementations.
 
 Additional host regressions: `bun run foreground-task.integration.ts --model-scoped`,
 `--markdown-global`, `--markdown-json`, and `--main-session`. These cases
