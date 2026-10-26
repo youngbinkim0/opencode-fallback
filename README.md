@@ -98,6 +98,9 @@ also loses this plugin's in-memory background delivery jobs; restart when idle.
   preserves the host's retry policy. Once an owned chain or attempt budget is
   exhausted, retryable errors end with a final failure instead of another native
   retry loop on the last model.
+- Fallback entries are checked against OpenCode's enabled model inventory before
+  they can take over. Unknown or disabled entries are skipped; if none remain,
+  the host's native retry policy is left intact.
 - TTFT starts before model dispatch, including streams that never produce their
   first frame. Text, reasoning, or tool activity cancels the timer. Each later
   model request gets a fresh window.

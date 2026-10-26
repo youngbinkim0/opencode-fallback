@@ -19,6 +19,7 @@ type Overrides = {
 	remove: (args: { sessionID: string }) => unknown
 	switchModel: (args: { sessionID: string; model: ModelRef }) => unknown
 	prompt: (args: PromptArgs) => unknown
+	modelList: () => unknown
 }
 interface EventQueue extends AsyncIterable<OpenCodeEvent> {
 	push(event: OpenCodeEvent): void
@@ -96,12 +97,32 @@ interface Fixture {
 	readonly signal: AbortSignal
 	readonly subscriptions: number
 	override<K extends keyof Overrides>(name: K, fn: Overrides[K] | undefined): void
+	readonly modelLists: number
 	emit(type: string, data: Record<string, unknown>, created?: number, location?: { directory: string; workspaceID?: string }): void
 	closeEvents(error?: Error): void
 	dispose(): Promise<void>
 }
 
-async function fixture(options: Record<string, unknown> = {}, agents: ReturnType<AgentEditor["list"]> = []): Promise<Fixture> {
+const KNOWN_MODELS = [
+	"provider/primary", "backup/b", "backup/c", "backup/model", "backup/global", "backup/special",
+	"backup/explicit", "backup/reloaded", "backup/compaction", "backup/parent",
+]
+
+function modelInfo(ref: string, enabled = true) {
+	const [providerID, ...rest] = ref.split("/")
+	const modelID = rest.join("/")
+	return {
+		id: modelID, modelID, providerID, name: modelID, enabled, status: "active",
+		variants: ["balanced", "careful", "fast"].map((id) => ({ id })),
+		capabilities: {}, cost: [], limit: { context: 0, output: 0 }, time: { released: 0 },
+	}
+}
+
+async function fixture(
+	options: Record<string, unknown> = {},
+	agents: ReturnType<AgentEditor["list"]> = [],
+	modelList: () => unknown = () => ({ data: KNOWN_MODELS.map((ref) => modelInfo(ref)) }),
+): Promise<Fixture> {
 	const directory = await mkdtemp(join(tmpdir(), "opencode-v2-test-"))
 	files.push(directory)
 	const callbacks = new Map<string, (input: any) => unknown>()
@@ -119,7 +140,8 @@ async function fixture(options: Record<string, unknown> = {}, agents: ReturnType
 	const removedChildren: string[] = []
 	const emittedNotifications: Fixture["emittedNotifications"] = []
 	let rpcDisposals = 0
-	const overrides: Partial<Overrides> = {}
+	let modelLists = 0
+	const overrides: Partial<Overrides> = { modelList }
 	let queue: EventQueue | undefined
 	let eventSignal!: AbortSignal
 	let subscriptions = 0
@@ -206,6 +228,12 @@ async function fixture(options: Record<string, unknown> = {}, agents: ReturnType
 			callback({ list: () => [nativeSubagent], update: (_id: string, update: (tool: any) => void) => update(nativeSubagent) })
 			return { dispose: async () => {} }
 		} },
+		model: {
+			list: async () => {
+				modelLists++
+				return overrides.modelList!()
+			},
+		},
 		agent: {
 			get: async ({ agentID }: { agentID: string }) => {
 				agentLookups.push(agentID)
@@ -235,6 +263,7 @@ async function fixture(options: Record<string, unknown> = {}, agents: ReturnType
 		compactionChildren, removedChildren, emittedNotifications, get rpcDisposals() { return rpcDisposals }, directory, agents,
 		get signal() { return eventSignal },
 		get subscriptions() { return subscriptions },
+		get modelLists() { return modelLists },
 		override(name, fn) { overrides[name] = fn as any },
 		emit(type, data, created = Date.now(), location) { queue?.push({ type, data, created, ...(location ? { location } : {}) } as unknown as OpenCodeEvent) },
 		closeEvents(error) { queue?.close(error) },
@@ -493,7 +522,7 @@ describe("setupV2", () => {
 		await invokeContext(f)
 		await f.dispose()
 		expect(f.signal.aborted).toBe(true)
-		expect(f.disposedHooks.sort()).toEqual(["compaction", "context", "context", "model.request", "prompt", "retry", "retry"])
+		expect(f.disposedHooks.sort()).toEqual(["compaction", "context", "context", "http.request", "model.request", "prompt", "retry", "retry"])
 		await settle(100)
 		expect(f.interrupts).toEqual([])
 		expect(f.switches).toEqual([])
@@ -1192,5 +1221,121 @@ describe("setupV2 prompt hook failures", () => {
 		f.override("switchModel", () => { throw new Error("switch unavailable") })
 		await expect(f.callbacks.get("prompt")!(userPrompt(sessionID))).resolves.toBeUndefined()
 		expect(f.switches.map((s) => s.model.id)).toEqual(["b", "primary"])
+	})
+})
+
+describe("setupV2 model inventory validation", () => {
+	test("stale configured IDs absent from the host inventory are never switched to", async () => {
+		const f = await fixture({ fallback_models: ["backup/gone", "backup/b"], timeout_seconds: 0 })
+		await invokeContext(f)
+		const retry = retryEvent()
+		f.callbacks.get("retry")!(retry)
+		expect(retry.decision).toEqual({ retry: false })
+		failure(f)
+		await until(() => f.prompts.length === 1, "fallback to verified backup")
+		expect(f.switches).toEqual([{ sessionID, model: backupB }])
+	})
+
+	test("next-valid candidate skips a stale ID later in the chain", async () => {
+		const f = await fixture({ fallback_models: ["backup/b", "backup/gone", "backup/c"], timeout_seconds: 0 })
+		await invokeContext(f)
+		failure(f)
+		await until(() => f.prompts.length === 1, "fallback to b")
+		await invokeContext(f, sessionID, "build", backupB)
+		failure(f, sessionID, "backup-assistant")
+		await until(() => f.prompts.length === 2, "fallback to c")
+		expect(f.switches.map((value) => value.model.id)).toEqual(["b", "c"])
+	})
+
+	test("no verified candidate keeps native retry and never arms TTFT", async () => {
+		const f = await fixture({ fallback_models: ["backup/gone"], timeout_seconds: 0.03 })
+		await invokeContext(f)
+		const retry = retryEvent()
+		const decision = retry.decision
+		f.callbacks.get("retry")!(retry)
+		expect(retry.decision).toBe(decision)
+		await settle(80)
+		expect(f.interrupts).toEqual([])
+		expect(f.switches).toEqual([])
+		expect(f.prompts).toEqual([])
+	})
+
+	test("an unavailable inventory at setup preserves native retry without rejecting setup", async () => {
+		const f = await fixture({ fallback_models: ["backup/b"], timeout_seconds: 0 }, [], () => { throw new Error("model list unavailable") })
+		await invokeContext(f)
+		const retry = retryEvent()
+		const decision = retry.decision
+		f.callbacks.get("retry")!(retry)
+		expect(retry.decision).toBe(decision)
+		failure(f)
+		await settle(40)
+		expect(f.switches).toEqual([])
+		expect(f.prompts).toEqual([])
+	})
+
+	test("a model.updated refresh restores fallback once the inventory is trustworthy again", async () => {
+		let listable = false
+		const f = await fixture({ fallback_models: ["backup/b"], timeout_seconds: 0 }, [], () => {
+			if (!listable) throw new Error("model list unavailable")
+			return { data: KNOWN_MODELS.map((ref) => modelInfo(ref)) }
+		})
+		await invokeContext(f)
+		listable = true
+		f.emit("model.updated", {})
+		await until(() => f.modelLists >= 2, "inventory refresh after model.updated")
+		await settle(10)
+		await invokeContext(f)
+		const retry = retryEvent()
+		f.callbacks.get("retry")!(retry)
+		expect(retry.decision).toEqual({ retry: false })
+		failure(f)
+		await until(() => f.prompts.length === 1, "fallback after inventory recovery")
+		expect(f.switches).toEqual([{ sessionID, model: backupB }])
+	})
+
+	test("a candidate removed before dispatch is replaced by the next verified candidate", async () => {
+		let hideB = false
+		const f = await fixture({ fallback_models: ["backup/b", "backup/c"], timeout_seconds: 0 }, [], () => ({
+			data: KNOWN_MODELS.filter((ref) => !(hideB && ref === "backup/b")).map((ref) => modelInfo(ref)),
+		}))
+		await invokeContext(f)
+		const retry = retryEvent()
+		f.callbacks.get("retry")!(retry)
+		expect(retry.decision).toEqual({ retry: false })
+		hideB = true
+		failure(f)
+		await until(() => f.prompts.length === 1, "fallback to the next verified candidate")
+		expect(f.switches.map((value) => value.model.id)).toEqual(["c"])
+	})
+
+	test("a candidate removed before dispatch with no remaining verified candidate is never switched to", async () => {
+		let hideB = false
+		const f = await fixture({ fallback_models: ["backup/b"], timeout_seconds: 0 }, [], () => ({
+			data: KNOWN_MODELS.filter((ref) => !(hideB && ref === "backup/b")).map((ref) => modelInfo(ref)),
+		}))
+		await invokeContext(f)
+		hideB = true
+		failure(f)
+		await settle(40)
+		expect(f.switches).toEqual([])
+		expect(f.prompts).toEqual([])
+	})
+
+	test("a variant the host does not list is skipped", async () => {
+		const f = await fixture({ fallback_models: ["backup/special#missing", "backup/b"], timeout_seconds: 0 })
+		await invokeContext(f)
+		failure(f)
+		await until(() => f.prompts.length === 1, "fallback past unknown variant")
+		expect(f.switches).toEqual([{ sessionID, model: backupB }])
+	})
+
+	test("a disabled inventory entry is skipped", async () => {
+		const f = await fixture({ fallback_models: ["backup/b", "backup/c"], timeout_seconds: 0 }, [], () => ({
+			data: KNOWN_MODELS.map((ref) => modelInfo(ref, ref !== "backup/b")),
+		}))
+		await invokeContext(f)
+		failure(f)
+		await until(() => f.prompts.length === 1, "fallback past disabled model")
+		expect(f.switches.map((value) => value.model.id)).toEqual(["c"])
 	})
 })

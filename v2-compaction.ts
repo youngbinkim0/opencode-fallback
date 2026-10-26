@@ -68,6 +68,7 @@ const DENY_ALL = [{ action: "*", resource: "*", effect: "deny" as const }]
 type ModelRef = SessionHooks["compaction"]["model"]
 type CompactionEvent = SessionHooks["compaction"]
 type ContextEvent = SessionHooks["context"]
+type HttpRequestEvent = SessionHooks["http.request"]
 type RetryEvent = SessionHooks["retry"]
 type CompactionResult = NonNullable<CompactionEvent["result"]>
 
@@ -467,10 +468,31 @@ export async function installV2CompactionFallback(
 		// summary instruction is always appended, whatever the last role, as the host would append it.
 		messages.push({ role: "user", content: [{ type: "text", text: SUMMARY_INSTRUCTION }] })
 		event.messages = messages
-		event.tools = {}
+		// Omit the key rather than sending an empty map: the host must not expose any tools to the child.
+		delete (event as Partial<ContextEvent>).tools
 		// Fallback children keep the host-computed options, which belong to their own model.
 		if (record.original) event.options = copy.options as typeof event.options
 		record.contextApplied = true
+	}
+
+	const httpRequest = async (event: HttpRequestEvent) => {
+		if (!children.has(event.sessionID)) return
+		const request = event.request
+		if (!request.headers.get("content-type")?.toLowerCase().includes("json")) return
+		let body: unknown
+		try {
+			body = await request.clone().json()
+		} catch {
+			return
+		}
+		if (!body || typeof body !== "object" || Array.isArray(body)) return
+		const payload = body as Record<string, unknown>
+		if (!Array.isArray(payload.tools) || payload.tools.length !== 0) return
+		const sanitized = { ...payload }
+		delete sanitized.tools
+		const headers = new Headers(request.headers)
+		headers.delete("content-length")
+		event.request = new Request(request, { headers, body: JSON.stringify(sanitized) })
 	}
 
 	const retry = (event: RetryEvent) => {
@@ -519,6 +541,7 @@ export async function installV2CompactionFallback(
 	const registerHooks = async () => {
 		// Registered before the main v2 context hook: children must be scoped before v2 tracks them.
 		registrations.push(await ctx.session.hook("context", context))
+		registrations.push(await ctx.session.hook("http.request", httpRequest))
 		registrations.push(await ctx.session.hook("retry", retry))
 		registrations.push(await ctx.session.hook("compaction", compaction))
 	}

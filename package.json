@@ -1,7 +1,15 @@
 {
   "name": "opencode-runtime-fallback",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Automatic model fallback plugin for OpenCode. Switches to backup models when API errors occur.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/youngbinkim0/opencode-fallback.git"
+  },
+  "bugs": {
+    "url": "https://github.com/youngbinkim0/opencode-fallback/issues"
+  },
+  "homepage": "https://github.com/youngbinkim0/opencode-fallback#readme",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

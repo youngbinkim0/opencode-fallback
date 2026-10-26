@@ -197,6 +197,7 @@ function fixture(options: {
 		install,
 		get compaction() { return hooks.get("compaction") as (event: SessionHooks["compaction"]) => Promise<void> },
 		get context() { return hooks.get("context") as (event: any) => Promise<void> },
+		get httpRequest() { return hooks.get("http.request") as (event: SessionHooks["http.request"]) => Promise<void> },
 		get retry() { return hooks.get("retry") as (event: any) => void },
 	}
 }
@@ -315,12 +316,31 @@ describe("v2 compaction fallback", () => {
 		expect(f.requests[0].messages).toEqual([...originalMessages, compactionInstruction])
 		expect(f.requests[0].system).toEqual([{ type: "text", text: "system" }])
 		expect(f.requests[0].options).toEqual({ temperature: 0.2 })
-		expect(f.requests[0].tools).toEqual({})
+		expect(Object.hasOwn(f.requests[0], "tools")).toBe(false)
+		const emptyTools = {
+			sessionID: "child-1", agent: "compaction", model: event.model, kind: "compaction",
+			request: new Request("https://provider.test/v1/chat/completions", {
+				method: "POST", headers: { "content-type": "application/json" },
+				body: JSON.stringify({ messages: [], tools: [] }),
+			}),
+		} as SessionHooks["http.request"]
+		await f.httpRequest(emptyTools)
+		expect(await emptyTools.request.json()).toEqual({ messages: [] })
+		const parentRequest = {
+			sessionID: "parent", agent: "build", model: event.model, kind: "primary",
+			request: new Request("https://provider.test/v1/chat/completions", {
+				method: "POST", headers: { "content-type": "application/json" },
+				body: JSON.stringify({ messages: [], tools: [] }),
+			}),
+		} as SessionHooks["http.request"]
+		await f.httpRequest(parentRequest)
+		expect(await parentRequest.request.json()).toEqual({ messages: [], tools: [] })
 		// Mutations to what the child received must not leak into later requests.
 		f.requests[0].messages[0].text = "mutated"
 		const again = { sessionID: "child-1", agent: "build", model: event.model, system: [], messages: [] as unknown[], options: {}, tools: {} }
 		await f.context(again)
 		expect(again.messages).toEqual([...originalMessages, compactionInstruction])
+		expect(Object.hasOwn(again, "tools")).toBe(false)
 		const parent = { sessionID: "parent", agent: "build", model: event.model, system: [], messages: [] as unknown[], options: {}, tools: { bash: {} } }
 		await f.context(parent)
 		expect(parent.tools).toEqual({ bash: {} })

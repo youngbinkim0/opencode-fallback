@@ -224,6 +224,9 @@ const mock = Bun.serve({
 			assert.equal(model, "backup", `Only the backup uses the Anthropic route: ${model}`)
 			return anthropicStream(compacting ? "BACKUP_SUMMARY" : "BACKUP_RESULT")
 		}
+		if (Object.hasOwn(body, "tools") && Array.isArray(body.tools) && body.tools.length === 0) {
+			return Response.json({ error: { type: "invalid_request_error", param: "tools", message: "tools must not be an empty array" } }, { status: 400 })
+		}
 		if (model === "parent" && backgroundTask) return parentBackgroundTurn(body)
 		if (model === "parent") {
 			if (parentAttempts++ === 0) return stream(model, {
@@ -730,7 +733,7 @@ try {
 				assert.ok(!("reasoning_effort" in body) && !("stream_options" in body), "OpenAI-only options leaked into the Anthropic request")
 				assert.ok(body.thinking === undefined || (body.thinking.type === "enabled" && body.thinking.budget_tokens < body.max_tokens), `Invalid thinking for Anthropic budget: ${JSON.stringify(body.thinking)}`)
 			}
-			assert.ok(!final.body.tools?.length, "Compaction child must not expose tools")
+			assert.ok(!Object.hasOwn(final.body, "tools"), "Compaction child must omit tools instead of sending an empty array")
 			assert.equal(JSON.stringify(final.body.messages).split(taskPrompt).length - 1, 1, "Summary request must contain the original task once")
 			assert.ok(!JSON.stringify(requests).includes(FALLBACK_CONTINUATION_PROMPT), "Compaction fallback must not send a continuation prompt")
 			const transcript = await messagesOf()

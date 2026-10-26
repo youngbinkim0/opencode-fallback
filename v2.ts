@@ -36,6 +36,7 @@ type SessionState = {
 	requestStartedAt?: number
 	timer?: ReturnType<typeof setTimeout>
 	pending?: FallbackPlan
+	pendingBlockedProvider?: string
 	pendingReady?: boolean
 	pendingInterrupt?: boolean
 	dispatch?: Promise<void>
@@ -96,7 +97,45 @@ export async function setupV2(ctx: Plugin.Context) {
 	let disposed = false
 	let streamHealthy = true
 	let compaction: V2CompactionFallback | undefined
+	// "provider/model" → variant IDs for enabled models. undefined means the
+	// inventory is untrusted, so no candidate is verified and native retry is kept.
+	let inventory: Map<string, Set<string>> | undefined
+	let inventoryUpdatedAt = 0
+	let inventoryRequest: Promise<void> | undefined
+	const refreshInventory = async (force = false) => {
+		const ttl = inventory ? 30_000 : 5_000
+		if (!force && inventoryUpdatedAt > 0 && Date.now() - inventoryUpdatedAt < ttl) return
+		if (inventoryRequest) return inventoryRequest
+		const request = (async () => {
+			try {
+				const lookupSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(5000)])
+				const { data } = await withSignal(ctx.model.list({ location: { directory: ctx.location.directory } }), lookupSignal)
+				inventory = new Map(data.filter((model) => model.enabled).map((model) => [
+					`${model.providerID}/${model.modelID}`,
+					new Set(model.variants.map((variant) => variant.id)),
+				]))
+			} catch (error) {
+				inventory = undefined
+				logError("V2 model inventory unavailable", { error: String(error) })
+			} finally {
+				inventoryUpdatedAt = Date.now()
+			}
+		})()
+		inventoryRequest = request
+		try {
+			await request
+		} finally {
+			if (inventoryRequest === request) inventoryRequest = undefined
+		}
+	}
+	const available = (name: string) => {
+		if (!inventory) return false
+		const { providerID, id, variant } = parseModelRef(name)
+		const variants = inventory.get(`${providerID}/${id}`)
+		return variants !== undefined && (!variant || variant === "default" || variants.has(variant))
+	}
 	const resolveAgentFallback = async (agentID: string) => {
+		await refreshInventory()
 		try {
 			const lookupSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(5000)])
 			const { data: agent } = await withSignal(ctx.agent.get({ agentID, location: { directory: ctx.location.directory } }), lookupSignal)
@@ -117,7 +156,7 @@ export async function setupV2(ctx: Plugin.Context) {
 	}
 	const notifications = await registerFallbackNotifications(ctx, config)
 	registrations.push(notifications)
-	const chain = (agent: string) => {
+	const configuredChain = (agent: string) => {
 		const merged = mergeAgentConfigs(resolvedAgents, agents)
 		const models = normalizeModels(readFallbackModels(agent, merged))
 		if (!models.length) return globalModels
@@ -127,9 +166,15 @@ export async function setupV2(ctx: Plugin.Context) {
 		if (primary && !models.includes(primary)) models.unshift(primary)
 		return models
 	}
+	// Only host-listed candidates may suppress native retry or be switched to.
+	const chain = (agent: string) => configuredChain(agent).filter(available)
 	const clearTimer = (state: SessionState) => {
 		clearTimeout(state.timer)
 		state.timer = undefined
+	}
+	const clearPending = (state: SessionState) => {
+		state.pending = undefined
+		state.pendingBlockedProvider = undefined
 	}
 	const track = (sessionID: string, agent: string, model: ModelRef) => {
 		const name = modelName(model)
@@ -148,10 +193,11 @@ export async function setupV2(ctx: Plugin.Context) {
 		if (state.requestKind !== "primary") return
 		if (!timeout && !isRetryableError(error, config.retry_on_errors, config.retryable_error_patterns)) return
 		if (state.pending) return state.pending
-		const result = planFallback(sessionID, state.fallback, chain(state.agent), config,
-			isProviderWideRateLimitError(error) ? state.fallback.currentModel.split("/")[0] : undefined)
+		const blockedProvider = isProviderWideRateLimitError(error) ? state.fallback.currentModel.split("/")[0] : undefined
+		const result = planFallback(sessionID, state.fallback, chain(state.agent), config, blockedProvider)
 		if (!result.success) return
 		state.pending = result
+		state.pendingBlockedProvider = blockedProvider
 		clearTimer(state)
 		return result
 	}
@@ -160,7 +206,7 @@ export async function setupV2(ctx: Plugin.Context) {
 		state.pendingReady = true
 		state.pendingInterrupt ||= interrupt
 		if (state.dispatch) return
-		const pending = state.pending
+		let pending = state.pending
 		state.recoveryFailed = false
 		const shouldInterrupt = state.pendingInterrupt
 		state.pendingReady = false
@@ -180,13 +226,29 @@ export async function setupV2(ctx: Plugin.Context) {
 			}
 			await ctx.session.wait({ sessionID }, { signal: controller.signal })
 			if (disposed || state.cancelled || state.pending !== pending) return
+			// Recheck immediately before persisting: the host model inventory may have
+			// changed since the synchronous retry hook admitted this candidate.
+			await refreshInventory(true)
+			if (disposed || state.cancelled || state.pending !== pending) return
+			if (!available(pending.newModel)) {
+				const refreshed = planFallback(sessionID, state.fallback, chain(state.agent), config, state.pendingBlockedProvider)
+				if (!refreshed.success) {
+					clearPending(state)
+					state.active = false
+					state.awaitingExecution = false
+					state.recoveryFailed = true
+					return
+				}
+				pending = refreshed
+				state.pending = refreshed
+			}
 			await ctx.session.switchModel({ sessionID, model: parseModelRef(pending.newModel) }, { signal: controller.signal })
 			if (disposed || state.cancelled || state.pending !== pending) return
 			// Commit before prompt admission: new step events can arrive before
 			// the admission promise returns, and must see the selected model.
 			commitFallback(state.fallback, pending)
 			state.ownedExecution = true
-			state.pending = undefined
+			clearPending(state)
 			state.messageID = undefined
 			state.active = false
 			state.requestToken = undefined
@@ -205,7 +267,7 @@ export async function setupV2(ctx: Plugin.Context) {
 		})().catch((error) => {
 			if (!disposed) logError("V2 fallback dispatch failed", { sessionID, error: String(error) })
 			if (!state.pending || state.pending === pending) {
-				state.pending = undefined
+				clearPending(state)
 				state.active = false
 				state.awaitingExecution = false
 				state.recoveryFailed = true
@@ -256,7 +318,7 @@ export async function setupV2(ctx: Plugin.Context) {
 		if (!state || state.active || state.dispatch) return
 		try {
 			clearTimer(state)
-			state.pending = undefined
+			clearPending(state)
 			state.cancelled = false
 			state.parentCancelled = false
 			state.lastAccess = Date.now()
@@ -280,6 +342,10 @@ export async function setupV2(ctx: Plugin.Context) {
 	const handleEvent = (event: OpenCodeEvent) => {
 		if (event.location && (event.location.directory !== ctx.location.directory ||
 			("workspaceID" in event.location && event.location.workspaceID !== ctx.location.workspaceID))) return
+		if (event.type === "model.updated" || event.type === "provider.updated") {
+			void refreshInventory(true)
+			return
+		}
 		compaction?.handleEvent(event)
 		const data = event.data
 		if (!("sessionID" in data)) return
@@ -319,7 +385,7 @@ export async function setupV2(ctx: Plugin.Context) {
 			if (plan(sessionID, state, event.data.error)) dispatch(sessionID, state)
 			else {
 				state.ownedExecution = false
-				if (!state.dispatch) state.pending = undefined
+				if (!state.dispatch) clearPending(state)
 			}
 		} else if (event.type === "session.execution.interrupted" || event.type === "session.deleted") {
 			if (event.type === "session.execution.interrupted" && state.expectedInterrupts > 0) {
@@ -331,7 +397,7 @@ export async function setupV2(ctx: Plugin.Context) {
 			state.cancelled = true
 			state.ownedExecution = false
 			state.awaitingExecution = false
-			state.pending = undefined
+			clearPending(state)
 			state.pendingReady = false
 			if (event.type === "session.deleted") states.delete(sessionID)
 		} else if (event.type === "session.idle" || event.type === "session.execution.succeeded") {
@@ -340,7 +406,7 @@ export async function setupV2(ctx: Plugin.Context) {
 			clearTimer(state)
 			state.active = false
 			state.requestToken = undefined
-			state.pending = undefined
+			clearPending(state)
 			state.pendingReady = false
 			state.expectedInterrupts = 0
 			state.ownedExecution = false
@@ -349,7 +415,7 @@ export async function setupV2(ctx: Plugin.Context) {
 			// never continue a failed compaction as an ordinary prompt.
 			clearTimer(state)
 			state.requestKind = "compaction"
-			state.pending = undefined
+			clearPending(state)
 		}
 	}
 	try {
@@ -382,7 +448,7 @@ export async function setupV2(ctx: Plugin.Context) {
 					clearTimer(state)
 					state.cancelled = true
 					state.parentCancelled = true
-					state.pending = undefined
+					clearPending(state)
 					state.pendingReady = false
 					state.active = false
 					state.awaitingExecution = false
@@ -472,7 +538,7 @@ export async function setupV2(ctx: Plugin.Context) {
 				clearTimer(state)
 				state.active = false
 				state.awaitingExecution = false
-				if (!state.dispatch) state.pending = undefined
+				if (!state.dispatch) clearPending(state)
 			}
 			try { await sleep(1000, undefined, { signal: controller.signal }) } catch { break }
 		}
