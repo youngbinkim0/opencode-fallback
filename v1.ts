@@ -98,6 +98,10 @@ export default async function OpenCodeFallbackPlugin(
 				configOverrides?.foreground_task_fallback ??
 				fileConfig?.foreground_task_fallback ??
 				DEFAULT_CONFIG.foreground_task_fallback,
+			compaction_fallback:
+				configOverrides?.compaction_fallback ??
+				fileConfig?.compaction_fallback ??
+				DEFAULT_CONFIG.compaction_fallback,
 		}
 
 		return mergedConfig

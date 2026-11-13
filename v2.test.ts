@@ -359,6 +359,59 @@ describe("setupV2", () => {
 		expect(f.waits).toEqual([])
 	})
 
+	test("disabled compaction fallback leaves compaction failures on the running model", async () => {
+		const f = await fixture({ fallback_models: ["backup/model"], compaction_fallback: false, timeout_seconds: 0.03 })
+		expect(f.registered).not.toContain("compaction")
+		expect(f.registered).not.toContain("http.request")
+		await invokeContext(f)
+		modelRequest(f, "compaction", sessionID, "build", backupB)
+		const retry = retryEvent()
+		const decision = retry.decision
+		f.callbacks.get("retry")!(retry)
+		failure(f)
+		f.emit("session.compaction.failed", { sessionID, error: retryableError })
+		await settle(100)
+		expect(retry.decision).toBe(decision)
+		expect(f.compactionChildren).toEqual([])
+		expect(f.switches).toEqual([])
+		expect(f.prompts).toEqual([])
+		expect(f.interrupts).toEqual([])
+	})
+
+	test("compaction fallback is disabled by default", async () => {
+		const f = await fixture({ fallback_models: ["backup/model"] })
+		expect(f.registered).not.toContain("compaction")
+		expect(f.registered).not.toContain("http.request")
+	})
+
+	test("disabled compaction fallback retains ordinary primary recovery", async () => {
+		const f = await fixture({ fallback_models: ["backup/model"], compaction_fallback: false, timeout_seconds: 0 })
+		await invokeContext(f)
+		modelRequest(f, "primary")
+		stepStarted(f)
+		const retry = retryEvent()
+		f.callbacks.get("retry")!(retry)
+		expect(retry.decision).toEqual({ retry: false })
+		failure(f)
+		await until(() => f.prompts.length === 1, "ordinary fallback continuation")
+		expect(f.switches).toEqual([{ sessionID, model: { providerID: "backup", id: "model" } }])
+	})
+
+	test("a compaction request cancels a queued ordinary fallback before model switch", async () => {
+		const f = await fixture({ fallback_models: ["backup/model"], compaction_fallback: false, timeout_seconds: 0 })
+		const release = gate()
+		f.override("wait", () => release.promise)
+		await invokeContext(f)
+		stepStarted(f)
+		failure(f)
+		await until(() => f.waits.length === 1, "queued fallback wait")
+		modelRequest(f, "compaction")
+		release.open()
+		await settle()
+		expect(f.switches).toEqual([])
+		expect(f.prompts).toEqual([])
+	})
+
 	test("turns off provider retry and dispatches once through step.failed then execution.failed", async () => {
 		const f = await fixture({ fallback_models: ["backup/model"], timeout_seconds: 0 })
 		await invokeContext(f)
@@ -522,7 +575,7 @@ describe("setupV2", () => {
 		await invokeContext(f)
 		await f.dispose()
 		expect(f.signal.aborted).toBe(true)
-		expect(f.disposedHooks.sort()).toEqual(["compaction", "context", "context", "http.request", "model.request", "prompt", "retry", "retry"])
+		expect(f.disposedHooks.sort()).toEqual(["context", "model.request", "prompt", "retry"])
 		await settle(100)
 		expect(f.interrupts).toEqual([])
 		expect(f.switches).toEqual([])
@@ -1009,7 +1062,7 @@ describe("setupV2 steer and auxiliary requests", () => {
 
 describe("setupV2 integrated compaction lifecycle", () => {
 	test("compaction-specific resolved legacy chain takes precedence over parent and global chains", async () => {
-		const f = await fixture({ fallback_models: ["backup/global"], timeout_seconds: 0 })
+		const f = await fixture({ fallback_models: ["backup/global"], timeout_seconds: 0, compaction_fallback: true })
 		f.override("agentGet", ({ agentID }) => ({ data: {
 			id: agentID,
 			model: original,
@@ -1029,7 +1082,7 @@ describe("setupV2 integrated compaction lifecycle", () => {
 	})
 
 	test("clearing the main TTFT timer does not dispatch ordinary fallback during compaction", async () => {
-		const f = await fixture({ fallback_models: ["backup/b"], timeout_seconds: 0.02 })
+		const f = await fixture({ fallback_models: ["backup/b"], timeout_seconds: 0.02, compaction_fallback: true })
 		const admission = gate()
 		f.override("create", () => admission.promise)
 		await invokeContext(f)
@@ -1044,7 +1097,7 @@ describe("setupV2 integrated compaction lifecycle", () => {
 	})
 
 	test("internal compaction children skip main agent resolution and delayed step events after cleanup", async () => {
-		const f = await fixture({ fallback_models: ["backup/b"], timeout_seconds: 0.03 })
+		const f = await fixture({ fallback_models: ["backup/b"], timeout_seconds: 0.03, compaction_fallback: true })
 		await invokeContext(f)
 		const event = compactionEvent()
 		await f.callbacks.get("compaction")!(event)
@@ -1061,7 +1114,7 @@ describe("setupV2 integrated compaction lifecycle", () => {
 	})
 
 	test("event-stream loss releases owned compaction to native generation without ordinary fallback", async () => {
-		const f = await fixture({ fallback_models: ["backup/b"], timeout_seconds: 0.02 })
+		const f = await fixture({ fallback_models: ["backup/b"], timeout_seconds: 0.02, compaction_fallback: true })
 		const admission = gate()
 		f.override("prompt", () => admission.promise)
 		const event = compactionEvent("untracked-parent")

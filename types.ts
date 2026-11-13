@@ -17,6 +17,8 @@ export interface FallbackPluginConfig {
 	/** Replace the foreground task tool with a plugin-owned execution loop.
 	 *  Enabled by default; set false to use OpenCode's native task tool. */
 	foreground_task_fallback?: boolean
+	/** V2 only: keep compaction on the session model when false. */
+	compaction_fallback?: boolean
 }
 
 export interface FallbackState {
