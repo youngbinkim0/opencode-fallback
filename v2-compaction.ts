@@ -434,8 +434,10 @@ export async function installV2CompactionFallback(
 	const compaction = (event: CompactionEvent): Promise<void> | void => {
 		if (disposed || event.result || options.streamHealthy?.() === false) return
 		options.clearMainTimer?.(event.sessionID)
-		// Snapshot before any await so later host mutations cannot reach the child.
-		const snapshot = structuredClone({ system: event.system, messages: event.messages, options: event.options })
+		// Snapshot before any await so later host mutations cannot reach the child. Copy the
+		// containers, not the message objects: structuredClone would drop class prototypes such as
+		// Media.Asset and break request validation for sessions with attachments.
+		const snapshot = { system: event.system, messages: [...event.messages], options: event.options }
 		// A superseded run is a real parent cancellation for its own compaction, so it rejects.
 		const previous = runs.get(event.sessionID)
 		if (previous) cancelRun(previous, "hard")
@@ -460,8 +462,9 @@ export async function installV2CompactionFallback(
 	const context = (event: ContextEvent) => {
 		const record = children.get(event.sessionID)
 		if (!record) return
-		// Children get the saved history (system, messages, options) with tools removed. Clone per request.
-		const copy = structuredClone(record.snapshot)
+		// Children get the saved history (system, messages, options) with tools removed. Copy the
+		// containers per request; the message objects keep their prototypes.
+		const copy = { ...record.snapshot, messages: [...record.snapshot.messages] }
 		event.system = copy.system as typeof event.system
 		const messages = copy.messages as typeof event.messages
 		// The snapshot is older history only. Its final message may be a real user turn, so the
