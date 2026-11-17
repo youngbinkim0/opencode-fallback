@@ -226,10 +226,12 @@ export async function setupV2(ctx: Plugin.Context) {
 			}
 			await ctx.session.wait({ sessionID }, { signal: controller.signal })
 			if (disposed || state.cancelled || state.pending !== pending) return
+			if (state.requestKind !== "primary") { clearPending(state); return }
 			// Recheck immediately before persisting: the host model inventory may have
 			// changed since the synchronous retry hook admitted this candidate.
 			await refreshInventory(true)
 			if (disposed || state.cancelled || state.pending !== pending) return
+			if (state.requestKind !== "primary") { clearPending(state); return }
 			if (!available(pending.newModel)) {
 				const refreshed = planFallback(sessionID, state.fallback, chain(state.agent), config, state.pendingBlockedProvider)
 				if (!refreshed.success) {
@@ -419,25 +421,27 @@ export async function setupV2(ctx: Plugin.Context) {
 		}
 	}
 	try {
-		compaction = await installV2CompactionFallback(ctx, {
-			config,
-			childAgent: () => "compaction",
-			streamHealthy: () => streamHealthy,
-			chain: async (agent) => {
-				await resolveAgentFallback("compaction")
-				// V1 compaction-specific chains take precedence over the parent
-				// agent. Explicit empty overrides still select the global chain.
-				if (Object.hasOwn(agents, "compaction") || normalizeFallbackModelsField(readFallbackModels("compaction", resolvedAgents)).length) return chain("compaction")
-				if (agent !== "compaction") await resolveAgentFallback(agent)
-				return chain(agent)
-			},
-			notify: notifications.notify,
-			clearMainTimer: (sessionID) => {
-				const state = states.get(sessionID)
-				if (state) { clearTimer(state); state.requestKind = "compaction" }
-			},
-		})
-		registrations.push(compaction)
+		if (config.compaction_fallback) {
+			compaction = await installV2CompactionFallback(ctx, {
+				config,
+				childAgent: () => "compaction",
+				streamHealthy: () => streamHealthy,
+				chain: async (agent) => {
+					await resolveAgentFallback("compaction")
+					// V1 compaction-specific chains take precedence over the parent
+					// agent. Explicit empty overrides still select the global chain.
+					if (Object.hasOwn(agents, "compaction") || normalizeFallbackModelsField(readFallbackModels("compaction", resolvedAgents)).length) return chain("compaction")
+					if (agent !== "compaction") await resolveAgentFallback(agent)
+					return chain(agent)
+				},
+				notify: notifications.notify,
+				clearMainTimer: (sessionID) => {
+					const state = states.get(sessionID)
+					if (state) { clearTimer(state); state.requestKind = "compaction" }
+				},
+			})
+			registrations.push(compaction)
+		}
 		if (config.foreground_task_fallback) {
 			registrations.push(await installV2ForegroundTaskFallback(ctx, {
 				isCancelled: (sessionID) => states.get(sessionID)?.cancelled === true,
@@ -507,12 +511,17 @@ export async function setupV2(ctx: Plugin.Context) {
 		}))
 		registrations.push(await ctx.session.hook("model.request", (event) => {
 			const state = states.get(event.sessionID)
+			if (state && event.kind === "compaction") {
+				state.requestKind = "compaction"
+				clearTimer(state)
+				clearPending(state)
+				return
+			}
 			if (state && state.fallback.currentModel === modelName(event.model)) {
 				// Title/generate can run concurrently with the primary request.
 				// Their arrival must not steal its retry ownership or TTFT window.
 				if (state.active && event.kind !== "primary" && event.kind !== "compaction") return
 				state.requestKind = event.kind
-				if (event.kind === "compaction") clearTimer(state)
 			}
 		}))
 		registrations.push(await ctx.session.hook("retry", retry))

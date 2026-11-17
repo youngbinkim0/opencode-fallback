@@ -12,6 +12,7 @@ export const DEFAULT_CONFIG: Required<FallbackPluginConfig> = {
 	notify_on_fallback: true,
 	fallback_models: [],
 	foreground_task_fallback: true,
+	compaction_fallback: false,
 }
 
 export const RETRYABLE_ERROR_PATTERNS = [
